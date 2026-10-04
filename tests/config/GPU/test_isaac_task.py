@@ -36,7 +36,7 @@ def test_forge_task_resolves_seeds_and_round_trips(tmp_path):
         assert live.seed == 7
 
         # Forge's __init__ recomputes observation_space, so an override of it must be caught
-        discarded = load_config(HERE / "forge_exp.yaml", ["task.cfg.observation_space=999"])
+        discarded = load_config(HERE / "forge_discarded.yaml")
         with pytest.raises(ValueError) as err:
             check_env_kept_overrides(discarded, live)
         assert "task.cfg.observation_space" in str(err.value)
@@ -49,6 +49,10 @@ def test_forge_task_resolves_seeds_and_round_trips(tmp_path):
         assert a.pop("meta") and b.pop("meta")
         assert a == b
         # the file records what the env computed, not the pre-__init__ default
-        assert a["task"]["cfg"]["observation_space"] == live.observation_space
+        # (spaces are written in Isaac Lab's serialized form)
+        from isaaclab.envs.utils.spaces import serialize_space
+
+        assert a["task"]["cfg"]["observation_space"] == serialize_space(live.observation_space)
+        assert live.observation_space != 999
     finally:
         env.close()

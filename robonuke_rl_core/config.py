@@ -122,10 +122,19 @@ def task_cfg_to_dict(env_cfg: Any) -> dict:
 
 
 def apply_task_cfg(env_cfg: Any, data: dict) -> Any:
-    """Plain dict -> env cfg object, the reverse of :func:`task_cfg_to_dict`."""
-    from isaaclab.envs.utils.spaces import replace_strings_with_env_cfg_spaces
+    """Plain dict -> env cfg object, the reverse of :func:`task_cfg_to_dict`.
+
+    The object's spaces are serialized to strings first: ``data`` holds them in that form
+    (``task_cfg_to_dict`` serialized them), and Isaac Lab's ``from_dict`` refuses a value whose
+    type differs from the attribute's current one.
+    """
+    from isaaclab.envs.utils.spaces import (
+        replace_env_cfg_spaces_with_strings,
+        replace_strings_with_env_cfg_spaces,
+    )
     from isaaclab.utils import replace_strings_with_slices
 
+    env_cfg = replace_env_cfg_spaces_with_strings(env_cfg)
     env_cfg.from_dict(replace_strings_with_slices(data))
     return replace_strings_with_env_cfg_spaces(env_cfg)
 
@@ -283,12 +292,20 @@ def _build(layers: List[tuple]) -> Config:
     root.task.cfg.seed = root.experiment.seed
     task_overrides["seed"] = "experiment.seed"
 
-    # 7. the task dict is not type-checked by OmegaConf, so check it against the defaults
-    _check_task_types(OmegaConf.to_container(root.task.cfg), task_defaults)
+    # 7. the task dict is not type-checked by OmegaConf, so check it against the defaults.
+    #    The checked copy is what gets applied (an int for a float field is converted), and it
+    #    goes back into root so the dumped config and the env hold the same value.
+    checked = _check_task_types(OmegaConf.to_container(root.task.cfg), task_defaults)
+    root.task.cfg = OmegaConf.create(checked)
 
     # 8. the objects
     sections = {name: OmegaConf.to_object(root[name]) for name in SECTIONS}
-    task_cfg = apply_task_cfg(env_cfg, OmegaConf.to_container(root.task.cfg))
+    task_container = OmegaConf.to_container(root.task.cfg)
+    # The seed is set on the object, not through the dict: every Isaac Lab env cfg defaults
+    # `seed` to None, and `from_dict` refuses a value whose type differs from the current one.
+    seed = task_container.pop("seed")
+    task_cfg = apply_task_cfg(env_cfg, task_container)
+    task_cfg.seed = seed
 
     # 9. derived values
     derived = {
@@ -329,20 +346,25 @@ def _leaf_paths(data: Any, path: str = "") -> List[str]:
     return [path]
 
 
-def _check_task_types(merged: Any, default: Any, path: str = "task.cfg") -> None:
-    """Compare every task leaf with the type of its default. int is fine for float."""
+def _check_task_types(merged: Any, default: Any, path: str = "task.cfg") -> Any:
+    """Check every task leaf against the type of its default; return the value to apply.
+
+    int is accepted where the default is a float and is **converted**: Isaac Lab's
+    ``from_dict`` requires ``isinstance(value, type(current))``, so an int left as an int
+    would be refused there (``Expected: float, Received: int``).
+    """
     if isinstance(default, dict):
-        for key, sub in default.items():
-            _check_task_types(merged[key], sub, f"{path}.{key}")
-        return
+        return {key: _check_task_types(merged[key], sub, f"{path}.{key}") for key, sub in default.items()}
     if default is None:
-        return
+        return merged
     if isinstance(default, bool):
         ok = isinstance(merged, bool)
     elif isinstance(default, int):
         ok = isinstance(merged, int) and not isinstance(merged, bool)
     elif isinstance(default, float):
-        ok = isinstance(merged, float) or (isinstance(merged, int) and not isinstance(merged, bool))
+        if isinstance(merged, int) and not isinstance(merged, bool):
+            return float(merged)
+        ok = isinstance(merged, float)
     elif isinstance(default, (list, tuple)):
         ok = isinstance(merged, (list, tuple))  # OmegaConf has no tuple: a tuple default reads back as a list
     else:
@@ -351,6 +373,7 @@ def _check_task_types(merged: Any, default: Any, path: str = "task.cfg") -> None
         raise TypeError(
             f"{path}: expected {type(default).__name__}, got {type(merged).__name__} {merged!r}"
         )
+    return merged
 
 
 # ------------------------------------------------------------------------------ dump / cli

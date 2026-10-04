@@ -38,7 +38,10 @@ Load order: class defaults and task defaults → most-base file → … → pass
 6. `OmegaConf.missing_keys` — raise listing every required field no layer set. Then write
    `experiment.seed` into `task.cfg.seed` (raise if the env cfg has no `seed` field).
 7. Walk the task dict against the defaults' types (OmegaConf does not type it): int is fine
-   for float, bool is not an int or float, a `None` default accepts anything.
+   for float **and is converted to one** (Isaac Lab's `from_dict` needs
+   `isinstance(value, type(current))`), bool is not an int or float, a `None` default accepts
+   anything. The checked copy is what the env gets, and it goes back into `root` so the dump
+   matches.
 8. Build the objects: `to_object` per section, `apply_task_cfg` for the env cfg.
 9. Derive `run_names = [f"{group}_a{i}"]`.
 10. Call `validate(cfg)` on each section object that defines it.
@@ -59,9 +62,14 @@ what actually ran. `load_from_run(run_dir, overrides)` uses that file minus `met
 
 * **Fields the env rewrites in `__init__`.** Factory and Forge (`FactoryEnv.__init__`)
   recompute `observation_space` and `state_space` from `obs_order`, `state_order` and
-  `action_space`, and copy `scene.fixed_asset`, `scene.held_asset` (and the gear assets for
-  gear mesh) from `task`. Override the source instead: `obs_order`, `state_order`,
-  `task.fixed_asset`, `task.held_asset`. `dump` raises if an override was discarded.
+  `action_space`. Override the source instead: `obs_order`, `state_order`. `dump` raises if an
+  override was discarded.
+* **Spaces must be written in Isaac Lab's serialized form.** `observation_space`,
+  `state_space` and `action_space` leave the env cfg object as JSON strings
+  (`'{"type": "python", "space": "Box", "value": 21}'`), so a config layer must set that
+  string, not an int — an int raises in step 7. This is acceptable because the env computes
+  these fields anyway (Factory and Forge recompute `observation_space` and `state_space` in
+  `__init__`), so overriding them never takes effect: set `obs_order` / `state_order` instead.
 * **New keys in dict-valued fields** (e.g. `init_state.joint_pos`): struct mode allows
   overriding existing keys only.
 * **Module constants and code** (e.g. Factory's `OBS_DIM_CFG`, `STATE_DIM_CFG`).

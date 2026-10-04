@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
@@ -24,6 +26,14 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 # ------------------------------------------------------------------ the fake task
+# The fake is as strict as the real thing on purpose: Isaac Lab's update_class_from_dict
+# refuses a value whose type differs from the attribute's current one (an int for a float
+# field included), and its env cfgs hold spaces as serialized JSON strings outside the live
+# object. Both rules are mirrored below so that class of bug fails here, on CPU, instead of
+# only on the GPU machine.
+SPACE_FIELDS = ("observation_space", "state_space", "action_space")
+
+
 @dataclass
 class FakeScene:
     num_envs: int = 4
@@ -39,17 +49,54 @@ class FakeEnvCfg:
     device: str = "cuda:0"
     joint_ids: str = "slice(None,None,None)"  # Isaac Lab stores slices as strings
     seed: Optional[int] = None  # Isaac Lab env cfgs default to None
+    observation_space: Any = 21  # a space spec: serialized when it leaves the object
     scene: FakeScene = field(default_factory=FakeScene)
 
 
-def _fake_apply(env_cfg: Any, data: dict) -> Any:
-    for key, value in data.items():
-        current = getattr(env_cfg, key)
-        if dataclasses.is_dataclass(current):
-            _fake_apply(current, value)
-        else:
-            setattr(env_cfg, key, value)
+def _serialize_spaces(env_cfg: Any) -> Any:
+    """Spaces leave the object as JSON strings (Isaac Lab's serialize_space)."""
+    for name in SPACE_FIELDS:
+        if hasattr(env_cfg, name) and not isinstance(getattr(env_cfg, name), str):
+            setattr(env_cfg, name, json.dumps({"space": "Box", "value": getattr(env_cfg, name)}))
     return env_cfg
+
+
+def _deserialize_spaces(env_cfg: Any) -> Any:
+    for name in SPACE_FIELDS:
+        if hasattr(env_cfg, name) and isinstance(getattr(env_cfg, name), str):
+            setattr(env_cfg, name, json.loads(getattr(env_cfg, name))["value"])
+    return env_cfg
+
+
+def _fake_to_dict(env_cfg: Any) -> dict:
+    return dataclasses.asdict(_serialize_spaces(copy.deepcopy(env_cfg)))
+
+
+def _strict_update(env_cfg: Any, data: dict, ns: str = "") -> None:
+    """Isaac Lab's update_class_from_dict rules: unknown key or type change raises."""
+    for key, value in data.items():
+        path = f"{ns}/{key}"
+        if not hasattr(env_cfg, key):
+            raise KeyError(f"[Config]: Key not found under namespace: {path}")
+        current = getattr(env_cfg, key)
+        if isinstance(value, dict):
+            _strict_update(current, value, path)
+            continue
+        if isinstance(value, (list, tuple)):
+            setattr(env_cfg, key, tuple(value) if isinstance(current, tuple) else value)
+            continue
+        if value is None or isinstance(value, type(current)):
+            setattr(env_cfg, key, value)
+            continue
+        raise ValueError(
+            f"[Config]: Incorrect type under namespace: {path}. "
+            f"Expected: {type(current)}, Received: {type(value)}."
+        )
+
+
+def _fake_apply(env_cfg: Any, data: dict) -> Any:
+    _strict_update(_serialize_spaces(env_cfg), data)
+    return _deserialize_spaces(env_cfg)
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +109,7 @@ def fake_task(monkeypatch):
         return FakeEnvCfg()
 
     monkeypatch.setattr(cfgmod, "load_task_cfg", load)
-    monkeypatch.setattr(cfgmod, "task_cfg_to_dict", dataclasses.asdict)
+    monkeypatch.setattr(cfgmod, "task_cfg_to_dict", _fake_to_dict)
     monkeypatch.setattr(cfgmod, "apply_task_cfg", _fake_apply)
 
     known = dict(cfgmod.SECTIONS)
@@ -432,3 +479,39 @@ def test_interpolation_raises(tmp_path, source):
         load_config(*args)
     message = str(err.value)
     assert "interpolation" in message and needle in message
+
+
+# ---------------------------------------------- spaces (the fake is strict, like Isaac Lab)
+def test_space_override_must_use_the_serialized_form(tmp_path):
+    # An int for a space field is a type error: outside the live object a space is a JSON
+    # string, and the env's from_dict would refuse the int anyway.
+    with pytest.raises(TypeError) as err:
+        load_config(FIXTURES / "minimal.yaml", ["task.cfg.observation_space=999"])
+    assert "task.cfg.observation_space" in str(err.value)
+
+    path = tmp_path / "space.yaml"
+    path.write_text(
+        "base: " + str(FIXTURES / "minimal.yaml") + "\n"
+        "task:\n"
+        "  cfg:\n"
+        '    observation_space: \'{"space": "Box", "value": 999}\'\n'
+    )
+    cfg = load_config(path)
+    assert cfg.task_cfg.observation_space == 999  # deserialized back onto the object
+    assert OmegaConf.to_container(cfg.root.task.cfg)["observation_space"] == (
+        '{"space": "Box", "value": 999}'
+    )
+
+
+def test_int_for_a_float_field_is_converted_before_it_reaches_the_env():
+    # Isaac Lab's from_dict needs isinstance(value, type(current)), so the int must become a
+    # float on the way in; the strict fake raises if it does not.
+    cfg = load_config(FIXTURES / "int_for_float.yaml")
+    assert isinstance(cfg.task_cfg.episode_length_s, float)
+    assert cfg.task_cfg.episode_length_s == 3.0
+
+
+def test_a_type_change_in_the_task_cfg_cannot_reach_the_env():
+    with pytest.raises(TypeError) as err:
+        load_config(FIXTURES / "minimal.yaml", ["task.cfg.device=3"])
+    assert "task.cfg.device" in str(err.value)
