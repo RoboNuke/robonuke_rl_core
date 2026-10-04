@@ -1,0 +1,7 @@
+base: minimal.yaml
+task:
+  cfg:
+    decimation: 16
+    device: cpu
+    scene:
+      num_envs: 32

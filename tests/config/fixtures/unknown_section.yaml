@@ -1,0 +1,3 @@
+base: minimal.yaml
+controller:
+  stiffness: 100.0

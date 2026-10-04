@@ -1,0 +1,3 @@
+base: ./does_not_exist.yaml
+task:
+  name: Fake-Task-v0

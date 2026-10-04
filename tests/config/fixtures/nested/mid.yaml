@@ -1,0 +1,12 @@
+base: ../base.yaml
+experiment:
+  seed: 200
+wandb:
+  project: mid_project
+  tags:
+    - mid
+    - baseline
+task:
+  cfg:
+    scene:
+      num_envs: 64

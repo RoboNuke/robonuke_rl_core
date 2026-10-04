@@ -1,0 +1,5 @@
+base: minimal.yaml
+task:
+  cfg:
+    scene:
+      num_env: 128

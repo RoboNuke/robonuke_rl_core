@@ -1,0 +1,4 @@
+base: minimal.yaml
+task:
+  cfg:
+    decimation: eight

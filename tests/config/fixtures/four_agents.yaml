@@ -1,0 +1,3 @@
+base: minimal.yaml
+experiment:
+  num_agents: 4

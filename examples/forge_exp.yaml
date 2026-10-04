@@ -1,0 +1,17 @@
+# One experiment: 4 agents on Forge peg-insert, in one Isaac Sim instance on one GPU.
+# Run:
+#   python scripts/train.py --config examples/forge_exp.yaml --headless \
+#       task.cfg.scene.num_envs=128 experiment.seed=3
+base: forge_base.yaml
+experiment:
+  num_agents: 4
+  seed: 10
+wandb:
+  group: fgain_k100
+  tags:
+    - fgain
+    - baseline
+task:
+  cfg:
+    scene:
+      num_envs: 256

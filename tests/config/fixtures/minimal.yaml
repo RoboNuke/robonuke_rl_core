@@ -1,0 +1,8 @@
+task:
+  name: Fake-Task-v0
+experiment:
+  seed: 10
+wandb:
+  entity: hur
+  project: forge_pih
+  group: fgain_k100

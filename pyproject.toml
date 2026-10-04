@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robonuke_rl_core"
+version = "0.1.0"
+description = "Shared RL core for Isaac Lab: config manager, models, skrl integration, training and eval."
+requires-python = ">=3.10"
+dependencies = ["pyyaml", "omegaconf"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["robonuke_rl_core*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# plain `pytest` runs the CPU tests; `pytest -m gpu` runs the ones that need Isaac Sim.
+# the ROS 2 pytest plugins are on sys.path in a sourced ROS shell and fail to import there.
+addopts = "-m 'not gpu' -p no:launch_testing -p no:launch_ros"

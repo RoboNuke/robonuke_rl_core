@@ -1,0 +1,4 @@
+task:
+  name: Fake-Task-v0
+experiment:
+  num_agents: 2

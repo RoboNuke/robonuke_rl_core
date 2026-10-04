@@ -1,0 +1,11 @@
+# Base config for the Isaac Lab Forge peg-insert task.
+# The values here differ from the task's own defaults on purpose, so the test proves the file
+# layer reached the env cfg object (Forge defaults: decimation 8, episode_length_s 10.0).
+task:
+  name: Isaac-Forge-PegInsert-Direct-v0
+  cfg:
+    decimation: 4
+    episode_length_s: 7.5
+wandb:
+  entity: hur
+  project: forge_pih

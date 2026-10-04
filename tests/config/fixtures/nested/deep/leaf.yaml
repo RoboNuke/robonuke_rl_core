@@ -1,0 +1,7 @@
+base: ../mid.yaml
+wandb:
+  group: leaf_group
+task:
+  cfg:
+    scene:
+      num_envs: 256

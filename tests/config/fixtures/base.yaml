@@ -1,0 +1,17 @@
+# most-base file of the 3-file chain
+task:
+  name: Fake-Task-v0
+  cfg:
+    decimation: 4
+    scene:
+      num_envs: 16
+      env_spacing: 2.0
+experiment:
+  num_agents: 2
+  seed: 100
+wandb:
+  entity: hur
+  project: root_project
+  group: root_group
+  tags:
+    - root

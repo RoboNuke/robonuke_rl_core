@@ -1,0 +1,4 @@
+base: minimal.yaml
+task:
+  cfg:
+    episode_length_s: 3
