@@ -31,10 +31,11 @@ from ..models.block_utils import (
     slice_block_state_dict,
     slice_optimizer_state,
 )
+from ..losses.losses import LossContext
 from ..models.normalizer import BlockRunningNorm
 from .cfg import TrainerCfg
 
-__all__ = ["LearnerBase", "AuxLossContext", "run_dirs"]
+__all__ = ["LearnerBase", "run_dirs"]
 
 
 @dataclass
@@ -42,23 +43,6 @@ class _SkrlCfg(AgentCfg):
     """Minimal cfg for skrl's ``Agent``. Our own section cfg lives in ``self.cfg``."""
 
     experiment: SkrlExperimentCfg = field(default_factory=SkrlExperimentCfg)
-
-
-@dataclass
-class AuxLossContext:
-    """What an ``aux_loss`` hook gets. Fields unrelated to ``target`` are None."""
-
-    learner: Any
-    target: str  # "policy" or "critic"
-    sampled: Dict[str, torch.Tensor]
-    inputs: Optional[Dict[str, torch.Tensor]] = None
-    critic_inputs: Optional[Dict[str, torch.Tensor]] = None
-    actions: Optional[torch.Tensor] = None
-    log_prob: Optional[torch.Tensor] = None
-    policy_outputs: Optional[Dict[str, torch.Tensor]] = None
-    critic_1_values: Optional[torch.Tensor] = None
-    critic_2_values: Optional[torch.Tensor] = None
-    target_values: Optional[torch.Tensor] = None
 
 
 def run_dirs(cfg: Any) -> List[Path]:
@@ -121,7 +105,7 @@ class LearnerBase(Agent):
         #: tensors, learner metrics as 0-d tensors. Empty by default: nothing is logged.
         self.on_log: List[Callable[[int, Dict[str, torch.Tensor], int], None]] = []
         #: ``fn(ctx) -> Tensor | None``; a returned tensor is added to that loss. Empty by default.
-        self.aux_loss: List[Callable[[AuxLossContext], Optional[torch.Tensor]]] = []
+        self.aux_loss: List[Callable[[LossContext], Optional[torch.Tensor]]] = []
 
         # Episode statistics: per-env running return/length, and per-agent sums over the
         # write interval. All on-device, so a step with a finished env costs no GPU->CPU sync;
@@ -184,8 +168,11 @@ class LearnerBase(Agent):
         for agent in range(self.num_agents):
             self.emit(agent, {name: value[agent] for name, value in metrics.items()}, step)
 
-    def compute_aux_loss(self, ctx: AuxLossContext) -> Optional[torch.Tensor]:
-        """Sum of what the ``aux_loss`` hooks return for ``ctx.target``, or None."""
+    def compute_aux_loss(self, ctx: LossContext) -> Optional[torch.Tensor]:
+        """Sum of what the ``aux_loss`` hooks return for ``ctx.target``, or None.
+
+        ``losses.build_aux_losses`` builds the usual hook; a project can append its own.
+        """
         total = None
         for hook in self.aux_loss:
             value = hook(ctx)

@@ -61,6 +61,22 @@ class BlockLayerNorm(nn.Module):
         return out * self.weight[:, None, :] + self.bias[:, None, :]
 
 
+class BlockMLP(nn.Module):
+    def __init__(self, num_blocks: int, in_dim: int, hidden_dim: int, out_dim: int, activation=None):
+        super().__init__()
+        self.fc1 = BlockLinear(num_blocks, in_dim, hidden_dim)
+        self.fc2 = BlockLinear(num_blocks, hidden_dim, out_dim)
+        self.activation = activation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.fc2(F.relu(self.fc1(x)))
+        if self.activation == "sigmoid":
+            out = torch.sigmoid(out)
+        elif self.activation == "tanh":
+            out = torch.tanh(out)
+        return out
+
+
 class BlockResidualBlock(nn.Module):
     def __init__(self, num_blocks: int, dim: int):
         super().__init__()

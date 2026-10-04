@@ -16,7 +16,8 @@ import torch
 
 from ..models.block_utils import clip_grad_norm_per_agent
 from ..models.normalizer import BlockRunningNorm
-from .base import AuxLossContext, LearnerBase
+from ..losses.losses import LossContext
+from .base import LearnerBase
 
 __all__ = ["PPO", "compute_gae"]
 
@@ -341,8 +342,9 @@ class PPO(LearnerBase):
 
                 total_loss = policy_loss + entropy_loss + value_loss
                 aux = self.compute_aux_loss(
-                    AuxLossContext(
+                    LossContext(
                         learner=self,
+                        step=timestep,
                         target="policy",
                         sampled=sampled,
                         inputs=inputs,
@@ -353,8 +355,9 @@ class PPO(LearnerBase):
                 if aux is not None:
                     total_loss = total_loss + aux
                 aux = self.compute_aux_loss(
-                    AuxLossContext(
+                    LossContext(
                         learner=self,
+                        step=timestep,
                         target="critic",
                         sampled=sampled,
                         critic_inputs=value_inputs,

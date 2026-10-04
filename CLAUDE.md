@@ -20,6 +20,10 @@ create a new conda env for this project.
 * `config.py` must import without Isaac Lab installed. Isaac Lab is imported only inside
   `load_task_cfg`, `task_cfg_to_dict` and `apply_task_cfg`.
 * Do not commit or push without approval. Report tests as passed / failed / total.
+* **Every config field is documented.** Adding, renaming or removing a field in any section
+  means updating its row in the README's configuration reference in the same change. No test
+  checks this. The README never documents `task.cfg` fields — it says once that any env cfg
+  field can be overridden under `task.cfg.*` and points here for the ones that cannot.
 
 ## How config works
 
@@ -124,15 +128,44 @@ that a gradient's magnitude changed.
 
 ### Add a model
 
-1. Write the networks in `robonuke_rl_core/models/`, then a builder in `models/factory.py`.
-2. **Every parameter must be a block parameter** (leading dim `num_agents`) or an entry of a
-   per-agent `nn.ParameterList`; `clip_grad_norm_per_agent` raises on anything else, because a
-   shared parameter would couple the agents. Prefer the block parameter: an optimizer-state
-   tensor of shape `(1, k)` cannot be attributed to its agent, so a `ParameterList` entry's
-   Adam moments cannot be sliced per agent (that is why the SimBa actor's `log_std` is a block
-   parameter, not a list).
-3. Add a checkpoint round-trip test (`tests/learners/test_base.py` has the template: save
-   agent 2 of 3, load into slot 0 of a 1-agent learner, compare deterministic actions).
+1. Write the class in `robonuke_rl_core/models/`. **Every parameter must be a block parameter**
+   (leading dim `num_agents`) or an entry of a per-agent `nn.ParameterList`;
+   `clip_grad_norm_per_agent` raises on anything else, because a shared parameter would couple
+   the agents. Prefer the block parameter: an optimizer-state tensor of shape `(1, k)` cannot
+   be attributed to its agent, so a `ParameterList` entry's Adam moments cannot be sliced per
+   agent (that is why the SimBa actor's `log_std` is a block parameter).
+2. Add a builder to `MODEL_BUILDERS` in `models/factory.py`, keyed by learner name. Critics
+   take `state_space` when it is not None (asymmetric actor-critic).
+3. Add its fields to `ModelCfg` in `models/cfg.py` and their rows to the README.
+4. Copy tests 1-3 of `tests/models/test_factory.py`: block-only parameters, independence
+   (agent 1's rows only, with any BatchNorm in training mode), and checkpoint slicing. If a
+   learner uses the model, also copy the checkpoint round trip in
+   `tests/learners/test_base.py` (save agent 2 of 3, load into slot 0 of a 1-agent learner,
+   compare deterministic actions).
+
+### Add a loss
+
+1. Subclass `AuxLoss` in the project (or in `robonuke_rl_core/losses/losses.py` for a package
+   loss), set `name` and `supported_targets`, implement `compute(ctx)`, and decorate it with
+   `@register_loss`. Projects register at import time, before the config is loaded.
+2. `compute` returns **one raw value per agent**, shape `(num_agents,)`. Reshape a flat
+   `(num_agents * rows, ...)` tensor with `.view(ctx.learner.num_agents, -1)` first.
+   **Never average across agents inside `compute`** — `build_aux_losses` applies the fixed
+   `1/num_agents` weight, and an average inside the loss would make one agent's data scale
+   another's gradient.
+3. Add a term to the experiment YAML (`losses.terms`), with `kwargs` for the constructor. No
+   new config fields are needed, so nothing to add to the README except a row in its built-in
+   loss table for a package loss.
+4. Copy tests 7-8 of `tests/losses/test_losses.py`: the weighted total and the per-agent
+   values, and independence under a change to agent 1's data.
+
+### Memory
+
+One memory class (`MultiRandomMemory`). Batch sizes are **per agent**: `sample(batch_size=B)`
+returns `B * num_agents` rows as `[agent 0 | agent 1 | ...]`, drawn from each agent's own envs,
+and `sample_all` keeps that order so a block-parallel reshape routes each agent's rows to its
+own parameters. `memory.memory_size` is SAC's per-agent capacity; PPO's buffer is
+`ppo.rollouts` steps per env.
 
 ### Emit a metric
 

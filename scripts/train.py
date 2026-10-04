@@ -34,6 +34,7 @@ def main() -> int:
     from skrl.trainers.torch import SequentialTrainer, SequentialTrainerCfg
 
     from robonuke_rl_core.learners.base import run_dirs
+    from robonuke_rl_core.losses import build_aux_losses
     from robonuke_rl_core.learners.flash_sac import FlashSAC
     from robonuke_rl_core.learners.ppo import PPO
     from robonuke_rl_core.learners.sac import SAC
@@ -73,14 +74,10 @@ def main() -> int:
     per_env_depth = (
         int(learner_cfg.rollouts)
         if learner_name == "ppo"
-        else max(1, cfg.memory.size // total_envs)
+        else max(1, cfg.memory.memory_size // total_envs)
     )
     memory = MultiRandomMemory(
-        memory_size=per_env_depth,
-        num_envs=total_envs,
-        num_agents=num_agents,
-        device=env.device,
-        replacement=cfg.memory.replacement,
+        memory_size=per_env_depth, num_envs=total_envs, num_agents=num_agents, device=env.device
     )
 
     extra = {"model_cfg": cfg.model} if learner_name in ("sac", "flash_sac") else {}
@@ -98,6 +95,11 @@ def main() -> int:
         run_dirs=dirs,
         **extra,
     )
+
+    aux = build_aux_losses(cfg.losses, num_agents)
+    if aux is not None:
+        learner.aux_loss.append(aux)
+        print(f"[train] aux losses: {[t.name for t in cfg.losses.terms]}")
 
     print(f"[train] {learner_name}: {num_agents} agents x {total_envs // num_agents} envs")
     print(f"[train] runs: {', '.join(str(d) for d in dirs)}")

@@ -24,6 +24,9 @@ class ActorCfg:
     clip_log_std: bool = True
     min_log_std: float = -20.0
     max_log_std: float = 2.0
+    #: how skrl reduces the log-probability density over action dims:
+    #: "sum", "mean", "prod" or "none" (checked in ModelCfg.validate; OmegaConf 2.3 cannot
+    #: type-check typing.Literal in a structured config)
     reduction: str = "sum"
     use_state_dependent_std: bool = False
     #: action dims drawn from a Bernoulli instead of the squashed Gaussian (e.g. a gripper)
@@ -52,7 +55,14 @@ class ModelCfg:
     actor: ActorCfg = field(default_factory=ActorCfg)
     critic: CriticCfg = field(default_factory=CriticCfg)
 
+    REDUCTIONS = ("sum", "mean", "prod", "none")
+
     def validate(self, cfg: Any) -> None:
+        if self.actor.reduction not in self.REDUCTIONS:
+            raise ValueError(
+                f"model.actor.reduction must be one of {self.REDUCTIONS}, got "
+                f"{self.actor.reduction!r}"
+            )
         if self.actor.min_log_std >= self.actor.max_log_std:
             raise ValueError(
                 f"model.actor.min_log_std ({self.actor.min_log_std}) must be below "

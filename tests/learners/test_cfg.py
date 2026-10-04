@@ -75,12 +75,13 @@ def write(tmp_path, extra: str = "", name: str = "exp.yaml"):
 def test_every_section_loads_with_its_defaults(tmp_path):
     cfg = load_config(write(tmp_path))
     assert set(cfg.sections) == {
-        "experiment", "wandb", "trainer", "sac", "ppo", "flash_sac", "model", "memory",
+        "experiment", "wandb", "trainer", "sac", "ppo", "flash_sac", "model", "memory", "losses",
     }
     assert cfg.trainer.learner == "sac"
     assert cfg.sac.batch_size == 64  # a class default, not set by the file
     assert cfg.model.actor.actor_latent == 512
-    assert cfg.memory.size == 1_000_000
+    assert cfg.memory.memory_size == 1_000_000
+    assert cfg.losses.terms == []
 
 
 def test_round_trip(tmp_path):
@@ -124,7 +125,8 @@ def test_unknown_learner_raises(tmp_path):
         ("sac.batch_size=0", "batch_size"),
         ("sac.polyak=0.0", "polyak"),
         ("sac.periodic_reset_enabled=true", "periodic_reset_frequency"),
-        ("memory.size=0", "memory.size"),
+        ("memory.memory_size=0", "memory.memory_size"),
+        ("model.actor.reduction=median", "reduction"),
         ("model.critic.n_atoms=1", "n_atoms"),
         ("model.critic.v_min=9.0", "v_min"),
         ("model.actor.min_log_std=5.0", "min_log_std"),

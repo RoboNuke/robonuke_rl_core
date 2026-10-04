@@ -48,7 +48,7 @@ def build_learner(cfg, env, learner_name: str, dirs):
     depth = (
         int(learner_cfg.rollouts)
         if learner_name == "ppo"
-        else max(1, cfg.memory.size // env.num_envs)
+        else max(1, cfg.memory.memory_size // env.num_envs)
     )
     memory = MultiRandomMemory(
         memory_size=depth, num_envs=env.num_envs, num_agents=num_agents, device=env.device

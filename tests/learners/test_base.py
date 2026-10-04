@@ -7,7 +7,8 @@ import copy
 import pytest
 import torch
 
-from robonuke_rl_core.learners.base import AuxLossContext, run_dirs
+from robonuke_rl_core.learners.base import run_dirs
+from robonuke_rl_core.losses import LossContext
 
 from helpers import ACT_DIM, OBS_DIM, build_learner, fill_memory
 
@@ -219,7 +220,7 @@ def test_aux_loss_hook_changes_the_loss_by_what_it_returns(learner_name, target)
 
     seen_targets: list[str] = []
 
-    def hook(ctx: AuxLossContext):
+    def hook(ctx: LossContext):
         seen_targets.append(ctx.target)
         assert ctx.learner is hooked
         if ctx.target != target:
@@ -248,7 +249,7 @@ def test_aux_loss_hook_changes_the_loss_by_what_it_returns(learner_name, target)
 def test_no_aux_hook_means_no_extra_loss():
     learner = build_learner("sac", num_agents=2, envs_per_agent=2)
     assert learner.compute_aux_loss(
-        AuxLossContext(learner=learner, target="policy", sampled={})
+        LossContext(learner=learner, target="policy", sampled={})
     ) is None
 
 
@@ -256,7 +257,7 @@ def test_an_aux_hook_returning_a_non_tensor_raises():
     learner = build_learner("sac", num_agents=2, envs_per_agent=2)
     learner.aux_loss.append(lambda ctx: 1.0)
     with pytest.raises(TypeError) as err:
-        learner.compute_aux_loss(AuxLossContext(learner=learner, target="policy", sampled={}))
+        learner.compute_aux_loss(LossContext(learner=learner, target="policy", sampled={}))
     assert "aux_loss" in str(err.value)
 
 

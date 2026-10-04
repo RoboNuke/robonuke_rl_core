@@ -10,16 +10,16 @@ __all__ = ["MemoryCfg"]
 
 @dataclass
 class MemoryCfg:
-    """Replay / rollout buffer.
+    """The SAC replay buffer.
 
-    ``size`` is transitions **per agent**: skrl allocates one
-    ``(size // num_envs, num_envs, *)`` tensor, so every agent's partition holds that depth.
-    PPO ignores it and uses ``ppo.rollouts`` as the per-env depth instead.
+    ``memory_size`` is transitions **per agent**: skrl allocates one
+    ``(memory_size // num_envs, num_envs, *)`` tensor, so every agent's env partition holds
+    that depth. PPO's rollout buffer is sized by ``ppo.rollouts`` instead; it is not
+    duplicated here.
     """
 
-    size: int = 1_000_000
-    replacement: bool = True
+    memory_size: int = 1_000_000
 
     def validate(self, cfg: Any) -> None:
-        if self.size < 1:
-            raise ValueError(f"memory.size must be >= 1, got {self.size}")
+        if self.memory_size < 1:
+            raise ValueError(f"memory.memory_size must be >= 1, got {self.memory_size}")

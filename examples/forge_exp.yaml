@@ -27,4 +27,4 @@ sac:
   lr_schedule: cosine
 
 memory:
-  size: 200000
+  memory_size: 200000

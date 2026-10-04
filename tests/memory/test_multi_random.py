@@ -27,6 +27,8 @@ def test_each_agents_rows_come_from_its_own_envs():
     memory = filled_memory()
     torch.manual_seed(0)
     (batch,) = memory.sample(names=["env_id"], batch_size=8)
+    # batch_size is PER AGENT: the rows come back as [agent0 | agent1 | ...]
+    assert batch[0].shape[0] == 8 * NUM_AGENTS
     env_ids = batch[0].reshape(NUM_AGENTS, 8)
     for agent in range(NUM_AGENTS):
         low, high = agent * ENVS_PER_AGENT, (agent + 1) * ENVS_PER_AGENT

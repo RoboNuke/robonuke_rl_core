@@ -22,7 +22,8 @@ import torch.nn.functional as F
 from ..models.block_utils import clip_grad_norm_per_agent
 from ..models.factory import build_models
 from ..models.normalizer import BlockRunningNorm
-from .base import AuxLossContext, LearnerBase
+from ..losses.losses import LossContext
+from .base import LearnerBase
 
 __all__ = ["SAC"]
 
@@ -284,8 +285,9 @@ class SAC(LearnerBase):
                 rows=rows,
             )
             aux = self.compute_aux_loss(
-                AuxLossContext(
+                LossContext(
                     learner=self,
+                    step=timestep,
                     target="critic",
                     sampled=sampled,
                     critic_inputs=critic_inputs,
@@ -318,8 +320,9 @@ class SAC(LearnerBase):
                     sampled=sampled, inputs=inputs, critic_inputs=critic_inputs, rows=rows
                 )
                 aux = self.compute_aux_loss(
-                    AuxLossContext(
+                    LossContext(
                         learner=self,
+                        step=timestep,
                         target="policy",
                         sampled=sampled,
                         inputs=inputs,
