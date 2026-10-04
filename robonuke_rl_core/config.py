@@ -11,6 +11,7 @@ Isaac Lab is imported only inside :func:`load_task_cfg`, :func:`task_cfg_to_dict
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import datetime
 import importlib
@@ -53,10 +54,10 @@ class WandbCfg:
     tags: List[str] = field(default_factory=list)
 
     def validate(self, cfg: Config) -> None:
-        if any(char.isspace() for char in self.group) or not self.group:
+        if not self.group or any(char.isspace() or char == "/" for char in self.group):
             raise ValueError(
-                f"wandb.group must be non-empty and free of whitespace, got {self.group!r}: run "
-                "names derive from it"
+                f"wandb.group must be non-empty and free of whitespace and '/', got {self.group!r}: "
+                "run names and run directories derive from it"
             )
 
 
@@ -108,11 +109,15 @@ def load_task_cfg(name: str) -> Any:
 
 
 def task_cfg_to_dict(env_cfg: Any) -> dict:
-    """Env cfg object -> plain dict, the way Isaac Lab's hydra integration does it."""
+    """Env cfg object -> plain dict, the way Isaac Lab's hydra integration does it.
+
+    Works on a deep copy: Isaac Lab's space conversion edits the object in place, and this is
+    also called on the live env's cfg (see :func:`dump`).
+    """
     from isaaclab.envs.utils.spaces import replace_env_cfg_spaces_with_strings
     from isaaclab.utils import replace_slices_with_strings
 
-    env_cfg = replace_env_cfg_spaces_with_strings(env_cfg)
+    env_cfg = replace_env_cfg_spaces_with_strings(copy.deepcopy(env_cfg))
     return replace_slices_with_strings(env_cfg.to_dict())
 
 
@@ -136,6 +141,9 @@ class Config:
     derived: Dict[str, Any]
     meta: Dict[str, Any]
     root: DictConfig
+    #: every ``task.cfg`` path a file or the CLI set -> the layer that set it last, plus
+    #: ``seed`` (set from ``experiment.seed``). :func:`check_env_kept_overrides` checks these.
+    task_overrides: Dict[str, str]
 
     def __getattr__(self, name: str) -> Any:
         sections = self.__dict__.get("sections", {})
@@ -215,16 +223,31 @@ def load_from_run(run_dir: str | Path, overrides: Any = None) -> Config:
     layer = _file_layer(path)
     for computed in ("meta", "derived"):
         layer.pop(computed, None)
+    task_cfg = OmegaConf.select(layer, "task.cfg")
+    if task_cfg is not None:
+        task_cfg.pop("seed", None)  # written from experiment.seed, never a layer's own value
     return _build([(str(path), layer), ("CLI", _cli_layer(overrides))])
 
 
 def _build(layers: List[tuple]) -> Config:
-    # 3. the task name: the last layer that sets it wins
+    # 3. the task name: the last layer that sets it wins. Also per layer: no interpolation,
+    #    no task.cfg.seed, and record every task.cfg path the layer sets.
     task_name = None
-    for _, layer in layers:
+    task_overrides: Dict[str, str] = {}
+    for where, layer in layers:
+        _reject_interpolation(OmegaConf.to_container(layer, resolve=False), where)
         name = OmegaConf.select(layer, "task.name")
         if name is not None:
             task_name = name
+        layer_task_cfg = OmegaConf.select(layer, "task.cfg")
+        if layer_task_cfg is not None:
+            if "seed" in layer_task_cfg:
+                raise ValueError(
+                    f"{where} sets task.cfg.seed: set experiment.seed instead; the env seed is "
+                    "always written from it"
+                )
+            for leaf in _leaf_paths(OmegaConf.to_container(layer_task_cfg, resolve=False)):
+                task_overrides[leaf] = where
     if task_name is None:
         raise ValueError("no layer sets task.name; set it in a config file or with task.name=<id>")
 
@@ -251,6 +274,15 @@ def _build(layers: List[tuple]) -> Config:
             + ", ".join(sorted(missing))
         )
 
+    # 6b. one seed: experiment.seed is the env's seed too
+    if "seed" not in root.task.cfg:
+        raise ValueError(
+            f"task '{task_name}' has no 'seed' field in its env cfg, so experiment.seed cannot "
+            "seed the env"
+        )
+    root.task.cfg.seed = root.experiment.seed
+    task_overrides["seed"] = "experiment.seed"
+
     # 7. the task dict is not type-checked by OmegaConf, so check it against the defaults
     _check_task_types(OmegaConf.to_container(root.task.cfg), task_defaults)
 
@@ -265,7 +297,7 @@ def _build(layers: List[tuple]) -> Config:
         ]
     }
 
-    cfg = Config(task_name, task_cfg, sections, derived, _meta(), root)
+    cfg = Config(task_name, task_cfg, sections, derived, _meta(), root, task_overrides)
 
     # 10. cross-field rules
     for name, obj in sections.items():
@@ -273,6 +305,28 @@ def _build(layers: List[tuple]) -> Config:
         if callable(hook):
             hook(cfg)
     return cfg
+
+
+def _reject_interpolation(data: Any, where: str, path: str = "") -> None:
+    """Configs never use OmegaConf interpolation; ``to_object`` would resolve it silently."""
+    if isinstance(data, dict):
+        for key, sub in data.items():
+            _reject_interpolation(sub, where, f"{path}.{key}" if path else str(key))
+    elif isinstance(data, list):
+        for i, sub in enumerate(data):
+            _reject_interpolation(sub, where, f"{path}[{i}]")
+    elif isinstance(data, str) and "${" in data:
+        raise ValueError(f"{where}: {path} = {data!r} uses '${{...}}' interpolation, which configs never use")
+
+
+def _leaf_paths(data: Any, path: str = "") -> List[str]:
+    """Dotted paths of every leaf (a list counts as one leaf)."""
+    if isinstance(data, dict):
+        out: List[str] = []
+        for key, sub in data.items():
+            out += _leaf_paths(sub, f"{path}.{key}" if path else str(key))
+        return out
+    return [path]
 
 
 def _check_task_types(merged: Any, default: Any, path: str = "task.cfg") -> None:
@@ -296,20 +350,68 @@ def _check_task_types(merged: Any, default: Any, path: str = "task.cfg") -> None
     if not ok:
         raise TypeError(
             f"{path}: expected {type(default).__name__}, got {type(merged).__name__} {merged!r}"
-            + (". Write floats as 1.0e-4: YAML reads 1e-4 as a string" if isinstance(default, float) else "")
         )
 
 
 # ------------------------------------------------------------------------------ dump / cli
-def dump(cfg: Config, path: str | Path) -> Path:
-    """Write ``resolved_config.yaml``: meta, derived, then the whole merged config."""
+def _normalize(value: Any) -> Any:
+    """Tuples read back from YAML as lists; compare them as lists."""
+    if isinstance(value, dict):
+        return {k: _normalize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize(v) for v in value]
+    return value
+
+
+_ABSENT = object()
+
+
+def _at(data: Any, dotted: str) -> Any:
+    for key in dotted.split("."):
+        if not isinstance(data, dict) or key not in data:
+            return _ABSENT
+        data = data[key]
+    return data
+
+
+def check_env_kept_overrides(cfg: Config, env_cfg: Any) -> None:
+    """Raise if the env changed a ``task.cfg`` value that a file or the CLI set.
+
+    Some envs rewrite parts of their cfg in ``__init__`` (Factory/Forge recompute
+    ``observation_space`` and ``state_space`` and copy ``scene.fixed_asset``/``held_asset`` from
+    ``task``), which would silently discard an override. Call this after the env exists.
+    """
+    expected = _normalize(OmegaConf.to_container(cfg.root.task.cfg, resolve=False))
+    live = _normalize(task_cfg_to_dict(env_cfg))
+    changed = []
+    for dotted, where in sorted(cfg.task_overrides.items()):
+        want, got = _at(expected, dotted), _at(live, dotted)
+        if want != got:
+            got_text = "<missing>" if got is _ABSENT else repr(got)
+            changed.append(f"  task.cfg.{dotted}: {where} set {want!r}, the env holds {got_text}")
+    if changed:
+        raise ValueError(
+            "the env changed task.cfg values that the config set, so those settings did not take "
+            "effect:\n" + "\n".join(changed) + "\nSet the field the env derives them from instead."
+        )
+
+
+def dump(cfg: Config, path: str | Path, env_cfg: Any) -> Path:
+    """Write ``resolved_config.yaml`` after the env exists: meta, derived, then every value.
+
+    The ``task.cfg`` section comes from ``env_cfg``, the live env's cfg (``env.unwrapped.cfg``),
+    so the file holds what the env actually ran with. Raises first if the env discarded an
+    override (:func:`check_env_kept_overrides`).
+    """
+    check_env_kept_overrides(cfg, env_cfg)
     out = Path(path)
     if out.suffix not in (".yaml", ".yml"):
         out = out / RESOLVED_NAME
     out.parent.mkdir(parents=True, exist_ok=True)
-    doc = OmegaConf.create({"meta": cfg.meta, "derived": cfg.derived})
-    doc = OmegaConf.merge(doc, cfg.root)
-    out.write_text(OmegaConf.to_yaml(doc))
+    body = OmegaConf.to_container(cfg.root, resolve=False)
+    body["task"]["cfg"] = task_cfg_to_dict(env_cfg)
+    doc = {"meta": cfg.meta, "derived": cfg.derived, **body}
+    out.write_text(OmegaConf.to_yaml(OmegaConf.create(doc)))
     return out
 
 

@@ -12,7 +12,9 @@ create a new conda env for this project.
 * Fail fast and loud. No silent fallbacks. Errors say what is wrong and which file or CLI
   argument caused it.
 * Use OmegaConf (installed with Isaac Lab). Do not use Hydra.
-* No OmegaConf interpolation (`${...}`) in configs.
+* No OmegaConf interpolation (`${...}`) in configs (a layer that uses it raises).
+* One seed: `experiment.seed` is also written to `task.cfg.seed`; no layer may set
+  `task.cfg.seed` itself.
 * `config.py` must import without Isaac Lab installed. Isaac Lab is imported only inside
   `load_task_cfg`, `task_cfg_to_dict` and `apply_task_cfg`.
 * Do not commit or push without approval. Report tests as passed / failed / total.
@@ -26,25 +28,48 @@ Load order: class defaults and task defaults → most-base file → … → pass
 1. Follow `base` from the passed file (each `base` is relative to the file that names it);
    raise on a missing file or a cycle, printing the chain; drop each file's `base` key.
 2. Check every leftover CLI arg is `a.b.c=value` and build that layer with `from_dotlist`.
-3. The last layer that sets `task.name` wins (CLI included); raise if none does.
+3. Per layer: reject `${...}` interpolation and `task.cfg.seed`, and record every
+   `task.cfg` path the layer sets (`Config.task_overrides`). The last layer that sets
+   `task.name` wins (CLI included); raise if none does.
 4. Build the root: one `OmegaConf.structured` node per registered section plus
    `task: {name, cfg}` from the task's env cfg defaults, then `set_struct(True)` so unknown
    keys raise at every level.
 5. Merge each layer in order; an OmegaConf error is re-raised with the layer name added.
-6. `OmegaConf.missing_keys` — raise listing every required field no layer set.
+6. `OmegaConf.missing_keys` — raise listing every required field no layer set. Then write
+   `experiment.seed` into `task.cfg.seed` (raise if the env cfg has no `seed` field).
 7. Walk the task dict against the defaults' types (OmegaConf does not type it): int is fine
    for float, bool is not an int or float, a `None` default accepts anything.
 8. Build the objects: `to_object` per section, `apply_task_cfg` for the env cfg.
 9. Derive `run_names = [f"{group}_a{i}"]`.
 10. Call `validate(cfg)` on each section object that defines it.
 11. Return a `Config` with `task_name`, `task_cfg`, the sections by name, `derived`, `meta`,
-    and the merged `root` (kept for `dump`).
+    the merged `root` (kept for `dump`), and `task_overrides`.
 
 Nothing may change the config after `load_config` returns.
 
-`dump(cfg, path)` writes `resolved_config.yaml`: `meta` (`pkg_commit`, `project_commit` or
-null, timestamp), `derived`, then the whole merged root. `load_from_run(run_dir, overrides)`
-uses that file minus `meta` and `derived` as the only file layer, then steps 2–11.
+`dump(cfg, path, env_cfg)` runs **after the env exists**, with `env_cfg = env.unwrapped.cfg`.
+It first calls `check_env_kept_overrides`, which raises if the env changed any `task.cfg`
+value a file or the CLI set (some envs rewrite their cfg in `__init__`; see below). Then it
+writes `resolved_config.yaml`: `meta` (`pkg_commit`, `project_commit` or null, timestamp),
+`derived`, then every value, with `task.cfg` taken from the live env cfg so the file holds
+what actually ran. `load_from_run(run_dir, overrides)` uses that file minus `meta`,
+`derived` and `task.cfg.seed` as the only file layer, then steps 2–11.
+
+## Task cfg fields an override cannot change
+
+* **Fields the env rewrites in `__init__`.** Factory and Forge (`FactoryEnv.__init__`)
+  recompute `observation_space` and `state_space` from `obs_order`, `state_order` and
+  `action_space`, and copy `scene.fixed_asset`, `scene.held_asset` (and the gear assets for
+  gear mesh) from `task`. Override the source instead: `obs_order`, `state_order`,
+  `task.fixed_asset`, `task.held_asset`. `dump` raises if an override was discarded.
+* **New keys in dict-valued fields** (e.g. `init_state.joint_pos`): struct mode allows
+  overriding existing keys only.
+* **Module constants and code** (e.g. Factory's `OBS_DIM_CFG`, `STATE_DIM_CFG`).
+* **Values a task cfg computes in `__post_init__`** from other fields are not recomputed when
+  you override those other fields. Forge and Factory have no `__post_init__`; check any new
+  task before relying on such an override.
+* **Setting a `None`-default field to a nested cfg** (e.g. a noise model) is untested; add a
+  GPU test before relying on it.
 
 ## Add a config class (package or project)
 
@@ -100,7 +125,8 @@ app_launcher = AppLauncher(args)              # start the sim app before loading
 
 register_section("controller", ControllerCfg)  # project sections, before loading
 cfg = load_from_args(args, overrides)
-dump(cfg, run_dir)                             # once, at run start
+env = gym.make(cfg.task_name, cfg=cfg.task_cfg)
+dump(cfg, run_dir, env.unwrapped.cfg)          # once, after the env exists
 ```
 
 ## Test layout

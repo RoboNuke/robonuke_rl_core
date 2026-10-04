@@ -6,7 +6,7 @@ import argparse
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 import pytest
 from omegaconf import MISSING, OmegaConf
@@ -38,6 +38,7 @@ class FakeEnvCfg:
     episode_length_s: float = 5.0
     device: str = "cuda:0"
     joint_ids: str = "slice(None,None,None)"  # Isaac Lab stores slices as strings
+    seed: Optional[int] = None  # Isaac Lab env cfgs default to None
     scene: FakeScene = field(default_factory=FakeScene)
 
 
@@ -240,10 +241,10 @@ def test_derived_run_names():
 # ------------------------------------------------------------------ 9. round trip
 def test_round_trip(tmp_path):
     first = load_config(FIXTURES / "task_override.yaml", ["experiment.num_agents=3"])
-    first_path = dump(first, tmp_path / "run_a")
+    first_path = dump(first, tmp_path / "run_a", first.task_cfg)
 
     second = load_from_run(tmp_path / "run_a")
-    second_path = dump(second, tmp_path / "run_b")
+    second_path = dump(second, tmp_path / "run_b", second.task_cfg)
 
     a = OmegaConf.to_container(OmegaConf.load(first_path))
     b = OmegaConf.to_container(OmegaConf.load(second_path))
@@ -258,7 +259,7 @@ def test_round_trip(tmp_path):
 
 def test_dump_writes_every_value_including_defaults(tmp_path):
     cfg = load_config(FIXTURES / "minimal.yaml")
-    data = OmegaConf.to_container(OmegaConf.load(dump(cfg, tmp_path / "run")))
+    data = OmegaConf.to_container(OmegaConf.load(dump(cfg, tmp_path / "run", cfg.task_cfg)))
     assert list(data) == ["meta", "derived", "task", "experiment", "wandb"]
     assert data["task"]["cfg"]["device"] == "cuda:0"  # a default no layer set
     assert data["task"]["cfg"]["scene"]["env_spacing"] == 1.5
@@ -268,7 +269,8 @@ def test_dump_writes_every_value_including_defaults(tmp_path):
 
 
 def test_from_run_takes_overrides_on_top(tmp_path):
-    dump(load_config(FIXTURES / "minimal.yaml"), tmp_path / "run")
+    first = load_config(FIXTURES / "minimal.yaml")
+    dump(first, tmp_path / "run", first.task_cfg)
     cfg = load_from_run(tmp_path / "run", ["experiment.num_agents=2", "task.cfg.scene.num_envs=512"])
     assert cfg.task_cfg.scene.num_envs == 512
     assert cfg.derived["run_names"] == ["fgain_k100_a0", "fgain_k100_a1"]
@@ -305,6 +307,9 @@ def test_builtin_validate_rules():
     with pytest.raises(ValueError) as err:
         load_config(FIXTURES / "minimal.yaml", ["wandb.group='bad group'"])
     assert "whitespace" in str(err.value)
+    with pytest.raises(ValueError) as err:
+        load_config(FIXTURES / "minimal.yaml", ["wandb.group=a/b"])
+    assert "'/'" in str(err.value)
 
 
 # ------------------------------------------------------------------ 11. register_section
@@ -352,3 +357,78 @@ def test_config_py_imports_without_isaac_lab():
     import sys
 
     assert not [m for m in sys.modules if m.split(".")[0] in ("isaaclab", "isaaclab_tasks", "omni")]
+
+
+# ------------------------------------------------------------------ 12. one seed
+def test_experiment_seed_is_the_env_seed():
+    cfg = load_config(FIXTURES / "minimal.yaml", ["experiment.seed=42"])
+    assert cfg.task_cfg.seed == 42
+    assert cfg.task_overrides["seed"] == "experiment.seed"
+
+
+@pytest.mark.parametrize("source", ["file", "cli"])
+def test_a_layer_may_not_set_the_env_seed(tmp_path, source):
+    if source == "file":
+        path = tmp_path / "seeded.yaml"
+        path.write_text(f"base: {FIXTURES / 'minimal.yaml'}\ntask:\n  cfg:\n    seed: 3\n")
+        args = (path, None)
+    else:
+        args = (FIXTURES / "minimal.yaml", ["task.cfg.seed=3"])
+    with pytest.raises(ValueError) as err:
+        load_config(*args)
+    assert "experiment.seed" in str(err.value)
+
+
+def test_task_without_a_seed_field_raises(monkeypatch):
+    @dataclass
+    class NoSeedEnvCfg:
+        decimation: int = 8
+        episode_length_s: float = 5.0
+        scene: FakeScene = field(default_factory=FakeScene)
+
+    monkeypatch.setattr(cfgmod, "load_task_cfg", lambda name: NoSeedEnvCfg())
+    with pytest.raises(ValueError) as err:
+        load_config(FIXTURES / "minimal.yaml")
+    assert "seed" in str(err.value)
+
+
+# ------------------------------------------------------------------ 13. the env keeps overrides
+def test_dump_raises_when_the_env_discarded_an_override(tmp_path):
+    cfg = load_config(FIXTURES / "minimal.yaml", ["task.cfg.scene.num_envs=128"])
+    cfg.task_cfg.scene.num_envs = 64  # what an env __init__ rewriting its cfg looks like
+    with pytest.raises(ValueError) as err:
+        dump(cfg, tmp_path / "run", cfg.task_cfg)
+    message = str(err.value)
+    assert "task.cfg.scene.num_envs" in message
+    assert "CLI set 128" in message and "64" in message
+    assert not (tmp_path / "run").exists()
+
+
+def test_dump_records_what_the_env_changed_on_its_own(tmp_path):
+    cfg = load_config(FIXTURES / "minimal.yaml")
+    cfg.task_cfg.episode_length_s = 7.0  # no layer set it, so the env may derive it
+    data = OmegaConf.to_container(OmegaConf.load(dump(cfg, tmp_path / "run", cfg.task_cfg)))
+    assert data["task"]["cfg"]["episode_length_s"] == 7.0
+
+
+def test_the_env_changing_the_seed_raises(tmp_path):
+    cfg = load_config(FIXTURES / "minimal.yaml", ["experiment.seed=5"])
+    cfg.task_cfg.seed = 6
+    with pytest.raises(ValueError) as err:
+        dump(cfg, tmp_path / "run", cfg.task_cfg)
+    assert "task.cfg.seed" in str(err.value)
+
+
+# ------------------------------------------------------------------ 14. no interpolation
+@pytest.mark.parametrize("source", ["file", "cli"])
+def test_interpolation_raises(tmp_path, source):
+    if source == "file":
+        path = tmp_path / "interp.yaml"
+        path.write_text(f"base: {FIXTURES / 'minimal.yaml'}\nwandb:\n  group: ${{wandb.project}}\n")
+        args, needle = (path, None), "interp.yaml"
+    else:
+        args, needle = (FIXTURES / "minimal.yaml", ["wandb.group=${wandb.project}"]), "CLI"
+    with pytest.raises(ValueError) as err:
+        load_config(*args)
+    message = str(err.value)
+    assert "interpolation" in message and needle in message
