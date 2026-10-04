@@ -1,0 +1,56 @@
+# The one config the whole GPU suite shares.
+#
+# Isaac Lab hangs when a second env is created in the same process (a closed env does not
+# release its USD stage) and no process-isolation pytest plugin is installed, so every GPU
+# test runs against a single env built from this file (see tests/conftest.py). Adding a GPU
+# test that needs a different env means splitting the suite into one process per directory.
+#
+# The task values differ from Forge's own defaults on purpose (decimation 8,
+# episode_length_s 10.0), so a test can prove the file layer reached the env cfg object.
+task:
+  name: Isaac-Forge-PegInsert-Direct-v0
+  cfg:
+    decimation: 4
+    episode_length_s: 7.5
+    scene:
+      num_envs: 8
+
+experiment:
+  num_agents: 2
+  seed: 7
+
+wandb:
+  entity: hur
+  project: smoke
+  group: gpu_smoke
+
+trainer:
+  learner: sac
+  total_timesteps: 24
+  write_interval: 8
+  checkpoint_interval: 8
+
+model:
+  actor:
+    actor_n: 1
+    actor_latent: 32
+  critic:
+    critic_n: 1
+    critic_latent: 32
+    n_atoms: 11
+
+memory:
+  size: 256
+
+sac:
+  batch_size: 8
+  learning_starts: 8
+
+ppo:
+  rollouts: 8
+  learning_epochs: 2
+  mini_batches: 2
+
+flash_sac:
+  batch_size: 8
+  learning_starts: 8

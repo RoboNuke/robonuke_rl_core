@@ -1,7 +1,7 @@
 # An override the env discards: FactoryEnv.__init__ recomputes observation_space from
 # obs_order + action_space, so setting it here never reaches the live env.
 # Spaces are stored in Isaac Lab's serialized form, hence the JSON string.
-base: forge_exp.yaml
+base: ../../gpu_forge.yaml
 task:
   cfg:
     observation_space: '{"type": "python", "space": "Box", "value": 999}'

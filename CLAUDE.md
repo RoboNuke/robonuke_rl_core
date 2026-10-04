@@ -1,8 +1,10 @@
 # robonuke_rl_core — Claude context
 
 Shared RL package for Isaac Lab research: skrl agents, several independent agents trained in
-parallel in one Isaac Sim instance on one GPU. Built area by area. **Today only the config
-manager exists** (`robonuke_rl_core/config.py`).
+parallel in one Isaac Sim instance on one GPU. Built area by area. **Today the config manager
+(`robonuke_rl_core/config.py`), the learners (`learners/`), the models (`models/`) and the
+memory (`memory/`) exist.** The models and the memory are provisional ports; they get their
+own design pass later.
 
 Test env: the `general` conda env (`/home/hunter/miniconda3/envs/general/bin/python`). Never
 create a new conda env for this project.
@@ -79,6 +81,85 @@ what actually ran. `load_from_run(run_dir, overrides)` uses that file minus `met
 * **Setting a `None`-default field to a nested cfg** (e.g. a noise model) is untested; add a
   GPU test before relying on it.
 
+## Learners
+
+Words: a **learner** is the RL algorithm (`sac`, `ppo`, `flash_sac`); an **agent** is one of
+`experiment.num_agents` independent policies trained in parallel; a **block network** holds
+every agent's parameters with a leading `num_agents` dimension so one forward pass serves all
+of them. Agent `i` owns envs `[i*envs_per_agent, (i+1)*envs_per_agent)`.
+
+### The independence rule
+
+**Nothing computed from agent `j`'s data may change agent `i`'s update.** That covers
+normalizers, gradient clipping, KL early stop, advantage normalization, LR rules and memory
+sampling: each is per agent. Two consequences that are easy to undo by accident:
+
+* **Reductions keep a constant denominator.** A masked loss is
+  `(keep * per_agent_mean).sum() / num_agents`, never a mean over the kept agents' rows: with
+  a mean over kept rows, dropping one agent rescales every other agent's gradient by
+  `num_agents / kept`. Adam does not wash that out — `eps`, stale moments, decoupled weight
+  decay and the clipping threshold all see the change. With every agent kept, the fixed
+  denominator is exactly the plain mean, so nothing changes in the common case.
+* **No data-driven learning rate.** One optimizer over block parameters holds a single LR, so
+  a KL-adaptive LR would couple the agents. Only `constant` and `cosine` exist.
+
+Test it the way `tests/learners/test_independence.py` does, which is the template for any new
+learner: fill the memory, `copy.deepcopy` the learner, make agent 1's data extreme in the copy
+(rewards x1e6, observations x1e3), run a few updates on both, and require agents 0 and 2 to be
+bit-identical (`torch.equal`) in weights, optimizer moments, normalizer stats and learner
+extras. Run more than one update: Adam's first step is sign-only, so a single step cannot show
+that a gradient's magnitude changed.
+
+### Add a learner
+
+1. Subclass `LearnerBase` in `robonuke_rl_core/learners/<name>.py`. Implement
+   `_create_memory_tensors`, `act`, `record_transition`, `_update_if_ready`, `update`, and the
+   checkpoint hooks (`_checkpoint_model_keys`, `_checkpoint_optimizer_keys`,
+   `_checkpoint_normalizers`, `_checkpoint_extras` / `_load_extras`).
+2. Add its config dataclass to `learners/cfg.py` and register the section at the bottom of
+   `config.py`. Add the name to `trainer.learner`'s allowed values (`learners/cfg.py:LEARNERS`).
+3. Add a builder to `MODEL_BUILDERS` in `models/factory.py`.
+4. Copy the independence test for it (one line in the parametrize list) and add it to
+   `tests/learners/GPU/test_train_smoke.py`'s `LEARNERS`.
+
+### Add a model
+
+1. Write the networks in `robonuke_rl_core/models/`, then a builder in `models/factory.py`.
+2. **Every parameter must be a block parameter** (leading dim `num_agents`) or an entry of a
+   per-agent `nn.ParameterList`; `clip_grad_norm_per_agent` raises on anything else, because a
+   shared parameter would couple the agents. Prefer the block parameter: an optimizer-state
+   tensor of shape `(1, k)` cannot be attributed to its agent, so a `ParameterList` entry's
+   Adam moments cannot be sliced per agent (that is why the SimBa actor's `log_std` is a block
+   parameter, not a list).
+3. Add a checkpoint round-trip test (`tests/learners/test_base.py` has the template: save
+   agent 2 of 3, load into slot 0 of a 1-agent learner, compare deterministic actions).
+
+### Emit a metric
+
+* **Env side:** put a `(num_envs,)` tensor in `infos["metrics_to_log"]`. The learner slices it
+  to each agent's envs and forwards it unchanged — no aggregation, no renaming. A wrong shape
+  raises; a missing key forwards nothing.
+* **Learner side:** build a `(num_agents,)` tensor and call `emit_per_agent({name: value},
+  step)`. The name is free.
+
+### Hooks
+
+Both lists live on the learner and are **empty by default** (nothing is logged, no extra loss):
+
+* `on_log`: `fn(agent_idx: int, metrics: dict[str, Tensor], step: int)`. Env metrics arrive as
+  `(envs_per_agent,)` tensors, learner metrics as 0-d tensors.
+* `aux_loss`: `fn(ctx: AuxLossContext) -> Tensor | None`, called for `ctx.target == "policy"`
+  and `"critic"`. A returned tensor is added to that loss.
+
+### Checkpoints
+
+Per agent, at `{trainer.output_dir}/{wandb.project}/{wandb.group}/{run_name}/checkpoints/`:
+`ckpt_{step}.pt` every `trainer.checkpoint_interval` steps, plus `ckpt_best.pt` whenever an
+agent's mean episode return over a write interval improves. A file holds that agent's model
+weights, optimizer state, normalizer stats, learner extras, the step and the mean return.
+`load_agent(path, slot)` loads one file into any slot; optimizer state only with
+`with_optimizer=True`, which needs `num_agents == 1`.
+
 ## Add a config class (package or project)
 
 1. Write a `@dataclass` next to the code it configures. Type every field with an
@@ -139,9 +220,15 @@ dump(cfg, run_dir, env.unwrapped.cfg)          # once, after the env exists
 
 ## Test layout
 
-`tests/<module>/` holds the tests for `robonuke_rl_core/<module>.py`. CPU tests sit directly
-in it; tests that need Isaac Sim or a GPU go in `tests/<module>/GPU/` and carry
-`@pytest.mark.gpu` (the marker is registered in `tests/conftest.py`).
+`tests/<module>/` holds the tests for `robonuke_rl_core/<module>.py` (or `<module>/`). CPU
+tests sit directly in it; tests that need Isaac Sim or a GPU go in `tests/<module>/GPU/` and
+carry `@pytest.mark.gpu` (the marker is registered in `tests/conftest.py`). Shared builders go
+in a plain module (`tests/learners/helpers.py`), not in a `conftest.py`: two `conftest`
+modules on the path shadow each other.
+
+The config tests run with only the sections `config.py` itself owns
+(`tests/config/conftest.py`), so a new section from another area does not make every config
+fixture incomplete.
 
 ```bash
 pytest          # CPU tests only (addopts = -m 'not gpu')

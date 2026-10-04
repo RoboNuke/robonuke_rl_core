@@ -101,7 +101,7 @@ def _fake_apply(env_cfg: Any, data: dict) -> Any:
 
 @pytest.fixture(autouse=True)
 def fake_task(monkeypatch):
-    """Replace the three Isaac Lab functions, and undo any section a test registers."""
+    """Replace the three Isaac Lab functions with the strict fake."""
 
     def load(name):
         if name != "Fake-Task-v0":
@@ -111,11 +111,7 @@ def fake_task(monkeypatch):
     monkeypatch.setattr(cfgmod, "load_task_cfg", load)
     monkeypatch.setattr(cfgmod, "task_cfg_to_dict", _fake_to_dict)
     monkeypatch.setattr(cfgmod, "apply_task_cfg", _fake_apply)
-
-    known = dict(cfgmod.SECTIONS)
-    yield
-    cfgmod.SECTIONS.clear()
-    cfgmod.SECTIONS.update(known)
+    yield  # conftest's only_config_sections fixture restores the registry
 
 
 # ------------------------------------------------------------------ 1. load order

@@ -17,7 +17,7 @@ include = ["robonuke_rl_core*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "tests/learners"]
 # plain `pytest` runs the CPU tests; `pytest -m gpu` runs the ones that need Isaac Sim.
 # the ROS 2 pytest plugins are on sys.path in a sourced ROS shell and fail to import there.
 addopts = "-m 'not gpu' -p no:launch_testing -p no:launch_ros"
