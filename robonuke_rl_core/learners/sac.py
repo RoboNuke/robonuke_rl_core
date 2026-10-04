@@ -1,4 +1,4 @@
-"""Block-parallel SAC.
+"""SAC over ``num_agents`` independent agents.
 
 Ported from RoboNuke/generalized_hybrid_vic_action_space ``learning/sac.py``, minus AMP,
 the distributed branches, the auxiliary-loss manager, the contact/rotation supervision and
@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..models.block_utils import clip_grad_norm_per_agent
+from ..optim import BlockAdamW, clip_grad_norm_per_agent, lr_at
 from ..models.factory import build_models
 from ..models.normalizer import BlockRunningNorm
 from ..losses.losses import LossContext
@@ -57,9 +57,13 @@ class SAC(LearnerBase):
             self.log_entropy_coefficient = torch.log(
                 self._entropy_coefficient.clone()
             ).requires_grad_(True)
-            # no weight decay on log_alpha: pulling it toward 0 has no meaning
-            self.entropy_optimizer = torch.optim.AdamW(
-                [self.log_entropy_coefficient], lr=self.cfg.entropy_lr, weight_decay=0.0
+            # no weight decay on log_alpha: pulling it toward 0 has no meaning. Its leading
+            # dim is the agent, so one BlockAdamW is N independent temperature optimizers.
+            self.entropy_optimizer = BlockAdamW(
+                [self.log_entropy_coefficient],
+                self.num_agents,
+                lr=self.cfg.entropy_lr,
+                weight_decay=0.0,
             )
 
         self._build_optimizers()
@@ -92,29 +96,30 @@ class SAC(LearnerBase):
         )
 
     def _build_optimizers(self) -> None:
-        self.policy_optimizer = torch.optim.AdamW(
-            self.policy.parameters(), lr=self.cfg.actor_lr, weight_decay=self.cfg.weight_decay
+        self.policy_optimizer = BlockAdamW(
+            self.policy.parameters(),
+            self.num_agents,
+            lr=self.cfg.actor_lr,
+            weight_decay=self.cfg.weight_decay,
         )
-        self.critic_optimizer = torch.optim.AdamW(
+        self.critic_optimizer = BlockAdamW(
             itertools.chain(self.critic_1.parameters(), self.critic_2.parameters()),
+            self.num_agents,
             lr=self.cfg.critic_lr,
             weight_decay=self.cfg.weight_decay,
         )
-        self.policy_scheduler = None
-        self.critic_scheduler = None
-        self._lr_built = False
+        self._updates = 0
 
-    def _build_cosine_lr(self, timesteps: int) -> None:
-        """Cosine LR for actor and critic, decayed to ``lr_end`` over the run's gradient steps."""
-        from torch.optim.lr_scheduler import CosineAnnealingLR
-
-        update_steps = max(1, int(timesteps) - int(self.cfg.learning_starts))
-        t_max = max(1, update_steps * int(self.cfg.gradient_steps))
-        self.policy_scheduler = CosineAnnealingLR(
-            self.policy_optimizer, T_max=t_max, eta_min=self.cfg.lr_end
+    def _set_learning_rates(self, timesteps: int) -> None:
+        """The LR for this gradient step, from the update count alone (never from the data)."""
+        if self.cfg.lr_schedule == "constant":
+            return
+        total = max(1, (int(timesteps) - int(self.cfg.learning_starts)) * int(self.cfg.gradient_steps))
+        self.policy_optimizer.set_lr(
+            lr_at(self._updates, total, self.cfg.actor_lr, self.cfg.lr_end, self.cfg.lr_schedule)
         )
-        self.critic_scheduler = CosineAnnealingLR(
-            self.critic_optimizer, T_max=t_max, eta_min=self.cfg.lr_end
+        self.critic_optimizer.set_lr(
+            lr_at(self._updates, total, self.cfg.critic_lr, self.cfg.lr_end, self.cfg.lr_schedule)
         )
 
     def _create_memory_tensors(self) -> None:
@@ -150,7 +155,7 @@ class SAC(LearnerBase):
         # no_grad: these actions only drive the env; the update re-runs the policy on replay
         # batches. A live graph here would be spliced into the env's action buffers and grow.
         with torch.no_grad():
-            return self._sample_rollout_action(inputs, timestep=timestep)
+            return self.policy.act(inputs, role="policy")
 
     def record_transition(
         self,
@@ -169,7 +174,6 @@ class SAC(LearnerBase):
     ) -> None:
         self._forward_env_metrics(infos, timestep)
         self._track_episodes(rewards, terminated, truncated)
-        self._update_return_stats(rewards=rewards, terminated=terminated, truncated=truncated)
 
         if not self.training:
             return
@@ -198,21 +202,7 @@ class SAC(LearnerBase):
             self.enable_models_training_mode(False)
         self._maybe_periodic_reset(timestep)
 
-    # ------------------------------------------------------------------ hooks FlashSAC overrides
-    def _sample_rollout_action(self, inputs: dict, *, timestep: int):
-        """Rollout sampling. Base: a stochastic squashed-Gaussian sample."""
-        return self.policy.act(inputs, role="policy")
-
-    def _should_update_actor(self, gradient_step: int) -> bool:
-        """Actor-update gate. Base: every gradient step."""
-        return True
-
-    def _post_optimizer_step(self) -> None:
-        """After both optimizer steps and the target update. Base: nothing."""
-
-    def _update_return_stats(self, *, rewards, terminated, truncated) -> None:
-        """Rollout statistics hook. Base: nothing (FlashSAC's reward scaling uses it)."""
-
+    # ------------------------------------------------------------------ losses
     def _compute_critic_loss(self, *, sampled, inputs, next_inputs, critic_inputs, critic_next_inputs, rows):
         """Min-twin bootstrapped target + MSE over both critics."""
         with torch.no_grad():
@@ -253,11 +243,9 @@ class SAC(LearnerBase):
     # ------------------------------------------------------------------ update
     def update(self, *, timestep: int, timesteps: int) -> None:
         rows = self.cfg.batch_size  # per agent; the memory returns N * batch_size rows
-        if self.cfg.lr_schedule == "cosine" and not self._lr_built:
-            self._build_cosine_lr(timesteps)
-            self._lr_built = True
 
         for gradient_step in range(self.cfg.gradient_steps):
+            self._set_learning_rates(timesteps)
             sampled = dict(
                 zip(
                     self._tensors_names,
@@ -306,52 +294,45 @@ class SAC(LearnerBase):
             )
             self.critic_optimizer.step()
 
-            actor_ran = self._should_update_actor(gradient_step)
-            policy_grad_norms = log_prob = None
-            if actor_ran:
-                (
-                    policy_loss,
-                    actions,
-                    log_prob,
-                    critic_1_pi,
-                    critic_2_pi,
-                    outputs,
-                ) = self._compute_actor_loss(
-                    sampled=sampled, inputs=inputs, critic_inputs=critic_inputs, rows=rows
+            (
+                policy_loss,
+                actions,
+                log_prob,
+                critic_1_pi,
+                critic_2_pi,
+                outputs,
+            ) = self._compute_actor_loss(
+                sampled=sampled, inputs=inputs, critic_inputs=critic_inputs, rows=rows
+            )
+            aux = self.compute_aux_loss(
+                LossContext(
+                    learner=self,
+                    step=timestep,
+                    target="policy",
+                    sampled=sampled,
+                    inputs=inputs,
+                    actions=actions,
+                    log_prob=log_prob,
+                    policy_outputs=outputs,
                 )
-                aux = self.compute_aux_loss(
-                    LossContext(
-                        learner=self,
-                        step=timestep,
-                        target="policy",
-                        sampled=sampled,
-                        inputs=inputs,
-                        actions=actions,
-                        log_prob=log_prob,
-                        policy_outputs=outputs,
-                    )
-                )
-                if aux is not None:
-                    policy_loss = policy_loss + aux
+            )
+            if aux is not None:
+                policy_loss = policy_loss + aux
 
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                policy_grad_norms = clip_grad_norm_per_agent(
-                    self.policy, self.num_agents, self.cfg.grad_norm_clip
-                )
-                self.policy_optimizer.step()
+            self.policy_optimizer.zero_grad()
+            policy_loss.backward()
+            policy_grad_norms = clip_grad_norm_per_agent(
+                self.policy, self.num_agents, self.cfg.grad_norm_clip
+            )
+            self.policy_optimizer.step()
 
-                if self.cfg.learn_entropy:
-                    self._update_entropy(log_prob, rows)
+            if self.cfg.learn_entropy:
+                self._update_entropy(log_prob, rows)
 
             self.target_critic_1.update_parameters(self.critic_1, polyak=self.cfg.polyak)
             self.target_critic_2.update_parameters(self.critic_2, polyak=self.cfg.polyak)
-            self._post_optimizer_step()
 
-            if self.policy_scheduler is not None:
-                self.policy_scheduler.step()
-            if self.critic_scheduler is not None:
-                self.critic_scheduler.step()
+            self._updates += 1
 
             if self.on_log:
                 self._emit_update_metrics(
@@ -369,7 +350,7 @@ class SAC(LearnerBase):
         """Per-agent temperature step: each agent's loss term holds only its own rows."""
         log_prob_per_agent = log_prob.view(self.num_agents, rows, 1).mean(dim=1)  # (N, 1)
         if self.cfg.entropy_loss_form == "alpha":
-            # FlashSAC's form: alpha * (H_hat - H_target), adaptation rate ~ alpha
+            # the multiplicative form: alpha * (H_hat - H_target); the adaptation rate is ~alpha
             entropy_loss = torch.exp(self.log_entropy_coefficient) * (
                 -log_prob_per_agent - self._target_entropy
             ).detach()
@@ -415,21 +396,11 @@ class SAC(LearnerBase):
                 "q/target_mean": self.per_agent_mean(target_values, rows),
                 "grad_norm/critic": critic_grad_norms,
                 "entropy/coefficient": self._entropy_coefficient.reshape(-1),
-                "lr/actor": torch.full(
-                    (self.num_agents,),
-                    self.policy_optimizer.param_groups[0]["lr"],
-                    device=self.device,
-                ),
-                "lr/critic": torch.full(
-                    (self.num_agents,),
-                    self.critic_optimizer.param_groups[0]["lr"],
-                    device=self.device,
-                ),
+                "lr/actor": self.policy_optimizer.lr.to(torch.float32),
+                "lr/critic": self.critic_optimizer.lr.to(torch.float32),
             }
-            if policy_grad_norms is not None:
-                metrics["grad_norm/policy"] = policy_grad_norms
-            if log_prob is not None:
-                metrics["policy/log_prob"] = self.per_agent_mean(log_prob, rows)
+            metrics["grad_norm/policy"] = policy_grad_norms
+            metrics["policy/log_prob"] = self.per_agent_mean(log_prob, rows)
             self.emit_per_agent(metrics, timestep)
 
     # ------------------------------------------------------------------ SimBa periodic reset
@@ -455,7 +426,7 @@ class SAC(LearnerBase):
                 "be rebuilt"
             )
         fresh = build_models(
-            self._learner_name(),
+            "sac",
             self._model_cfg,
             self.observation_space,
             self.state_space,
@@ -479,12 +450,12 @@ class SAC(LearnerBase):
             self.log_entropy_coefficient = torch.log(
                 self._entropy_coefficient.clone()
             ).requires_grad_(True)
-            self.entropy_optimizer = torch.optim.AdamW(
-                [self.log_entropy_coefficient], lr=self.cfg.entropy_lr, weight_decay=0.0
+            self.entropy_optimizer = BlockAdamW(
+                [self.log_entropy_coefficient],
+                self.num_agents,
+                lr=self.cfg.entropy_lr,
+                weight_decay=0.0,
             )
-
-    def _learner_name(self) -> str:
-        return "sac"
 
     # ------------------------------------------------------------------ checkpoints
     def _checkpoint_model_keys(self) -> List[str]:

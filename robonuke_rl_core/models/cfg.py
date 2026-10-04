@@ -39,15 +39,12 @@ class ActorCfg:
 
 @dataclass
 class CriticCfg:
-    """Critic network. ``n_atoms`` / ``v_min`` / ``v_max`` are FlashSAC's categorical support."""
+    """Critic network."""
 
     critic_n: int = 2
     critic_latent: int = 512
     critic_output_init_mean: float = 0.0
     clip_actions: bool = False
-    n_atoms: int = 101
-    v_min: float = -5.0
-    v_max: float = 5.0
 
 
 @dataclass
@@ -68,9 +65,3 @@ class ModelCfg:
                 f"model.actor.min_log_std ({self.actor.min_log_std}) must be below "
                 f"max_log_std ({self.actor.max_log_std})"
             )
-        if self.critic.v_min >= self.critic.v_max:
-            raise ValueError(
-                f"model.critic.v_min ({self.critic.v_min}) must be below v_max ({self.critic.v_max})"
-            )
-        if self.critic.n_atoms < 2:
-            raise ValueError(f"model.critic.n_atoms must be >= 2, got {self.critic.n_atoms}")

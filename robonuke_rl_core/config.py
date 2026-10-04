@@ -479,7 +479,7 @@ def load_from_args(args: argparse.Namespace, overrides: Any = None) -> Config:
 
 # package sections are registered here, at the bottom of this file. The imports sit here, not
 # at the top, because the config classes they bring in import nothing from this module.
-from .learners.cfg import FlashSACCfg, PPOCfg, SACCfg, TrainerCfg  # noqa: E402
+from .learners.cfg import PPOCfg, SACCfg, TrainerCfg  # noqa: E402
 from .losses.cfg import LossesCfg  # noqa: E402
 from .memory.cfg import MemoryCfg  # noqa: E402
 from .models.cfg import ModelCfg  # noqa: E402
@@ -489,7 +489,6 @@ register_section("wandb", WandbCfg)
 register_section("trainer", TrainerCfg)
 register_section("sac", SACCfg)
 register_section("ppo", PPOCfg)
-register_section("flash_sac", FlashSACCfg)
 register_section("model", ModelCfg)
 register_section("memory", MemoryCfg)
 register_section("losses", LossesCfg)

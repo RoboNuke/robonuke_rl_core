@@ -5,12 +5,14 @@ training pipeline, an evaluation pipeline, configuration and experiment tracking
 env definitions.
 
 Several agents train in parallel in one Isaac Sim instance on one GPU. Agent `i` owns a
-contiguous block of envs, every network holds all agents' parameters with a leading
-`num_agents` dimension, and nothing computed from agent `j`'s data touches agent `i`'s update.
+contiguous block of envs; the models are ordinary single-agent `nn.Module`s stacked with
+`torch.vmap` so every agent runs in one pass, one `BlockAdamW` is N independent AdamW
+instances over the stacked parameters, and nothing computed from agent `j`'s data touches
+agent `i`'s update.
 
 Built area by area. Today: the config manager (`robonuke_rl_core/config.py`), the learners
-(`learners/`), the models (`models/`), the memory (`memory/`) and the auxiliary losses
-(`losses/`).
+(`learners/`), the models (`models/`), the optimizer (`optim.py`), the memory (`memory/`) and
+the auxiliary losses (`losses/`).
 
 ## Running
 
@@ -82,7 +84,7 @@ run-name field.
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |
-| `learner` | str | required | which learner runs: `sac`, `ppo` or `flash_sac`. Only that section is used; all are dumped |
+| `learner` | str | required | which learner runs: `sac` or `ppo`. Only that section is used; both are dumped |
 | `total_timesteps` | int | required | env steps to train for |
 | `write_interval` | int | `1000` | env steps between episode-stat flushes through the `on_log` hooks (0 disables) |
 | `checkpoint_interval` | int | `10000` | env steps between per-agent checkpoints (0 disables) |
@@ -113,7 +115,7 @@ Soft Actor-Critic. `batch_size` and the memory are per agent.
 | `learn_entropy` | bool | `True` | learn the temperature per agent |
 | `initial_entropy_value` | float | `0.2` | starting temperature |
 | `target_entropy` | float or null | `null` | target entropy; `null` means `-|A|` |
-| `entropy_loss_form` | str | `"log_alpha"` | `log_alpha` (skrl's form) or `alpha` (FlashSAC's gentler form) |
+| `entropy_loss_form` | str | `"log_alpha"` | `log_alpha` (skrl's form) or `alpha` (the gentler multiplicative form) |
 | `periodic_reset_enabled` | bool | `False` | SimBa periodic reset: rebuild networks and optimizers, keep the replay buffer and the normalizer stats |
 | `periodic_reset_frequency` | int | `0` | env steps between resets; must be > 0 when resets are enabled |
 | `periodic_reset_max` | int | `0` | maximum number of resets (0 = unlimited) |
@@ -150,29 +152,10 @@ Proximal Policy Optimization. The rollout buffer is `rollouts` steps per env;
 | `normalize_values` | bool | `True` | per-agent running normalization of values and returns |
 | `value_update_ratio` | int | `1` | extra value-only updates per minibatch after the combined update (1 = none) |
 
-## flash_sac
-
-FlashSAC: every `sac` field above, plus a distributional critic (`model.critic.n_atoms`,
-`v_min`, `v_max`), weight normalization, and noise repetition.
-
-| field | type | default | what it does |
-| --- | --- | --- | --- |
-| *(every field of `sac`)* | | | same meaning as above |
-| `actor_update_period` | int | `1` | gradient steps between actor updates; the critic updates every step |
-| `weight_norm_enabled` | bool | `True` | project each weight row onto the unit sphere after every step |
-| `noise_repeat_enabled` | bool | `True` | hold a rollout noise draw for a Zeta-sampled number of steps |
-| `noise_repeat_zeta_mu` | float | `2.0` | Zeta exponent for the hold length (larger = shorter holds) |
-| `noise_repeat_max` | int | `16` | longest hold, in steps |
-| `reward_scaling_enabled` | bool | `False` | adaptive reward scaling from the per-agent running discounted-return variance |
-| `reward_scaling_g_max` | float | `5.0` | scaling cap; must equal `model.critic.v_max` so scaled returns land inside the categorical support |
-| `reward_scaling_eps` | float | `1.0e-8` | epsilon in the scaling denominator |
-| `target_entropy_mode` | str | `"neg_action_dim"` | `neg_action_dim` (SAC's `-|A|`) or `unified` (FlashSAC's `0.5*|A|*log(2*pi*e*sigma^2)`); ignored when `target_entropy` is set |
-| `entropy_sigma_target` | float | `0.15` | sigma of the `unified` target entropy |
-
 ## model
 
-The networks. `actor_*` sizes feed the policy, `critic_*` the critics; `n_atoms` / `v_min` /
-`v_max` are FlashSAC's categorical support and are ignored by the SimBa critics.
+The networks: plain single-agent modules, stacked across agents with `torch.vmap`. `actor_*`
+sizes feed the policy, `critic_*` the critics.
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |
@@ -181,7 +164,7 @@ The networks. `actor_*` sizes feed the policy, `critic_*` the critics; `n_atoms`
 | `actor.act_init_std` | float | `0.60653066` | initial action standard deviation |
 | `actor.second_act_init_std` | float or null | `null` | a second initial std, for the dims in `second_act_init_std_dims` |
 | `actor.second_act_init_std_dims` | list[int] or null | `null` | action dims that start at `second_act_init_std` |
-| `actor.last_layer_scale` | float | `1.0` | scale on the action-mean output weights at init (FlashSAC applies it at forward time) |
+| `actor.last_layer_scale` | float | `1.0` | scale applied to the action-mean output weights at init |
 | `actor.clip_log_std` | bool | `True` | clamp log_std to `[min_log_std, max_log_std]` |
 | `actor.min_log_std` | float | `-20.0` | lower log_std bound; must be below `max_log_std` |
 | `actor.max_log_std` | float | `2.0` | upper log_std bound |
@@ -194,9 +177,6 @@ The networks. `actor_*` sizes feed the policy, `critic_*` the critics; `n_atoms`
 | `critic.critic_latent` | int | `512` | critic hidden width |
 | `critic.critic_output_init_mean` | float | `0.0` | initial critic output bias (SimBa critics) |
 | `critic.clip_actions` | bool | `False` | clip actions to the action space inside the critic |
-| `critic.n_atoms` | int | `101` | FlashSAC: atoms in the categorical value distribution (>= 2) |
-| `critic.v_min` | float | `-5.0` | FlashSAC: lowest atom; must be below `v_max` |
-| `critic.v_max` | float | `5.0` | FlashSAC: highest atom |
 
 ## memory
 
@@ -220,19 +200,15 @@ new config fields. An empty list means no extra loss and no hook.
 ```yaml
 losses:
   terms:
-    - name: action_l2
+    - name: my_project_loss
       target: policy
       weight: 0.1
 ```
 
-### Built-in losses
-
-| name | targets | kwargs | what it does |
-| --- | --- | --- | --- |
-| `action_l2` | `policy` | *(none)* | mean squared action magnitude per agent, a regularizer toward smaller actions |
-
-Projects add their own with `@register_loss` before loading the config; see the "Add a loss"
-checklist in `CLAUDE.md`.
+**The package ships no built-in loss**, so every `name` comes from a project's own
+`@register_loss` (registered before the config is loaded). A penalty on action magnitude
+belongs in the env's reward, not in a policy-side term. See the "Add a loss" checklist in
+`CLAUDE.md`.
 
 ## derived and meta
 

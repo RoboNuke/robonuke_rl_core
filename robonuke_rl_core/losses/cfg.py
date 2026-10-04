@@ -1,10 +1,11 @@
 """Losses configuration: the `losses` section.
 
-A list of terms, so adding a loss needs no new config fields:
+A list of terms, so adding a loss needs no new config fields. The package ships no loss, so
+every name here comes from a project's own ``@register_loss``:
 
     losses:
       terms:
-        - name: action_l2
+        - name: my_project_loss
           target: policy
           weight: 0.1
 """

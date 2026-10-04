@@ -9,14 +9,8 @@ import gymnasium
 import numpy as np
 import pytest
 import torch
-import torch.nn as nn
 
-from robonuke_rl_core.models.block_utils import (
-    assign_block_slice,
-    merge_optimizer_states,
-    slice_block_state_dict,
-    slice_optimizer_state,
-)
+from robonuke_rl_core.optim import BlockAdamW
 from robonuke_rl_core.models.cfg import ActorCfg, CriticCfg, ModelCfg
 from robonuke_rl_core.models.factory import MODEL_BUILDERS, build_models
 
@@ -35,7 +29,7 @@ def box(dim: int) -> gymnasium.spaces.Box:
 def tiny_cfg() -> ModelCfg:
     return ModelCfg(
         actor=ActorCfg(actor_n=1, actor_latent=8),
-        critic=CriticCfg(critic_n=1, critic_latent=8, n_atoms=5, v_min=-2.0, v_max=2.0),
+        critic=CriticCfg(critic_n=1, critic_latent=8),
     )
 
 
@@ -54,9 +48,6 @@ def make(learner: str, num_agents: int = NUM_AGENTS, asymmetric: bool = False) -
 
 def forward(model, observations: torch.Tensor, actions: torch.Tensor, training: bool = False):
     """One forward pass, whichever kind of model this is."""
-    if hasattr(model, "forward_dist"):  # FlashSAC critic
-        value, _ = model.forward_dist(observations, actions, training=training)
-        return value
     inputs = {"observations": observations, "training": training}
     if model.__class__.__name__.endswith("QCritic"):
         inputs["taken_actions"] = actions
@@ -69,28 +60,22 @@ def forward(model, observations: torch.Tensor, actions: torch.Tensor, training: 
     return outputs["mean_actions"]  # deterministic: no sampling noise
 
 
-# ------------------------------------------------------------------ 1. block parameters only
+# ------------------------------------------------------------------ 1. stacked parameters only
 @pytest.mark.parametrize("learner", LEARNERS)
-def test_every_parameter_is_block_parallel(learner):
+def test_every_parameter_is_stacked_across_agents(learner):
     for name, model in make(learner).items():
-        lists = [
-            prefix
-            for prefix, module in model.named_modules()
-            if isinstance(module, nn.ParameterList) and len(module) == NUM_AGENTS
-        ]
         for param_name, param in model.named_parameters():
-            is_block = param.dim() >= 1 and param.shape[0] == NUM_AGENTS
-            in_list = any(param_name.startswith(prefix + ".") for prefix in lists)
-            assert is_block or in_list, (
-                f"{learner}/{name}.{param_name} has shape {tuple(param.shape)}: not a block "
-                f"parameter (leading dim {NUM_AGENTS}) and not a per-agent ParameterList entry"
+            assert param.dim() >= 1 and param.shape[0] == NUM_AGENTS, (
+                f"{learner}/{name}.{param_name} has shape {tuple(param.shape)}: every parameter "
+                f"needs a leading agent dimension of {NUM_AGENTS}, or it couples the agents"
             )
+            assert not param.is_meta, f"{learner}/{name}.{param_name} is a meta tensor"
 
 
 # ------------------------------------------------------------------ 2. independence
 @pytest.mark.parametrize("learner", LEARNERS)
 def test_one_agents_rows_cannot_change_another_agents_output(learner):
-    """BlockBatchNorm runs in training mode here, so its batch statistics are exercised."""
+    """Agent 1's rows only; the other agents' outputs must be untouched."""
     torch.manual_seed(1)
     observations = torch.randn(NUM_AGENTS * ROWS, OBS_DIM)
     actions = torch.rand(NUM_AGENTS * ROWS, ACT_DIM) * 2.0 - 1.0
@@ -124,9 +109,7 @@ def test_slicing_one_agent_into_a_single_agent_model(learner):
     padding = torch.zeros(2 * ROWS, OBS_DIM), torch.zeros(2 * ROWS, ACT_DIM)
 
     for name, model in source.items():
-        assign_block_slice(
-            target[name], 0, 1, slice_block_state_dict(model, 2, NUM_AGENTS)
-        )
+        target[name].load_agent_state_dict(0, model.agent_state_dict(2))
         model.enable_training_mode(False)
         target[name].enable_training_mode(False)
         with torch.no_grad():
@@ -141,26 +124,21 @@ def test_slicing_one_agent_into_a_single_agent_model(learner):
 
 
 @pytest.mark.parametrize("learner", LEARNERS)
-def test_optimizer_state_slices_and_merges(learner):
-    models = make(learner)
-    for name, model in models.items():
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+def test_optimizer_state_slices_per_agent(learner):
+    """One agent's optimizer slice loads into one slot of another optimizer."""
+    for name, model in make(learner).items():
+        source = BlockAdamW(model.parameters(), NUM_AGENTS, lr=0.1)
         for param in model.parameters():
             param.grad = torch.randn_like(param)
-        optimizer.step()
+        source.step()
 
-        per_agent = [
-            slice_optimizer_state(optimizer.state_dict(), agent, NUM_AGENTS)
-            for agent in range(NUM_AGENTS)
-        ]
-        merged = merge_optimizer_states(per_agent, NUM_AGENTS)
-        original = optimizer.state_dict()["state"]
-        for param_id, state in original.items():
-            for key, value in state.items():
-                if torch.is_tensor(value) and value.dim() >= 1 and value.shape[0] == NUM_AGENTS:
-                    assert torch.equal(merged["state"][param_id][key], value), f"{name}.{key}"
-        # and the merged state loads back into an identically shaped optimizer
-        optimizer.load_state_dict(merged)
+        target_model = make(learner, num_agents=1)[name]
+        target = BlockAdamW(target_model.parameters(), 1, lr=0.1)
+        target.load_agent_state_dict(0, source.agent_state_dict(2))
+        for index in range(len(source.params)):
+            assert torch.equal(target.exp_avg[index][0], source.exp_avg[index][2]), name
+            assert torch.equal(target.exp_avg_sq[index][0], source.exp_avg_sq[index][2]), name
+        assert int(target.t[0]) == int(source.t[2])
 
 
 # ------------------------------------------------------------------ 4. unknown learner

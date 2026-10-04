@@ -87,7 +87,7 @@ what actually ran. `load_from_run(run_dir, overrides)` uses that file minus `met
 
 ## Learners
 
-Words: a **learner** is the RL algorithm (`sac`, `ppo`, `flash_sac`); an **agent** is one of
+Words: a **learner** is the RL algorithm (`sac`, `ppo`); an **agent** is one of
 `experiment.num_agents` independent policies trained in parallel; a **block network** holds
 every agent's parameters with a leading `num_agents` dimension so one forward pass serves all
 of them. Agent `i` owns envs `[i*envs_per_agent, (i+1)*envs_per_agent)`.
@@ -104,15 +104,16 @@ sampling: each is per agent. Two consequences that are easy to undo by accident:
   `num_agents / kept`. Adam does not wash that out — `eps`, stale moments, decoupled weight
   decay and the clipping threshold all see the change. With every agent kept, the fixed
   denominator is exactly the plain mean, so nothing changes in the common case.
-* **No data-driven learning rate.** One optimizer over block parameters holds a single LR, so
-  a KL-adaptive LR would couple the agents. Only `constant` and `cosine` exist.
-* **A dropped agent is frozen, and nothing else depends on who dropped.** PPO's KL early stop
-  masks the agent's policy loss *and* steps the policy optimizer through
-  `step_with_frozen_agents`, which puts the dropped agent's weights and Adam moments back
-  after the step (otherwise momentum and weight decay keep moving it). The step is still taken
-  on every minibatch, also when every agent is dropped, so the shared Adam step counter never
-  depends on another agent's KL. There is no early `break`, and the critic trains on every
-  minibatch for every agent.
+* **No data-driven learning rate.** `BlockAdamW` could hold one LR per agent, but the
+  schedule is deliberately a function of the global update count only (`lr_at`): a KL-adaptive
+  LR would couple the agents. Only `constant` and `cosine` exist.
+* **A dropped agent is frozen, policy and critic.** PPO's KL early stop masks the agent's
+  policy loss *and* passes the keep mask to both optimizers: `BlockAdamW.step(keep)` computes
+  the update and writes it only where `keep` is true, so a frozen agent comes out
+  bit-identical — weights, both Adam moments, and its own step count. When **every** agent is
+  dropped the epoch `break`s out; with the whole agent frozen that skips only masked work, so
+  it couples nothing. (SpinningUp-style "the critic keeps training" is a one-argument change:
+  pass `keep=None` to the value optimizer.)
 * **Loading one agent touches one slot.** Every per-agent tensor (including SAC's target
   critics) is saved and loaded per slot; nothing on load may write a whole block.
 
@@ -124,6 +125,30 @@ extras. Run more than one update: Adam's first step is sign-only, so a single st
 that a gradient's magnitude changed. Make sure each case really runs the path it names: the
 test checks the *weights* changed (normalizer stats alone do not count), and the KL cases
 assert from `ppo/kept` that agent 1 was dropped in the copy but not in the control.
+
+### The optimizer
+
+`BlockAdamW` (`robonuke_rl_core/optim.py`) is the only optimizer. AdamW's update is
+elementwise, so N independent `torch.optim.AdamW` instances are the same thing as one update
+rule over parameters with a leading agent dimension, plus:
+
+* a **per-agent step count** `t`, so the bias correction is right for an agent that was frozen
+  for part of training;
+* a **per-agent learning rate** (`set_lr` takes a scalar or an `(N,)` tensor);
+* a **keep mask**: `step(keep)` writes the update only where `keep` is true, leaving a frozen
+  agent bit-identical.
+
+Every parameter must have a leading dimension of `num_agents` or the constructor raises, so a
+shared parameter cannot silently couple the agents. There are no param groups, no amsgrad and
+no foreach/fused plumbing — add a feature with a test when something needs it.
+
+`tests/optim/test_block_adamw.py` is the guard: it runs N plain models with N
+`torch.optim.AdamW` instances beside the stacked version for 50 steps and requires a match at
+`rtol=1e-6` (float32) and `1e-12` (float64), with and without an agent frozen for part of the
+run. If it fails, the optimizer is wrong — fix it rather than loosening the tolerance.
+
+The LR schedule is `lr_at(update, total_updates, lr, lr_end, schedule)`: `constant` or
+`cosine`, from the update count alone.
 
 ### Add a learner
 
@@ -139,26 +164,31 @@ assert from `ppo/kept` that agent 1 was dropped in the copy but not in the contr
 
 ### Add a model
 
-1. Write the class in `robonuke_rl_core/models/`. **Every parameter must be a block parameter**
-   (leading dim `num_agents`) or an entry of a per-agent `nn.ParameterList`;
-   `clip_grad_norm_per_agent` raises on anything else, because a shared parameter would couple
-   the agents. Prefer the block parameter: an optimizer-state tensor of shape `(1, k)` cannot
-   be attributed to its agent, so a `ParameterList` entry's Adam moments cannot be sliced per
-   agent (that is why the SimBa actor's `log_std` is a block parameter).
-2. Add a builder to `MODEL_BUILDERS` in `models/factory.py`, keyed by learner name. Critics
+1. Write an ordinary single-agent `nn.Module` in `robonuke_rl_core/models/`. Normal PyTorch:
+   `nn.Linear`, `nn.LayerNorm`, whatever you like. **No block layers, no einsum, no per-agent
+   `ParameterList`** — those are gone.
+2. Two rules, because the module runs under `torch.vmap`: **no sampling and no in-place buffer
+   mutation inside `forward`**. Return distribution parameters and build the distribution
+   outside (that is what the wrappers in `models/simba.py` do). A vmap "falling back to a
+   for-loop" warning is a failure, not a nuisance — `VmapEnsemble.forward` raises on it.
+3. Wrap it: `VmapEnsemble(build_fn, num_agents, device=...)` builds N copies under sequential
+   RNG (so the inits differ), stacks them with `stack_module_state`, and registers the stacked
+   tensors as parameters. Everything else then works unchanged — `BlockAdamW`,
+   `clip_grad_norm_per_agent`, and the per-agent checkpoint slices — because every stacked
+   parameter has a leading agent dimension.
+4. Add a builder to `MODEL_BUILDERS` in `models/factory.py`, keyed by learner name. Critics
    take `state_space` when it is not None (asymmetric actor-critic).
-3. Add its fields to `ModelCfg` in `models/cfg.py` and their rows to the README.
-4. Copy tests 1-3 of `tests/models/test_factory.py`: block-only parameters, independence
-   (agent 1's rows only, with any BatchNorm in training mode), and checkpoint slicing. If a
-   learner uses the model, also copy the checkpoint round trip in
-   `tests/learners/test_base.py` (save agent 2 of 3, load into slot 0 of a 1-agent learner,
-   compare deterministic actions).
+5. Add its fields to `ModelCfg` in `models/cfg.py` and their rows to the README.
+6. Copy the tests: the slot-vs-plain-module equivalence in `tests/models/test_ensemble.py`
+   (same outputs **and** same gradients), plus tests 1-3 of `tests/models/test_factory.py`
+   (stacked-only parameters, independence on agent 1's rows, checkpoint slicing).
 
 ### Add a loss
 
-1. Subclass `AuxLoss` in the project (or in `robonuke_rl_core/losses/losses.py` for a package
-   loss), set `name` and `supported_targets`, implement `compute(ctx)`, and decorate it with
-   `@register_loss`. Projects register at import time, before the config is loaded.
+1. Subclass `AuxLoss` in the project, set `name` and `supported_targets`, implement
+   `compute(ctx)`, and decorate it with `@register_loss`, at import time and before the config
+   is loaded. **The package ships no built-in loss**: a penalty on action magnitude belongs in
+   the env's reward, not in a policy-side term.
 2. `compute` returns **one raw value per agent**, shape `(num_agents,)`. Reshape a flat
    `(num_agents * rows, ...)` tensor with `.view(ctx.learner.num_agents, -1)` first.
    **Never average across agents inside `compute`** — `build_aux_losses` applies the fixed
@@ -172,7 +202,8 @@ assert from `ppo/kept` that agent 1 was dropped in the copy but not in the contr
 
 ### Memory
 
-One memory class (`MultiRandomMemory`). Batch sizes are **per agent**: `sample(batch_size=B)`
+One memory class (`MultiRandomMemory`), unchanged by the vmap restructure. Batch sizes are
+**per agent**: `sample(batch_size=B)`
 returns `B * num_agents` rows as `[agent 0 | agent 1 | ...]`, drawn from each agent's own envs,
 and `sample_all` keeps that order so a block-parallel reshape routes each agent's rows to its
 own parameters. `memory.memory_size` is SAC's capacity in transitions **per agent**:

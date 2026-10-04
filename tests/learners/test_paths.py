@@ -38,7 +38,9 @@ def test_periodic_reset_rebuilds_the_networks_and_keeps_the_buffer():
     assert learner._n_periodic_resets == 1
     assert not torch.equal(before_policy, params_of(learner.policy))  # fresh weights
     assert learner.policy is learner.models["policy"]  # the model dict was updated too
-    assert learner.policy_optimizer.state == {}  # fresh Adam moments
+    for moment in learner.policy_optimizer.exp_avg:  # fresh Adam moments
+        assert float(moment.abs().max()) == 0.0
+    assert learner.policy_optimizer.t.tolist() == [0] * learner.num_agents
     assert float(learner._entropy_coefficient[0]) == pytest.approx(
         learner.cfg.initial_entropy_value
     )
@@ -83,21 +85,19 @@ def test_periodic_reset_is_off_by_default():
 
 
 # ------------------------------------------------------------------ cosine LR
-@pytest.mark.parametrize("learner_name", ["sac", "ppo", "flash_sac"])
+@pytest.mark.parametrize("learner_name", ["sac", "ppo"])
 def test_cosine_lr_decays_and_constant_does_not(learner_name):
     for schedule, should_decay in (("cosine", True), ("constant", False)):
         learner = build_learner(
             learner_name, num_agents=2, envs_per_agent=2, lr_schedule=schedule, lr_end=1.0e-6
         )
         fill_memory(learner)
-        optimizer = (
-            learner.policy_optimizer if learner_name != "ppo" else learner.policy_optimizer
-        )
-        start = optimizer.param_groups[0]["lr"]
+        optimizer = learner.policy_optimizer
+        start = float(optimizer.lr[0])
         torch.manual_seed(2)
         for _ in range(3):
             learner.update(timestep=0, timesteps=10)
-        end = optimizer.param_groups[0]["lr"]
+        end = float(optimizer.lr[0])
         if should_decay:
             assert end < start, f"{learner_name}: cosine LR did not decay"
         else:
@@ -144,7 +144,7 @@ def test_a_bad_shaper_reference_raises():
 
 
 # ------------------------------------------------------------------ random warmup
-@pytest.mark.parametrize("learner_name", ["sac", "ppo", "flash_sac"])
+@pytest.mark.parametrize("learner_name", ["sac", "ppo"])
 def test_random_timesteps_emit_uniform_actions(learner_name):
     learner = build_learner(learner_name, num_agents=2, envs_per_agent=2, random_timesteps=5)
     torch.manual_seed(0)
@@ -162,7 +162,7 @@ def test_random_timesteps_emit_uniform_actions(learner_name):
 
 
 # ------------------------------------------------------------------ asymmetric actor-critic
-@pytest.mark.parametrize("learner_name", ["sac", "ppo", "flash_sac"])
+@pytest.mark.parametrize("learner_name", ["sac", "ppo"])
 def test_asymmetric_critic_consumes_the_state(learner_name):
     learner = build_learner(learner_name, num_agents=2, envs_per_agent=2, asymmetric=True)
     assert learner._asymmetric

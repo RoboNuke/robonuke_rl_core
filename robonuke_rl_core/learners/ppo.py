@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from ..models.block_utils import clip_grad_norm_per_agent, step_with_frozen_agents
+from ..optim import BlockAdamW, clip_grad_norm_per_agent, lr_at
 from ..models.normalizer import BlockRunningNorm
 from ..losses.losses import LossContext
 from .base import LearnerBase
@@ -79,15 +79,19 @@ class PPO(LearnerBase):
 
         self._asymmetric = self.state_space is not None
 
-        self.policy_optimizer = torch.optim.AdamW(
-            self.policy.parameters(), lr=self.cfg.policy_lr, weight_decay=self.cfg.weight_decay
+        self.policy_optimizer = BlockAdamW(
+            self.policy.parameters(),
+            self.num_agents,
+            lr=self.cfg.policy_lr,
+            weight_decay=self.cfg.weight_decay,
         )
-        self.value_optimizer = torch.optim.AdamW(
-            self.value.parameters(), lr=self.cfg.value_lr, weight_decay=self.cfg.weight_decay
+        self.value_optimizer = BlockAdamW(
+            self.value.parameters(),
+            self.num_agents,
+            lr=self.cfg.value_lr,
+            weight_decay=self.cfg.weight_decay,
         )
-        self.policy_scheduler = None
-        self.value_scheduler = None
-        self._lr_built = False
+        self._updates = 0
 
         if self.cfg.normalize_observations:
             self.observation_normalizer = self.make_normalizer(self.observation_space)
@@ -130,16 +134,16 @@ class PPO(LearnerBase):
             self.memory.create_tensor(name="states", size=self.state_space, dtype=torch.float32)
             self._tensors_names.insert(1, "states")
 
-    def _build_cosine_lr(self, timesteps: int) -> None:
-        from torch.optim.lr_scheduler import CosineAnnealingLR
-
-        updates = max(1, (int(timesteps) - int(self.cfg.learning_starts)) // max(1, self.cfg.rollouts))
-        t_max = max(1, updates * self.cfg.learning_epochs)
-        self.policy_scheduler = CosineAnnealingLR(
-            self.policy_optimizer, T_max=t_max, eta_min=self.cfg.lr_end
+    def _set_learning_rates(self, timesteps: int) -> None:
+        """The LR for this update, from the update count alone (never from the data)."""
+        if self.cfg.lr_schedule == "constant":
+            return
+        total = max(1, (int(timesteps) - int(self.cfg.learning_starts)) // max(1, self.cfg.rollouts))
+        self.policy_optimizer.set_lr(
+            lr_at(self._updates, total, self.cfg.policy_lr, self.cfg.lr_end, self.cfg.lr_schedule)
         )
-        self.value_scheduler = CosineAnnealingLR(
-            self.value_optimizer, T_max=t_max, eta_min=self.cfg.lr_end
+        self.value_optimizer.set_lr(
+            lr_at(self._updates, total, self.cfg.value_lr, self.cfg.lr_end, self.cfg.lr_schedule)
         )
 
     # ------------------------------------------------------------------ normalization
@@ -247,9 +251,7 @@ class PPO(LearnerBase):
     # ------------------------------------------------------------------ update
     def update(self, *, timestep: int, timesteps: int) -> None:
         num_agents = self.num_agents
-        if self.cfg.lr_schedule == "cosine" and not self._lr_built:
-            self._build_cosine_lr(timesteps)
-            self._lr_built = True
+        self._set_learning_rates(timesteps)
 
         with torch.no_grad():
             last_values, _ = self.value.act(
@@ -280,12 +282,11 @@ class PPO(LearnerBase):
             accumulated.setdefault(name, []).append(value.detach())
 
         for epoch in range(self.cfg.learning_epochs):
-            # Per-agent KL early stop: once an agent is dropped it stays frozen for this epoch.
-            # Frozen means its policy weights and Adam moments do not change at all (see
-            # step_with_frozen_agents). The value network is not masked: every agent's critic
-            # trains on every minibatch, so no agent's critic depends on another agent's KL.
+            # Per-agent KL early stop: once an agent is over the threshold it is frozen for the
+            # rest of the epoch — policy AND critic, including the value_update_ratio passes —
+            # by the keep mask on both optimizers. A frozen agent comes out bit-identical, so
+            # nothing it would have done can leak into another agent.
             keep = torch.ones(num_agents, dtype=torch.bool, device=self.device)
-            any_kept = True
 
             for batch in self.memory.sample_all(
                 names=self._tensors_names, mini_batches=self.cfg.mini_batches, shuffle=True
@@ -304,65 +305,53 @@ class PPO(LearnerBase):
                     else inputs
                 )
 
-                self.policy_optimizer.zero_grad(set_to_none=False)
-                self.value_optimizer.zero_grad()
-                total_loss = torch.zeros((), device=self.device)
+                _, outputs = self.policy.act(
+                    {**inputs, "taken_actions": sampled["actions"]}, role="policy"
+                )
+                ratio_log = outputs["log_prob"] - sampled["log_prob"]
+                with torch.no_grad():
+                    kl = (ratio_log.exp() - 1.0 - ratio_log).view(num_agents, rows, -1).mean(dim=(1, 2))
+                accumulate("ppo/kl", kl)
 
-                if any_kept:
-                    _, outputs = self.policy.act(
-                        {**inputs, "taken_actions": sampled["actions"]}, role="policy"
+                if self.cfg.kl_threshold > 0:
+                    keep = keep & (kl <= self.cfg.kl_threshold)
+                    if not bool(keep.any()):
+                        break  # every agent is frozen: the rest of this epoch is a no-op
+                keep_f = keep.to(ratio_log.dtype)
+
+                # Masked losses keep the FULL denominator (num_agents), so dropping one agent
+                # does not rescale another agent's gradient. With every agent kept this is
+                # exactly the mean over the flat batch.
+                ratio = ratio_log.exp()
+                surrogate = sampled["advantages"] * ratio
+                surrogate_clipped = sampled["advantages"] * torch.clip(
+                    ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
+                )
+                policy_terms = -torch.min(surrogate, surrogate_clipped)
+                policy_per_agent = policy_terms.view(num_agents, rows, -1).mean(dim=(1, 2))
+                total_loss = (keep_f * policy_per_agent).sum() / num_agents
+
+                entropy_per_agent = (
+                    self.policy.get_entropy(role="policy").view(num_agents, rows, -1).mean(dim=(1, 2))
+                )
+                if self.cfg.entropy_loss_scale:
+                    total_loss = total_loss - (
+                        self.cfg.entropy_loss_scale * (keep_f * entropy_per_agent).sum() / num_agents
                     )
-                    ratio_log = outputs["log_prob"] - sampled["log_prob"]
-                    with torch.no_grad():
-                        kl = (ratio_log.exp() - 1.0 - ratio_log).view(num_agents, rows, -1).mean(dim=(1, 2))
-                    accumulate("ppo/kl", kl)
-                    if self.cfg.kl_threshold > 0:
-                        keep = keep & (kl <= self.cfg.kl_threshold)
-                        any_kept = bool(keep.any())
-                    keep_f = keep.to(ratio_log.dtype)
 
-                    # Masked losses keep the FULL denominator (num_agents), so dropping one
-                    # agent does not rescale another agent's gradient. With every agent kept
-                    # this is exactly the mean over the flat batch.
-                    ratio = ratio_log.exp()
-                    surrogate = sampled["advantages"] * ratio
-                    surrogate_clipped = sampled["advantages"] * torch.clip(
-                        ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
+                aux = self.compute_aux_loss(
+                    LossContext(
+                        learner=self,
+                        step=timestep,
+                        target="policy",
+                        sampled=sampled,
+                        inputs=inputs,
+                        log_prob=outputs["log_prob"],
+                        policy_outputs=outputs,
                     )
-                    policy_terms = -torch.min(surrogate, surrogate_clipped)
-                    policy_per_agent = policy_terms.view(num_agents, rows, -1).mean(dim=(1, 2))
-                    total_loss = total_loss + (keep_f * policy_per_agent).sum() / num_agents
-
-                    entropy_per_agent = (
-                        self.policy.get_entropy(role="policy").view(num_agents, rows, -1).mean(dim=(1, 2))
-                    )
-                    if self.cfg.entropy_loss_scale:
-                        total_loss = total_loss - (
-                            self.cfg.entropy_loss_scale * (keep_f * entropy_per_agent).sum() / num_agents
-                        )
-
-                    aux = self.compute_aux_loss(
-                        LossContext(
-                            learner=self,
-                            step=timestep,
-                            target="policy",
-                            sampled=sampled,
-                            inputs=inputs,
-                            log_prob=outputs["log_prob"],
-                            policy_outputs=outputs,
-                        )
-                    )
-                    if aux is not None:
-                        total_loss = total_loss + aux
-
-                    if self.on_log:
-                        accumulate("loss/policy", policy_per_agent)
-                        accumulate("policy/entropy", entropy_per_agent)
-                        accumulate("ppo/clip_fraction", (
-                            ((ratio - 1.0).abs() > self.cfg.ratio_clip).to(ratio.dtype)
-                        ).view(num_agents, rows, -1).mean(dim=(1, 2)))
-                # every agent dropped: the policy only takes the (frozen) step below, so its
-                # step counter advances like every other minibatch
+                )
+                if aux is not None:
+                    total_loss = total_loss + aux
 
                 value_loss, value_per_agent = self._value_loss(sampled, value_inputs, rows)
                 total_loss = total_loss + value_loss
@@ -379,57 +368,51 @@ class PPO(LearnerBase):
                 if aux is not None:
                     total_loss = total_loss + aux
 
-                # one combined backward, two disjoint optimizer steps
+                # one combined backward, then each optimizer steps the agents it keeps
+                self.policy_optimizer.zero_grad()
+                self.value_optimizer.zero_grad()
                 total_loss.backward()
-                for param in self.policy.parameters():
-                    if param.grad is None:  # the first minibatch had no policy loss
-                        param.grad = torch.zeros_like(param)
                 policy_norms = clip_grad_norm_per_agent(
                     self.policy, num_agents, self.cfg.grad_norm_clip
                 )
                 value_norms = clip_grad_norm_per_agent(
                     self.value, num_agents, self.cfg.grad_norm_clip
                 )
-                if self.cfg.kl_threshold > 0:
-                    step_with_frozen_agents(self.policy_optimizer, self.policy, num_agents, keep)
-                else:
-                    self.policy_optimizer.step()
-                self.value_optimizer.step()
+                self.policy_optimizer.step(keep)
+                self.value_optimizer.step(keep)
 
-                # extra value-only passes over the same minibatch
+                # extra value-only passes over the same minibatch, frozen agents included
                 for _ in range(self.cfg.value_update_ratio - 1):
                     extra_loss, extra_per_agent = self._value_loss(sampled, value_inputs, rows)
                     self.value_optimizer.zero_grad()
                     extra_loss.backward()
                     clip_grad_norm_per_agent(self.value, num_agents, self.cfg.grad_norm_clip)
-                    self.value_optimizer.step()
+                    self.value_optimizer.step(keep)
                     value_per_agent = value_per_agent + extra_per_agent
                 if self.cfg.value_update_ratio > 1:
                     value_per_agent = value_per_agent / self.cfg.value_update_ratio
 
                 if self.on_log:
+                    accumulate("loss/policy", policy_per_agent)
+                    accumulate("policy/entropy", entropy_per_agent)
+                    accumulate("ppo/clip_fraction", (
+                        ((ratio - 1.0).abs() > self.cfg.ratio_clip).to(ratio.dtype)
+                    ).view(num_agents, rows, -1).mean(dim=(1, 2)))
                     accumulate("loss/value", value_per_agent)
                     accumulate("grad_norm/policy", policy_norms)
                     accumulate("grad_norm/value", value_norms)
                     accumulate("ppo/kept", keep.to(value_per_agent.dtype))
 
-            if self.policy_scheduler is not None:
-                self.policy_scheduler.step()
-            if self.value_scheduler is not None:
-                self.value_scheduler.step()
+        self._updates += 1
 
         if self.on_log:
             metrics = {name: torch.stack(values).mean(dim=0) for name, values in accumulated.items()}
-            metrics["lr/policy"] = torch.full(
-                (num_agents,), self.policy_optimizer.param_groups[0]["lr"], device=self.device
-            )
-            metrics["lr/value"] = torch.full(
-                (num_agents,), self.value_optimizer.param_groups[0]["lr"], device=self.device
-            )
+            metrics["lr/policy"] = self.policy_optimizer.lr.to(torch.float32)
+            metrics["lr/value"] = self.value_optimizer.lr.to(torch.float32)
             self.emit_per_agent(metrics, timestep)
 
     def _value_loss(self, sampled: dict, value_inputs: dict, rows: int):
-        """Clipped MSE value loss. Not KL-masked: an agent's critic keeps learning."""
+        """Clipped MSE value loss. A frozen agent's share is discarded by step(keep)."""
         predicted, _ = self.value.act(value_inputs, role="value")
         if self.cfg.value_clip > 0:
             predicted = sampled["values"] + torch.clip(

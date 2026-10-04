@@ -1,8 +1,8 @@
 """The learner, model and memory sections: defaults load, every validate rule bites.
 
 These go through the real config pipeline with a faked task, so the cross-section rules
-(`num_envs` divisible by `num_agents`, PPO's minibatch split, FlashSAC's reward scaling)
-are checked the way a run would hit them.
+(`num_envs` divisible by `num_agents`, PPO's minibatch split) are checked the way a run
+would hit them.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def write(tmp_path, extra: str = "", name: str = "exp.yaml"):
 def test_every_section_loads_with_its_defaults(tmp_path):
     cfg = load_config(write(tmp_path))
     assert set(cfg.sections) == {
-        "experiment", "wandb", "trainer", "sac", "ppo", "flash_sac", "model", "memory", "losses",
+        "experiment", "wandb", "trainer", "sac", "ppo", "model", "memory", "losses",
     }
     assert cfg.trainer.learner == "sac"
     assert cfg.sac.batch_size == 64  # a class default, not set by the file
@@ -95,7 +95,7 @@ def test_round_trip(tmp_path):
     assert a["sac"]["batch_size"] == 8
     assert a["model"]["critic"]["critic_n"] == 3
     # every learner's section is dumped, not only the one in use
-    assert {"sac", "ppo", "flash_sac"} <= set(a)
+    assert {"sac", "ppo"} <= set(a)
 
 
 # ------------------------------------------------------------------ 8. the env partition
@@ -127,8 +127,6 @@ def test_unknown_learner_raises(tmp_path):
         ("sac.periodic_reset_enabled=true", "periodic_reset_frequency"),
         ("memory.memory_size=0", "memory.memory_size"),
         ("model.actor.reduction=median", "reduction"),
-        ("model.critic.n_atoms=1", "n_atoms"),
-        ("model.critic.v_min=9.0", "v_min"),
         ("model.actor.min_log_std=5.0", "min_log_std"),
     ],
 )
@@ -151,37 +149,6 @@ def test_ppo_rules(tmp_path, overrides, needle):
     with pytest.raises(ValueError) as err:
         load_config(write(tmp_path), ["trainer.learner=ppo"] + overrides)
     assert needle in str(err.value)
-
-
-def test_flash_sac_reward_scaling_must_match_the_critic_support(tmp_path):
-    with pytest.raises(ValueError) as err:
-        load_config(
-            write(tmp_path),
-            [
-                "trainer.learner=flash_sac",
-                "flash_sac.reward_scaling_enabled=true",
-                "flash_sac.reward_scaling_g_max=3.0",
-                "model.critic.v_max=5.0",
-            ],
-        )
-    assert "reward_scaling_g_max" in str(err.value)
-
-    cfg = load_config(
-        write(tmp_path),
-        [
-            "trainer.learner=flash_sac",
-            "flash_sac.reward_scaling_enabled=true",
-            "flash_sac.reward_scaling_g_max=5.0",
-            "model.critic.v_max=5.0",
-        ],
-    )
-    assert cfg.flash_sac.reward_scaling_enabled is True
-
-
-def test_flash_sac_target_entropy_mode(tmp_path):
-    with pytest.raises(ValueError) as err:
-        load_config(write(tmp_path), ["flash_sac.target_entropy_mode=sigma"])
-    assert "target_entropy_mode" in str(err.value)
 
 
 def test_a_callable_is_a_module_name_string(tmp_path):

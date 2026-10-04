@@ -13,8 +13,7 @@ import numpy as np
 import torch
 
 from robonuke_rl_core.learners.base import run_dirs  # noqa: F401  (re-exported for tests)
-from robonuke_rl_core.learners.cfg import FlashSACCfg, PPOCfg, SACCfg, TrainerCfg
-from robonuke_rl_core.learners.flash_sac import FlashSAC
+from robonuke_rl_core.learners.cfg import PPOCfg, SACCfg, TrainerCfg
 from robonuke_rl_core.learners.ppo import PPO
 from robonuke_rl_core.learners.sac import SAC
 from robonuke_rl_core.memory.multi_random import MultiRandomMemory
@@ -24,13 +23,13 @@ from robonuke_rl_core.models.factory import build_models
 OBS_DIM = 4
 STATE_DIM = 6
 ACT_DIM = 2
-LEARNER_CLASSES = {"sac": SAC, "ppo": PPO, "flash_sac": FlashSAC}
+LEARNER_CLASSES = {"sac": SAC, "ppo": PPO}
 
 
 def tiny_model_cfg() -> ModelCfg:
     return ModelCfg(
         actor=ActorCfg(actor_n=1, actor_latent=8),
-        critic=CriticCfg(critic_n=1, critic_latent=8, n_atoms=5, v_min=-2.0, v_max=2.0),
+        critic=CriticCfg(critic_n=1, critic_latent=8),
     )
 
 
@@ -42,8 +41,6 @@ def learner_cfg(learner: str, **overrides) -> Any:
     """A tiny but complete cfg for one learner."""
     if learner == "sac":
         cfg = SACCfg(batch_size=4, gradient_steps=1, learning_starts=0)
-    elif learner == "flash_sac":
-        cfg = FlashSACCfg(batch_size=4, gradient_steps=1, learning_starts=0)
     elif learner == "ppo":
         cfg = PPOCfg(rollouts=4, learning_epochs=2, mini_batches=2, learning_starts=0)
     else:
@@ -89,7 +86,7 @@ def build_learner(
     memory = MultiRandomMemory(
         memory_size=rollout, num_envs=num_envs, num_agents=num_agents, device="cpu"
     )
-    extra = {"model_cfg": model_cfg} if learner in ("sac", "flash_sac") else {}
+    extra = {"model_cfg": model_cfg} if learner == "sac" else {}
     instance = LEARNER_CLASSES[learner](
         models=models,
         memory=memory,

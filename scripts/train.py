@@ -35,14 +35,13 @@ def main() -> int:
 
     from robonuke_rl_core.learners.base import run_dirs
     from robonuke_rl_core.losses import build_aux_losses
-    from robonuke_rl_core.learners.flash_sac import FlashSAC
     from robonuke_rl_core.learners.ppo import PPO
     from robonuke_rl_core.learners.sac import SAC
     from robonuke_rl_core.memory.multi_random import MultiRandomMemory
     from robonuke_rl_core.memory.cfg import replay_depth
     from robonuke_rl_core.models.factory import build_models
 
-    learners = {"sac": SAC, "ppo": PPO, "flash_sac": FlashSAC}
+    learners = {"sac": SAC, "ppo": PPO}
 
     cfg = load_from_args(args, overrides)
     learner_name = cfg.trainer.learner
@@ -81,7 +80,7 @@ def main() -> int:
         memory_size=per_env_depth, num_envs=total_envs, num_agents=num_agents, device=env.device
     )
 
-    extra = {"model_cfg": cfg.model} if learner_name in ("sac", "flash_sac") else {}
+    extra = {"model_cfg": cfg.model} if learner_name == "sac" else {}
     learner = learners[learner_name](
         models=models,
         memory=memory,

@@ -1,4 +1,4 @@
-"""Learner and trainer configuration: the `trainer`, `sac`, `ppo` and `flash_sac` sections.
+"""Learner and trainer configuration: the `trainer`, `sac` and `ppo` sections.
 
 Hyperparameters come from V's ``SAC_CFG`` / ``PPO_CFG``, minus everything the learner plan
 removes (AMP, distributed, auxiliary losses, contact/rotation supervision, per-axis action
@@ -13,9 +13,9 @@ from typing import Any, Optional
 
 from omegaconf import MISSING
 
-__all__ = ["TrainerCfg", "SACCfg", "PPOCfg", "FlashSACCfg"]
+__all__ = ["TrainerCfg", "SACCfg", "PPOCfg"]
 
-LEARNERS = ("sac", "ppo", "flash_sac")
+LEARNERS = ("sac", "ppo")
 
 
 @dataclass
@@ -85,9 +85,9 @@ class SACCfg(_CommonCfg):
     lr_end: float = 1.5e-4
     learn_entropy: bool = True
     initial_entropy_value: float = 0.2
-    #: target entropy; None means -|A| (see also FlashSAC's ``target_entropy_mode``)
+    #: target entropy; None means -|A|
     target_entropy: Optional[float] = None
-    #: "log_alpha" (skrl) or "alpha" (FlashSAC's gentler form)
+    #: "log_alpha" (skrl's form) or "alpha" (the gentler multiplicative form)
     entropy_loss_form: str = "log_alpha"
     #: SimBa periodic reset: rebuild networks + optimizers, keep the replay buffer
     periodic_reset_enabled: bool = False
@@ -119,46 +119,6 @@ class SACCfg(_CommonCfg):
 
     def _name(self) -> str:
         return "sac"
-
-
-@dataclass
-class FlashSACCfg(SACCfg):
-    """FlashSAC: distributional critic, weight normalization, noise repetition."""
-
-    #: gradient steps between actor updates (the critic updates every step)
-    actor_update_period: int = 1
-    weight_norm_enabled: bool = True
-    noise_repeat_enabled: bool = True
-    noise_repeat_zeta_mu: float = 2.0
-    noise_repeat_max: int = 16
-    #: adaptive reward scaling (Eq. 6); ``g_max`` must equal the critic's ``v_max``
-    reward_scaling_enabled: bool = False
-    reward_scaling_g_max: float = 5.0
-    reward_scaling_eps: float = 1.0e-8
-    #: "neg_action_dim" (SAC's -|A|) or "unified" (FlashSAC's sigma-based target)
-    target_entropy_mode: str = "neg_action_dim"
-    entropy_sigma_target: float = 0.15
-
-    def validate(self, cfg: Any) -> None:
-        super().validate(cfg)
-        if self.target_entropy_mode not in ("neg_action_dim", "unified"):
-            raise ValueError(
-                "flash_sac.target_entropy_mode must be 'neg_action_dim' or 'unified', got "
-                f"{self.target_entropy_mode!r}"
-            )
-        if self.actor_update_period < 1:
-            raise ValueError(
-                f"flash_sac.actor_update_period must be >= 1, got {self.actor_update_period}"
-            )
-        if self.reward_scaling_enabled and self.reward_scaling_g_max != cfg.model.critic.v_max:
-            raise ValueError(
-                f"flash_sac.reward_scaling_g_max ({self.reward_scaling_g_max}) must equal "
-                f"model.critic.v_max ({cfg.model.critic.v_max}) so normalized returns land "
-                "inside the categorical support"
-            )
-
-    def _name(self) -> str:
-        return "flash_sac"
 
 
 @dataclass

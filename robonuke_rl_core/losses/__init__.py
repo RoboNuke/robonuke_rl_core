@@ -4,7 +4,6 @@ from .cfg import LossesCfg, LossTermCfg
 from .losses import (
     LOSSES,
     TARGETS,
-    ActionL2Loss,
     AuxLoss,
     LossContext,
     build_aux_losses,
@@ -14,7 +13,6 @@ from .losses import (
 __all__ = [
     "LOSSES",
     "TARGETS",
-    "ActionL2Loss",
     "AuxLoss",
     "LossContext",
     "LossTermCfg",

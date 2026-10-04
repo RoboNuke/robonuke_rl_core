@@ -14,10 +14,8 @@ from helpers import ACT_DIM, OBS_DIM, build_learner, fill_memory
 
 
 def _policy_head_bias(policy):
-    """The actor's output bias, whatever the architecture calls it."""
-    if hasattr(policy, "actor_mean"):
-        return policy.actor_mean.fc_out.bias  # SimBa
-    return policy.mean_w.bias  # FlashSAC
+    """The actor's stacked output bias."""
+    return getattr(policy.net, "trunk__fc_out__bias")
 
 
 def collector():
@@ -143,7 +141,7 @@ def test_best_checkpoint_follows_the_highest_mean_return(tmp_path):
 
 
 # ------------------------------------------------------------------ 4. checkpoints
-@pytest.mark.parametrize("learner_name", ["sac", "ppo", "flash_sac"])
+@pytest.mark.parametrize("learner_name", ["sac", "ppo"])
 def test_checkpoint_round_trip_into_another_slot(tmp_path, learner_name):
     """Save agent 2 of 3, load it into slot 0 of a fresh 1-agent learner, compare actions."""
     source = build_learner(
@@ -177,11 +175,9 @@ def test_checkpoint_round_trip_into_another_slot(tmp_path, learner_name):
     )
 
 
-@pytest.mark.parametrize("learner_name", ["sac", "flash_sac"])
+@pytest.mark.parametrize("learner_name", ["sac"])
 def test_loading_one_slot_leaves_every_other_agent_alone(tmp_path, learner_name):
     """Target critics are saved per agent; loading slot 1 touches slot 1 only."""
-    from robonuke_rl_core.models.block_utils import slice_block_state_dict
-
     source = build_learner(
         learner_name, num_agents=3, envs_per_agent=2, run_dirs_list=[tmp_path / f"a{i}" for i in range(3)]
     )
@@ -196,28 +192,26 @@ def test_loading_one_slot_leaves_every_other_agent_alone(tmp_path, learner_name)
     learner.update(timestep=10, timesteps=100)
     keys = learner._checkpoint_model_keys()
     assert "target_critic_1" in keys and "target_critic_2" in keys
-    before = {a: {k: slice_block_state_dict(getattr(learner, k), a, 3) for k in keys} for a in (0, 2)}
+    before = {a: {k: getattr(learner, k).agent_state_dict(a) for k in keys} for a in (0, 2)}
 
     learner.load_agent(path, slot=1)
 
     for agent in (0, 2):
         for key in keys:
-            after = slice_block_state_dict(getattr(learner, key), agent, 3)
+            after = getattr(learner, key).agent_state_dict(agent)
             for name in after:
                 assert torch.equal(after[name], before[agent][key][name]), (agent, key, name)
     # slot 1 holds the saved agent's lagging targets, not a copy of its critics
     for key in ("target_critic_1", "target_critic_2"):
-        saved = slice_block_state_dict(getattr(source, key), 2, 3)
-        loaded = slice_block_state_dict(getattr(learner, key), 1, 3)
+        saved = getattr(source, key).agent_state_dict(2)
+        loaded = getattr(learner, key).agent_state_dict(1)
         for name in saved:
             assert torch.equal(saved[name], loaded[name]), (key, name)
 
 
-def test_ppo_every_agent_dropped_freezes_the_policy_but_trains_the_critic():
-    """With every agent over the KL limit, policy weights and Adam moments do not move, the
-    critic still trains, and the policy optimizer's step counter still counts every minibatch."""
-    from robonuke_rl_core.models.block_utils import slice_block_state_dict
-
+def test_ppo_every_agent_dropped_freezes_the_whole_update():
+    """Over the KL limit, an agent is frozen policy AND critic (the keep mask on both
+    optimizers). With every agent dropped the epoch breaks out and nothing moves at all."""
     # observation normalization on: the stats move between rollout and update, so every
     # agent's KL starts far above this threshold
     learner = build_learner("ppo", num_agents=3, envs_per_agent=2, kl_threshold=1.0e-6)
@@ -229,24 +223,36 @@ def test_ppo_every_agent_dropped_freezes_the_policy_but_trains_the_critic():
     learner.update(timestep=10, timesteps=100)
 
     for name, tensor in learner.policy.state_dict().items():
-        assert torch.equal(tensor, policy_before[name]), name
-    for state in learner.policy_optimizer.state.values():
-        assert torch.equal(state["exp_avg"], torch.zeros_like(state["exp_avg"]))
-        assert float(state["step"]) == learner.cfg.learning_epochs * learner.cfg.mini_batches
-    assert any(
-        not torch.equal(tensor, value_before[name]) for name, tensor in learner.value.state_dict().items()
-    )
+        assert torch.equal(tensor, policy_before[name]), f"policy {name} moved"
+    for name, tensor in learner.value.state_dict().items():
+        assert torch.equal(tensor, value_before[name]), f"value {name} moved"
+    # no agent stepped, so no step counter advanced and no moment was written
+    for optimizer in (learner.policy_optimizer, learner.value_optimizer):
+        assert optimizer.t.tolist() == [0] * learner.num_agents
+        for moment in optimizer.exp_avg:
+            assert float(moment.abs().max()) == 0.0
 
 
-def test_loading_an_optimizer_into_a_multi_agent_learner_raises(tmp_path):
+def test_an_optimizer_slot_loads_at_any_agent_count(tmp_path):
+    """BlockAdamW keeps its moments per agent, so one file fills exactly one slot."""
     source = build_learner(
         "sac", num_agents=3, envs_per_agent=2, run_dirs_list=[tmp_path / f"a{i}" for i in range(3)]
     )
-    paths = source.save_checkpoints(step=0)
+    fill_memory(source)
+    torch.manual_seed(5)
+    source.update(timestep=10, timesteps=100)
+    paths = source.save_checkpoints(step=10)
+
     target = build_learner("sac", num_agents=3, envs_per_agent=2)
-    with pytest.raises(ValueError) as err:
-        target.load_agent(paths[0], slot=0, with_optimizer=True)
-    assert "num_agents == 1" in str(err.value)
+    target.load_agent(paths[2], slot=1, with_optimizer=True)
+    for index in range(len(target.policy_optimizer.params)):
+        assert torch.equal(
+            target.policy_optimizer.exp_avg[index][1], source.policy_optimizer.exp_avg[index][2]
+        )
+        # the other slots keep their fresh (zero) moments
+        assert float(target.policy_optimizer.exp_avg[index][0].abs().max()) == 0.0
+    assert int(target.policy_optimizer.t[1]) == int(source.policy_optimizer.t[2])
+    assert int(target.policy_optimizer.t[0]) == 0
 
 
 def test_checkpoints_need_run_dirs():
@@ -271,7 +277,7 @@ def test_run_dirs_follow_the_config_layout():
 
 
 # ------------------------------------------------------------------ 7. aux_loss hook
-@pytest.mark.parametrize("learner_name", ["sac", "ppo", "flash_sac"])
+@pytest.mark.parametrize("learner_name", ["sac", "ppo"])
 @pytest.mark.parametrize("target", ["policy", "critic"])
 def test_aux_loss_hook_changes_the_loss_by_what_it_returns(learner_name, target):
     """A hook adding a constant shifts that loss; with no hook the loss is the ported one."""

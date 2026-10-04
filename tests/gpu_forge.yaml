@@ -37,7 +37,6 @@ model:
   critic:
     critic_n: 1
     critic_latent: 32
-    n_atoms: 11
 
 memory:
   memory_size: 256
@@ -50,7 +49,3 @@ ppo:
   rollouts: 8
   learning_epochs: 2
   mini_batches: 2
-
-flash_sac:
-  batch_size: 8
-  learning_starts: 8

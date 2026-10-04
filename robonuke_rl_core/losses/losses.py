@@ -9,6 +9,9 @@ weight, so each agent's gradient depends only on its own rows.
 
 The learners know nothing about this module beyond the ``LossContext`` they build and the
 callable they put in their ``aux_loss`` hook list.
+
+The package ships **no** built-in loss: a penalty on action magnitude belongs in the env's
+reward, not in a policy-side term. Projects register their own with ``@register_loss``.
 """
 
 from __future__ import annotations
@@ -28,7 +31,6 @@ __all__ = [
     "AuxLoss",
     "LOSSES",
     "register_loss",
-    "ActionL2Loss",
     "build_aux_losses",
 ]
 
@@ -112,25 +114,6 @@ def register_loss(cls: type) -> type:
         )
     LOSSES[cls.name] = cls
     return cls
-
-
-@register_loss
-class ActionL2Loss(AuxLoss):
-    """Mean squared action magnitude: a policy-side regularizer toward smaller actions.
-
-    Policy only: it differentiates through the freshly sampled ``ctx.actions``.
-    """
-
-    name = "action_l2"
-    supported_targets = ("policy",)
-
-    def compute(self, ctx: LossContext) -> torch.Tensor:
-        if ctx.actions is None:
-            raise ValueError(
-                "action_l2 needs ctx.actions, which only the policy block sets; give the term "
-                "target: policy"
-            )
-        return ctx.actions.pow(2).view(ctx.learner.num_agents, -1).mean(dim=1)
 
 
 def build_aux_losses(losses_cfg: "LossesCfg", num_agents: int) -> Optional[Callable]:

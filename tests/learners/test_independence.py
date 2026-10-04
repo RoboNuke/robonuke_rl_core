@@ -13,7 +13,6 @@ import copy
 import pytest
 import torch
 
-from robonuke_rl_core.models.block_utils import slice_block_state_dict, slice_optimizer_state
 
 from helpers import build_learner, fill_memory
 
@@ -25,13 +24,9 @@ def snapshot(learner, agent: int) -> dict:
     """Everything that belongs to one agent: weights, optimizer moments, stats, extras."""
     snap = {}
     for key in learner._checkpoint_model_keys():
-        snap[f"model/{key}"] = slice_block_state_dict(
-            getattr(learner, key), agent, learner.num_agents
-        )
+        snap[f"model/{key}"] = getattr(learner, key).agent_state_dict(agent)
     for key in learner._checkpoint_optimizer_keys():
-        snap[f"optimizer/{key}"] = slice_optimizer_state(
-            getattr(learner, key).state_dict(), agent, learner.num_agents
-        )
+        snap[f"optimizer/{key}"] = getattr(learner, key).agent_state_dict(agent)
     for name, norm in learner._checkpoint_normalizers().items():
         snap[f"normalizer/{name}"] = norm.state_dict_for(agent)
     snap["extras"] = learner._checkpoint_extras(agent)
@@ -107,8 +102,6 @@ def _kept(learner) -> dict:
         ("ppo", {"grad_norm_clip": 0.5, "kl_threshold": 0.1, "normalize_observations": False}),
         ("ppo", {"kl_threshold": 0.1, "value_update_ratio": 3, "normalize_observations": False}),
         ("ppo", {"entropy_loss_scale": 0.01, "value_update_ratio": 3}),
-        ("flash_sac", {}),
-        ("flash_sac", {"grad_norm_clip": 0.5}),
     ],
 )
 def test_one_agents_data_cannot_change_another_agents_update(learner_name, overrides):

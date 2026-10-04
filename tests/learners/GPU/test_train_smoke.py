@@ -20,18 +20,17 @@ from robonuke_rl_core.learners.base import run_dirs
 pytestmark = pytest.mark.gpu
 
 HERE = Path(__file__).resolve().parent
-LEARNERS = ["sac", "ppo", "flash_sac"]
+LEARNERS = ["sac", "ppo"]
 
 
 def build_learner(cfg, env, learner_name: str, dirs):
-    from robonuke_rl_core.learners.flash_sac import FlashSAC
     from robonuke_rl_core.learners.ppo import PPO
     from robonuke_rl_core.learners.sac import SAC
     from robonuke_rl_core.memory.cfg import replay_depth
     from robonuke_rl_core.memory.multi_random import MultiRandomMemory
     from robonuke_rl_core.models.factory import build_models
 
-    classes = {"sac": SAC, "ppo": PPO, "flash_sac": FlashSAC}
+    classes = {"sac": SAC, "ppo": PPO}
     learner_cfg = cfg[learner_name]
     num_agents = cfg.experiment.num_agents
     # asymmetric actor-critic when the env advertises a state space
@@ -54,7 +53,7 @@ def build_learner(cfg, env, learner_name: str, dirs):
     memory = MultiRandomMemory(
         memory_size=depth, num_envs=env.num_envs, num_agents=num_agents, device=env.device
     )
-    extra = {"model_cfg": cfg.model} if learner_name in ("sac", "flash_sac") else {}
+    extra = {"model_cfg": cfg.model} if learner_name == "sac" else {}
     return classes[learner_name](
         models=models,
         memory=memory,

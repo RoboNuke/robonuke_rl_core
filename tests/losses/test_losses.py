@@ -15,7 +15,6 @@ from robonuke_rl_core import config as cfgmod
 from robonuke_rl_core.config import dump, load_config, load_from_run
 from robonuke_rl_core.losses import (
     LOSSES,
-    ActionL2Loss,
     AuxLoss,
     LossContext,
     LossesCfg,
@@ -42,10 +41,27 @@ class FakeLearner:
             self.logged.append((agent, {k: v[agent] for k, v in metrics.items()}, step))
 
 
+class ActionSquaredLoss(AuxLoss):
+    """A project-style loss: mean squared action magnitude, one value per agent.
+
+    The package ships no built-in loss (an action penalty belongs in the reward), so the
+    tests register this one themselves — which is also how a project does it.
+    """
+
+    name = "action_squared"
+    supported_targets = ("policy",)
+
+    def compute(self, ctx):
+        if ctx.actions is None:
+            raise ValueError("action_squared needs ctx.actions, which the policy block sets")
+        return ctx.actions.pow(2).view(ctx.learner.num_agents, -1).mean(dim=1)
+
+
 @pytest.fixture(autouse=True)
-def restore_registry():
-    """Undo any loss a test registers."""
+def registry():
+    """Register the test loss, and undo anything a test registers."""
     known = dict(LOSSES)
+    register_loss(ActionSquaredLoss)
     yield
     LOSSES.clear()
     LOSSES.update(known)
@@ -60,13 +76,13 @@ def test_the_total_is_the_sum_of_weight_times_mean_raw():
     learner = FakeLearner()
     actions = torch.randn(NUM_AGENTS * ROWS, ACT_DIM)
     aux = build_aux_losses(
-        LossesCfg(terms=[LossTermCfg(name="action_l2", target="policy", weight=0.25)]),
+        LossesCfg(terms=[LossTermCfg(name="action_squared", target="policy", weight=0.25)]),
         NUM_AGENTS,
     )
     ctx = policy_ctx(learner, actions)
     total = aux(ctx)
 
-    raw = ActionL2Loss().compute(ctx)
+    raw = ActionSquaredLoss().compute(ctx)
     assert raw.shape == (NUM_AGENTS,)
     assert float(total) == pytest.approx(float(0.25 * raw.mean()))
 
@@ -74,13 +90,13 @@ def test_the_total_is_the_sum_of_weight_times_mean_raw():
     assert [agent for agent, _, _ in learner.logged] == list(range(NUM_AGENTS))
     for agent, metrics, step in learner.logged:
         assert step == 3
-        assert float(metrics["loss/action_l2_policy"]) == pytest.approx(float(raw[agent]))
+        assert float(metrics["loss/action_squared_policy"]) == pytest.approx(float(raw[agent]))
 
 
 def test_terms_for_another_target_do_not_contribute():
     learner = FakeLearner()
     aux = build_aux_losses(
-        LossesCfg(terms=[LossTermCfg(name="action_l2", target="policy", weight=1.0)]),
+        LossesCfg(terms=[LossTermCfg(name="action_squared", target="policy", weight=1.0)]),
         NUM_AGENTS,
     )
     critic_ctx = LossContext(learner=learner, target="critic", sampled={})
@@ -123,19 +139,19 @@ def test_kwargs_reach_the_loss_and_a_bad_one_raises():
         build_aux_losses(
             LossesCfg(
                 terms=[
-                    LossTermCfg(name="action_l2", target="policy", weight=1.0, kwargs={"x": 1})
+                    LossTermCfg(name="action_squared", target="policy", weight=1.0, kwargs={"x": 1})
                 ]
             ),
             NUM_AGENTS,
         )
-    assert "action_l2" in str(err.value)
+    assert "action_squared" in str(err.value)
 
 
 # ------------------------------------------------------------------ 8. independence
 def test_one_agents_actions_do_not_change_another_agents_raw_value():
     learner = FakeLearner()
     aux = build_aux_losses(
-        LossesCfg(terms=[LossTermCfg(name="action_l2", target="policy", weight=1.0)]),
+        LossesCfg(terms=[LossTermCfg(name="action_squared", target="policy", weight=1.0)]),
         NUM_AGENTS,
     )
     torch.manual_seed(0)
@@ -144,10 +160,10 @@ def test_one_agents_actions_do_not_change_another_agents_raw_value():
     extreme[ROWS : 2 * ROWS] *= 1.0e3  # agent 1 only
 
     aux(policy_ctx(learner, actions))
-    plain = {agent: metrics["loss/action_l2_policy"] for agent, metrics, _ in learner.logged}
+    plain = {agent: metrics["loss/action_squared_policy"] for agent, metrics, _ in learner.logged}
     learner.logged.clear()
     aux(policy_ctx(learner, extreme))
-    changed = {agent: metrics["loss/action_l2_policy"] for agent, metrics, _ in learner.logged}
+    changed = {agent: metrics["loss/action_squared_policy"] for agent, metrics, _ in learner.logged}
 
     for agent in (0, 2):
         assert torch.equal(plain[agent], changed[agent])
@@ -157,7 +173,7 @@ def test_one_agents_actions_do_not_change_another_agents_raw_value():
 def test_the_gradient_of_one_agents_slice_comes_only_from_its_rows():
     learner = FakeLearner()
     aux = build_aux_losses(
-        LossesCfg(terms=[LossTermCfg(name="action_l2", target="policy", weight=1.0)]),
+        LossesCfg(terms=[LossTermCfg(name="action_squared", target="policy", weight=1.0)]),
         NUM_AGENTS,
     )
 
@@ -181,17 +197,17 @@ def test_an_unknown_loss_name_raises():
             LossesCfg(terms=[LossTermCfg(name="nope", target="policy", weight=1.0)]), NUM_AGENTS
         )
     message = str(err.value)
-    assert "nope" in message and "action_l2" in message
+    assert "nope" in message and "action_squared" in message
 
 
 def test_an_unsupported_target_raises():
     with pytest.raises(ValueError) as err:
         build_aux_losses(
-            LossesCfg(terms=[LossTermCfg(name="action_l2", target="critic", weight=1.0)]),
+            LossesCfg(terms=[LossTermCfg(name="action_squared", target="critic", weight=1.0)]),
             NUM_AGENTS,
         )
     message = str(err.value)
-    assert "action_l2" in message and "critic" in message
+    assert "action_squared" in message and "critic" in message
 
 
 def test_a_raw_value_of_the_wrong_shape_raises():
@@ -234,13 +250,13 @@ def test_duplicate_registration_raises():
 
         @register_loss
         class Duplicate(AuxLoss):
-            name = "action_l2"
+            name = "action_squared"
             supported_targets = ("policy",)
 
             def compute(self, ctx):
                 return torch.zeros(ctx.learner.num_agents)
 
-    assert "action_l2" in str(err.value)
+    assert "action_squared" in str(err.value)
 
 
 def test_a_loss_must_declare_a_name_and_valid_targets():
@@ -271,9 +287,16 @@ def test_a_loss_must_declare_a_name_and_valid_targets():
             supported_targets = ("policy",)
 
 
-def test_action_l2_without_actions_raises():
+def test_the_package_ships_no_built_in_loss():
+    """An action-magnitude penalty belongs in the env reward, not in a policy-side term."""
+    known = dict(LOSSES)
+    known.pop("action_squared")  # the fixture's own
+    assert known == {}
+
+
+def test_a_loss_reading_a_field_its_target_does_not_set_raises():
     with pytest.raises(ValueError) as err:
-        ActionL2Loss().compute(LossContext(learner=FakeLearner(), target="policy"))
+        ActionSquaredLoss().compute(LossContext(learner=FakeLearner(), target="policy"))
     assert "ctx.actions" in str(err.value)
 
 
@@ -332,7 +355,7 @@ def test_terms_load_from_yaml_and_the_cli(tmp_path, fake_task):
         + """
 losses:
   terms:
-    - name: action_l2
+    - name: action_squared
       target: policy
       weight: 0.1
 """
@@ -340,13 +363,13 @@ losses:
     cfg = load_config(path)
     assert len(cfg.losses.terms) == 1
     term = cfg.losses.terms[0]
-    assert (term.name, term.target, term.weight, term.kwargs) == ("action_l2", "policy", 0.1, {})
+    assert (term.name, term.target, term.weight, term.kwargs) == ("action_squared", "policy", 0.1, {})
     assert build_aux_losses(cfg.losses, cfg.experiment.num_agents) is not None
 
     # and the whole list can come from the CLI
     cli = load_config(
         tmp_path / "exp.yaml",
-        ['losses.terms=[{name: action_l2, target: policy, weight: 0.5}]'],
+        ['losses.terms=[{name: action_squared, target: policy, weight: 0.5}]'],
     )
     assert len(cli.losses.terms) == 1
     assert cli.losses.terms[0].weight == 0.5
@@ -358,14 +381,14 @@ losses:
     b = OmegaConf.to_container(OmegaConf.load(second))
     a.pop("meta"), b.pop("meta")
     assert a == b
-    assert a["losses"]["terms"][0]["name"] == "action_l2"
+    assert a["losses"]["terms"][0]["name"] == "action_squared"
 
 
 def test_a_bad_target_in_the_config_raises(tmp_path, fake_task):
     path = tmp_path / "exp.yaml"
     path.write_text(BASE)
     with pytest.raises(ValueError) as err:
-        load_config(path, ['losses.terms=[{name: action_l2, target: value, weight: 0.1}]'])
+        load_config(path, ['losses.terms=[{name: action_squared, target: value, weight: 0.1}]'])
     assert "target" in str(err.value)
 
 
@@ -374,6 +397,6 @@ def test_an_unknown_field_in_a_term_raises(tmp_path, fake_task):
     path.write_text(BASE)
     with pytest.raises(ValueError) as err:
         load_config(
-            path, ['losses.terms=[{name: action_l2, target: policy, weight: 0.1, scale: 2}]']
+            path, ['losses.terms=[{name: action_squared, target: policy, weight: 0.1, scale: 2}]']
         )
     assert "scale" in str(err.value)

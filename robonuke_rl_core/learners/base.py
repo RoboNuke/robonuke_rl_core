@@ -25,12 +25,6 @@ from skrl.agents.torch.base import ExperimentCfg as SkrlExperimentCfg
 from skrl.memories.torch import Memory
 from skrl.models.torch import Model
 
-from ..models.block_utils import (
-    assign_block_slice,
-    merge_optimizer_states,
-    slice_block_state_dict,
-    slice_optimizer_state,
-)
 from ..losses.losses import LossContext
 from ..models.normalizer import BlockRunningNorm
 from .cfg import TrainerCfg
@@ -94,7 +88,7 @@ class LearnerBase(Agent):
             action_space=action_space,
             device=device,
         )
-        self.cfg = cfg  # our section cfg (SACCfg / PPOCfg / FlashSACCfg)
+        self.cfg = cfg  # our section cfg (SACCfg or PPOCfg)
         self.trainer_cfg = trainer_cfg
         self.num_agents = num_agents
         self.num_envs = num_envs
@@ -318,11 +312,11 @@ class LearnerBase(Agent):
             "agent_idx": int(agent),
             "mean_return": float(self._mean_return[agent]),
             "models": {
-                key: slice_block_state_dict(getattr(self, key), agent, self.num_agents)
+                key: getattr(self, key).agent_state_dict(agent)
                 for key in self._checkpoint_model_keys()
             },
             "optimizers": {
-                key: slice_optimizer_state(getattr(self, key).state_dict(), agent, self.num_agents)
+                key: getattr(self, key).agent_state_dict(agent)
                 for key in self._checkpoint_optimizer_keys()
             },
             "normalizers": {
@@ -364,12 +358,12 @@ class LearnerBase(Agent):
             directory.mkdir(parents=True, exist_ok=True)
             torch.save(self._build_checkpoint(agent, step), directory / "ckpt_best.pt")
 
-    def load_agent(self, path: str | Path, slot: int, *, with_optimizer: bool = False) -> Dict[str, Any]:
-        """Load one agent's checkpoint file into block slot ``slot``; return its metadata.
+    def load_agent(self, path: str | Path, slot: int, *, with_optimizer: bool = True) -> Dict[str, Any]:
+        """Load one agent's checkpoint file into slot ``slot``; return its metadata.
 
-        Model weights, normalizer stats and learner extras always load. Optimizer state only
-        loads with ``with_optimizer=True``, which needs ``num_agents == 1``: one file cannot
-        fill an N-agent optimizer's block-shaped moments.
+        Model weights, normalizer stats, learner extras and (unless ``with_optimizer`` is
+        False) the optimizer moments for that one slot. BlockAdamW keeps its state per agent,
+        so this works at any ``num_agents``.
         """
         path = Path(path)
         if not 0 <= slot < self.num_agents:
@@ -389,7 +383,7 @@ class LearnerBase(Agent):
                 f"{sorted(model_keys)}"
             )
         for key in model_keys:
-            assign_block_slice(getattr(self, key), slot, self.num_agents, ckpt["models"][key])
+            getattr(self, key).load_agent_state_dict(slot, ckpt["models"][key])
 
         normalizers = self._checkpoint_normalizers()
         if set(ckpt["normalizers"]) != set(normalizers):
@@ -403,14 +397,14 @@ class LearnerBase(Agent):
         self._load_extras(slot, ckpt["extras"], path)
 
         if with_optimizer:
-            if self.num_agents != 1:
-                raise ValueError(
-                    f"with_optimizer=True needs num_agents == 1 (this learner has "
-                    f"{self.num_agents}): one agent's file cannot fill a block-shaped optimizer "
-                    "state. Load without it to start that slot with fresh moments."
+            expected = set(self._checkpoint_optimizer_keys())
+            if set(ckpt["optimizers"]) != expected:
+                raise KeyError(
+                    f"{path} holds optimizer state {sorted(ckpt['optimizers'])} but "
+                    f"{type(self).__name__} expects {sorted(expected)}"
                 )
-            for key in self._checkpoint_optimizer_keys():
-                getattr(self, key).load_state_dict(merge_optimizer_states([ckpt["optimizers"][key]], 1))
+            for key in expected:
+                getattr(self, key).load_agent_state_dict(slot, ckpt["optimizers"][key])
 
         return {k: ckpt[k] for k in ("step", "num_agents", "agent_idx", "mean_return")}
 
