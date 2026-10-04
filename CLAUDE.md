@@ -106,13 +106,24 @@ sampling: each is per agent. Two consequences that are easy to undo by accident:
   denominator is exactly the plain mean, so nothing changes in the common case.
 * **No data-driven learning rate.** One optimizer over block parameters holds a single LR, so
   a KL-adaptive LR would couple the agents. Only `constant` and `cosine` exist.
+* **A dropped agent is frozen, and nothing else depends on who dropped.** PPO's KL early stop
+  masks the agent's policy loss *and* steps the policy optimizer through
+  `step_with_frozen_agents`, which puts the dropped agent's weights and Adam moments back
+  after the step (otherwise momentum and weight decay keep moving it). The step is still taken
+  on every minibatch, also when every agent is dropped, so the shared Adam step counter never
+  depends on another agent's KL. There is no early `break`, and the critic trains on every
+  minibatch for every agent.
+* **Loading one agent touches one slot.** Every per-agent tensor (including SAC's target
+  critics) is saved and loaded per slot; nothing on load may write a whole block.
 
 Test it the way `tests/learners/test_independence.py` does, which is the template for any new
 learner: fill the memory, `copy.deepcopy` the learner, make agent 1's data extreme in the copy
 (rewards x1e6, observations x1e3), run a few updates on both, and require agents 0 and 2 to be
 bit-identical (`torch.equal`) in weights, optimizer moments, normalizer stats and learner
 extras. Run more than one update: Adam's first step is sign-only, so a single step cannot show
-that a gradient's magnitude changed.
+that a gradient's magnitude changed. Make sure each case really runs the path it names: the
+test checks the *weights* changed (normalizer stats alone do not count), and the KL cases
+assert from `ppo/kept` that agent 1 was dropped in the copy but not in the control.
 
 ### Add a learner
 
@@ -164,8 +175,9 @@ that a gradient's magnitude changed.
 One memory class (`MultiRandomMemory`). Batch sizes are **per agent**: `sample(batch_size=B)`
 returns `B * num_agents` rows as `[agent 0 | agent 1 | ...]`, drawn from each agent's own envs,
 and `sample_all` keeps that order so a block-parallel reshape routes each agent's rows to its
-own parameters. `memory.memory_size` is SAC's per-agent capacity; PPO's buffer is
-`ppo.rollouts` steps per env.
+own parameters. `memory.memory_size` is SAC's capacity in transitions **per agent**:
+`replay_depth(memory_size, envs_per_agent)` gives the per-env depth and raises unless
+`memory_size` is a multiple of the envs per agent. PPO's buffer is `ppo.rollouts` steps per env.
 
 ### Emit a metric
 

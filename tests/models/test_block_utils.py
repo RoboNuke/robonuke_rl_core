@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -12,6 +14,7 @@ from robonuke_rl_core.models.block_utils import (
     merge_optimizer_states,
     slice_block_state_dict,
     slice_optimizer_state,
+    step_with_frozen_agents,
 )
 
 NUM_AGENTS = 3
@@ -153,3 +156,91 @@ def test_merge_needs_every_agent():
         merge_optimizer_states([sliced], NUM_AGENTS)
     with pytest.raises(KeyError):
         merge_optimizer_states([{"state": {}, "param_groups": []}], 1)
+
+
+# ------------------------------------------------------------------ step_with_frozen_agents
+def _random_grads(module: nn.Module, seed: int) -> None:
+    gen = torch.Generator().manual_seed(seed)
+    for param in module.parameters():
+        param.grad = torch.randn(param.shape, generator=gen)
+
+
+def _init_weights(module: nn.Module) -> None:
+    gen = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for param in module.parameters():
+            param.copy_(torch.randn(param.shape, generator=gen))
+
+
+def _agent_view(module: nn.Module, optimizer, agent: int) -> dict:
+    """One agent's weights and Adam moments (block slice or its own ParameterList entry)."""
+    out = {}
+    for name, param in module.named_parameters():
+        if param.shape[0] == NUM_AGENTS:
+            index = agent
+        elif name.startswith("log_std."):
+            if int(name.split(".")[1]) != agent:
+                continue
+            index = slice(None)
+        state = optimizer.state.get(param, {})
+        out[name] = param.detach()[index].clone()
+        for key in ("exp_avg", "exp_avg_sq"):
+            out[f"{name}/{key}"] = state[key][index].clone() if key in state else None
+    return out
+
+
+@pytest.mark.parametrize("warm_steps", [0, 3])  # 0: the optimizer state does not exist yet
+def test_a_frozen_agent_comes_out_bit_identical(warm_steps):
+    module = WithParameterList()
+    _init_weights(module)
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-2, weight_decay=0.1)
+    for step in range(warm_steps):
+        _random_grads(module, seed=step)
+        optimizer.step()
+
+    reference = WithParameterList()
+    reference.load_state_dict(module.state_dict())
+    reference_opt = torch.optim.AdamW(reference.parameters(), lr=1e-2, weight_decay=0.1)
+    # deepcopy: load_state_dict keeps same-device tensors by reference, so the two
+    # optimizers would otherwise share their moment tensors
+    reference_opt.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+
+    frozen_before = _agent_view(module, optimizer, 1)
+    _random_grads(module, seed=99)
+    _random_grads(reference, seed=99)
+    active = torch.tensor([True, False, True])
+    step_with_frozen_agents(optimizer, module, NUM_AGENTS, active)
+    reference_opt.step()
+
+    frozen_after = _agent_view(module, optimizer, 1)
+    for key, before in frozen_before.items():
+        if before is None:  # moments created by this step: the frozen agent's stay at zero
+            assert torch.equal(frozen_after[key], torch.zeros_like(frozen_after[key])), key
+        else:
+            assert torch.equal(before, frozen_after[key]), key
+    # the active agents took exactly a plain AdamW step
+    for agent in (0, 2):
+        got, want = _agent_view(module, optimizer, agent), _agent_view(reference, reference_opt, agent)
+        for key in want:
+            assert torch.equal(got[key], want[key]), (agent, key)
+
+
+def test_frozen_step_still_advances_the_step_counter():
+    module = BlockOnly()
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-2)
+    for step in range(3):
+        _random_grads(module, seed=step)
+        step_with_frozen_agents(optimizer, module, NUM_AGENTS, torch.zeros(NUM_AGENTS, dtype=torch.bool))
+    for param in module.parameters():
+        assert float(optimizer.state[param]["step"]) == 3.0
+        assert torch.equal(param.detach(), torch.zeros_like(param))  # every agent frozen
+
+
+def test_frozen_step_needs_every_grad():
+    module = BlockOnly()
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-2)
+    with pytest.raises(ValueError):
+        step_with_frozen_agents(optimizer, module, NUM_AGENTS, torch.ones(NUM_AGENTS, dtype=torch.bool))
+    _random_grads(module, seed=0)
+    with pytest.raises(ValueError):
+        step_with_frozen_agents(optimizer, module, NUM_AGENTS, torch.ones(2, dtype=torch.bool))

@@ -177,6 +177,67 @@ def test_checkpoint_round_trip_into_another_slot(tmp_path, learner_name):
     )
 
 
+@pytest.mark.parametrize("learner_name", ["sac", "flash_sac"])
+def test_loading_one_slot_leaves_every_other_agent_alone(tmp_path, learner_name):
+    """Target critics are saved per agent; loading slot 1 touches slot 1 only."""
+    from robonuke_rl_core.models.block_utils import slice_block_state_dict
+
+    source = build_learner(
+        learner_name, num_agents=3, envs_per_agent=2, run_dirs_list=[tmp_path / f"a{i}" for i in range(3)]
+    )
+    fill_memory(source)
+    torch.manual_seed(5)
+    source.update(timestep=10, timesteps=100)  # targets now lag their critics
+    path = source.save_checkpoints(step=10)[2]
+
+    learner = build_learner(learner_name, num_agents=3, envs_per_agent=2)
+    fill_memory(learner)
+    torch.manual_seed(6)
+    learner.update(timestep=10, timesteps=100)
+    keys = learner._checkpoint_model_keys()
+    assert "target_critic_1" in keys and "target_critic_2" in keys
+    before = {a: {k: slice_block_state_dict(getattr(learner, k), a, 3) for k in keys} for a in (0, 2)}
+
+    learner.load_agent(path, slot=1)
+
+    for agent in (0, 2):
+        for key in keys:
+            after = slice_block_state_dict(getattr(learner, key), agent, 3)
+            for name in after:
+                assert torch.equal(after[name], before[agent][key][name]), (agent, key, name)
+    # slot 1 holds the saved agent's lagging targets, not a copy of its critics
+    for key in ("target_critic_1", "target_critic_2"):
+        saved = slice_block_state_dict(getattr(source, key), 2, 3)
+        loaded = slice_block_state_dict(getattr(learner, key), 1, 3)
+        for name in saved:
+            assert torch.equal(saved[name], loaded[name]), (key, name)
+
+
+def test_ppo_every_agent_dropped_freezes_the_policy_but_trains_the_critic():
+    """With every agent over the KL limit, policy weights and Adam moments do not move, the
+    critic still trains, and the policy optimizer's step counter still counts every minibatch."""
+    from robonuke_rl_core.models.block_utils import slice_block_state_dict
+
+    # observation normalization on: the stats move between rollout and update, so every
+    # agent's KL starts far above this threshold
+    learner = build_learner("ppo", num_agents=3, envs_per_agent=2, kl_threshold=1.0e-6)
+    fill_memory(learner)
+    policy_before = copy.deepcopy(learner.policy.state_dict())
+    value_before = copy.deepcopy(learner.value.state_dict())
+
+    torch.manual_seed(7)
+    learner.update(timestep=10, timesteps=100)
+
+    for name, tensor in learner.policy.state_dict().items():
+        assert torch.equal(tensor, policy_before[name]), name
+    for state in learner.policy_optimizer.state.values():
+        assert torch.equal(state["exp_avg"], torch.zeros_like(state["exp_avg"]))
+        assert float(state["step"]) == learner.cfg.learning_epochs * learner.cfg.mini_batches
+    assert any(
+        not torch.equal(tensor, value_before[name]) for name, tensor in learner.value.state_dict().items()
+    )
+
+
 def test_loading_an_optimizer_into_a_multi_agent_learner_raises(tmp_path):
     source = build_learner(
         "sac", num_agents=3, envs_per_agent=2, run_dirs_list=[tmp_path / f"a{i}" for i in range(3)]

@@ -39,6 +39,7 @@ def main() -> int:
     from robonuke_rl_core.learners.ppo import PPO
     from robonuke_rl_core.learners.sac import SAC
     from robonuke_rl_core.memory.multi_random import MultiRandomMemory
+    from robonuke_rl_core.memory.cfg import replay_depth
     from robonuke_rl_core.models.factory import build_models
 
     learners = {"sac": SAC, "ppo": PPO, "flash_sac": FlashSAC}
@@ -74,7 +75,7 @@ def main() -> int:
     per_env_depth = (
         int(learner_cfg.rollouts)
         if learner_name == "ppo"
-        else max(1, cfg.memory.memory_size // total_envs)
+        else replay_depth(cfg.memory.memory_size, total_envs // num_agents)
     )
     memory = MultiRandomMemory(
         memory_size=per_env_depth, num_envs=total_envs, num_agents=num_agents, device=env.device

@@ -78,14 +78,34 @@ def run_updates(learner, count: int = 3, seed: int = 7) -> None:
         learner.update(timestep=10, timesteps=100)
 
 
+def _model_weights(snap: dict) -> dict:
+    return {key: value for key, value in snap.items() if key.startswith("model/")}
+
+
+def _kept(learner) -> dict:
+    """Collect each agent's logged ``ppo/kept`` fractions."""
+    kept: dict = {}
+    learner.on_log.append(
+        lambda agent, metrics, step: kept.setdefault(agent, []).append(float(metrics["ppo/kept"]))
+        if "ppo/kept" in metrics
+        else None
+    )
+    return kept
+
+
 @pytest.mark.parametrize(
     "learner_name, overrides",
     [
         ("sac", {}),
         ("sac", {"grad_norm_clip": 0.5}),
         ("ppo", {}),
-        ("ppo", {"grad_norm_clip": 0.5, "kl_threshold": 0.001}),
-        ("ppo", {"kl_threshold": 0.001, "value_update_ratio": 3}),
+        ("ppo", {"grad_norm_clip": 0.5}),
+        # KL cases run without observation normalization: then the untouched agents start at
+        # KL 0 and keep updating, while agent 1 (whose stored log_prob came from its unscaled
+        # observations) is dropped in the extreme copy only. The test asserts that this
+        # happened, so the masking path is really exercised.
+        ("ppo", {"grad_norm_clip": 0.5, "kl_threshold": 0.1, "normalize_observations": False}),
+        ("ppo", {"kl_threshold": 0.1, "value_update_ratio": 3, "normalize_observations": False}),
         ("ppo", {"entropy_loss_scale": 0.01, "value_update_ratio": 3}),
         ("flash_sac", {}),
         ("flash_sac", {"grad_norm_clip": 0.5}),
@@ -99,14 +119,31 @@ def test_one_agents_data_cannot_change_another_agents_update(learner_name, overr
     extreme = copy.deepcopy(control)
     make_extreme(extreme, AGENT_UNDER_TEST)
 
+    masked = overrides.get("kl_threshold", 0) > 0
+    if masked:
+        control_kept, extreme_kept = _kept(control), _kept(extreme)
+
     run_updates(control)
     run_updates(extreme)
 
     for agent in UNTOUCHED:
         assert_same(snapshot(control, agent), snapshot(extreme, agent), f"agent{agent}")
-        # and the update really did something, so the comparison above is not vacuous
+        # and the networks really changed (not just normalizer stats), so the comparison
+        # above is not vacuous
         with pytest.raises(AssertionError):
-            assert_same(before[agent], snapshot(control, agent), f"agent{agent}")
+            assert_same(
+                _model_weights(before[agent]),
+                _model_weights(snapshot(control, agent)),
+                f"agent{agent}",
+            )
+
+    if masked:
+        # agent 1 was dropped in the extreme copy but not in the control, while the untouched
+        # agents kept updating: the masked-loss and frozen-step paths really ran
+        assert extreme_kept[AGENT_UNDER_TEST] != control_kept[AGENT_UNDER_TEST]
+        assert min(extreme_kept[AGENT_UNDER_TEST]) < 1.0
+        for agent in UNTOUCHED:
+            assert max(extreme_kept[agent]) == 1.0
 
     # the extreme agent itself did diverge
     with pytest.raises(AssertionError):

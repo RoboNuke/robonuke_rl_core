@@ -22,6 +22,7 @@ __all__ = [
     "slice_optimizer_state",
     "merge_optimizer_states",
     "clip_grad_norm_per_agent",
+    "step_with_frozen_agents",
 ]
 
 
@@ -172,13 +173,10 @@ def _agent_of(name: str, prefixes: List[str]) -> int | None:
     return None
 
 
-def clip_grad_norm_per_agent(modules, num_agents: int, max_norm: float) -> torch.Tensor:
-    """Clip each agent's gradients by its own norm; return the pre-clip norms ``(num_agents,)``.
-
-    ``modules`` is one ``nn.Module`` or an iterable of them. Every parameter must be either a
-    block parameter (leading dim ``num_agents``) or an entry of an ``nn.ParameterList`` with one
-    entry per agent. A shared parameter would make one agent's gradient scale depend on another
-    agent's data, so it raises instead.
+def _owned_parameters(modules, num_agents: int, caller: str) -> List[Tuple[nn.Parameter, int | None]]:
+    """Every parameter of ``modules`` with its owner: ``None`` for a block parameter (all
+    agents, leading dim ``num_agents``), else the agent index of a per-agent ParameterList
+    entry. A shared parameter would couple the agents, so it raises.
 
     Ownership is read from the module tree, not from attributes on the parameters: a
     ``copy.deepcopy`` of a module drops custom tensor attributes.
@@ -187,17 +185,13 @@ def clip_grad_norm_per_agent(modules, num_agents: int, max_norm: float) -> torch
         modules = [modules]
     modules = list(modules)
     if not modules:
-        raise ValueError("clip_grad_norm_per_agent got no modules")
-
-    block: List[torch.nn.Parameter] = []
-    per_agent: List[Tuple[int, torch.nn.Parameter]] = []
-    device = None
+        raise ValueError(f"{caller} got no modules")
+    owned: List[Tuple[nn.Parameter, int | None]] = []
     for module in modules:
         prefixes = _per_agent_paramlist_prefixes(module, num_agents)
         for name, param in module.named_parameters():
-            device = param.device if device is None else device
             if param.dim() >= 1 and param.shape[0] == num_agents:
-                block.append(param)
+                owned.append((param, None))
                 continue
             agent = _agent_of(name, prefixes)
             if agent is None:
@@ -206,25 +200,94 @@ def clip_grad_norm_per_agent(modules, num_agents: int, max_norm: float) -> torch
                     f"block parameter (leading dim == num_agents == {num_agents}) nor an entry of "
                     "a per-agent nn.ParameterList. A shared parameter would couple the agents."
                 )
-            per_agent.append((agent, param))
+            owned.append((param, agent))
+    return owned
 
-    norms = torch.zeros(num_agents, device=device)
-    for agent in range(num_agents):
-        squares = [p.grad[agent].pow(2).sum() for p in block if p.grad is not None]
-        squares += [
-            p.grad.pow(2).sum() for owner, p in per_agent if owner == agent and p.grad is not None
-        ]
-        if squares:
-            norms[agent] = torch.sqrt(torch.stack(squares).sum())
+
+def _per_row(vector: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """``(num_agents,)`` -> a view that broadcasts over ``like``'s trailing dims."""
+    return vector.view(-1, *([1] * (like.dim() - 1)))
+
+
+def clip_grad_norm_per_agent(modules, num_agents: int, max_norm: float) -> torch.Tensor:
+    """Clip each agent's gradients by its own norm; return the pre-clip norms ``(num_agents,)``.
+
+    ``modules`` is one ``nn.Module`` or an iterable of them. Every parameter must be either a
+    block parameter (leading dim ``num_agents``) or an entry of an ``nn.ParameterList`` with one
+    entry per agent; a shared parameter raises. Same scaling rule as
+    ``torch.nn.utils.clip_grad_norm_`` (``max_norm / (norm + 1e-6)``, capped at 1), computed
+    for all agents at once: no GPU->CPU sync.
+    """
+    owned = _owned_parameters(modules, num_agents, "clip_grad_norm_per_agent")
+    device = owned[0][0].device if owned else None
+    squares = torch.zeros(num_agents, device=device)
+    for param, owner in owned:
+        if param.grad is None:
+            continue
+        if owner is None:
+            squares += param.grad.pow(2).reshape(num_agents, -1).sum(dim=1)
+        else:
+            squares[owner] += param.grad.pow(2).sum()
+    norms = squares.sqrt()
 
     if max_norm > 0:
-        for agent in range(num_agents):
-            if norms[agent] > max_norm:
-                scale = max_norm / norms[agent]
-                for p in block:
-                    if p.grad is not None:
-                        p.grad[agent].mul_(scale)
-                for owner, p in per_agent:
-                    if owner == agent and p.grad is not None:
-                        p.grad.mul_(scale)
+        scale = (max_norm / (norms + 1e-6)).clamp(max=1.0)
+        for param, owner in owned:
+            if param.grad is None:
+                continue
+            if owner is None:
+                param.grad.mul_(_per_row(scale, param.grad))
+            else:
+                param.grad.mul_(scale[owner])
     return norms
+
+
+def step_with_frozen_agents(optimizer: torch.optim.Optimizer, modules, num_agents: int, active: torch.Tensor) -> None:
+    """``optimizer.step()``, then put every inactive agent's weights and Adam moments back.
+
+    A frozen agent's weights and ``exp_avg`` / ``exp_avg_sq`` come out bit-identical to before
+    the step, so momentum and weight decay cannot move it. The optimizer's step counter is
+    shared and still advances; call this on every update step (also when every agent is
+    inactive) so the counter is the same for every agent and never depends on another agent's
+    data. Works with Adam/AdamW (any implementation: foreach or fused).
+
+    ``active`` is a bool tensor ``(num_agents,)``. Every parameter needs a ``.grad`` (zeros are
+    fine), so the step counter advances for all of them.
+    """
+    if active.shape != (num_agents,) or active.dtype != torch.bool:
+        raise ValueError(f"active must be a bool tensor of shape ({num_agents},), got {active.dtype} {tuple(active.shape)}")
+    owned = _owned_parameters(modules, num_agents, "step_with_frozen_agents")
+    if any(param.grad is None for param, _ in owned):
+        raise ValueError("every parameter needs a .grad before step_with_frozen_agents; zero it, do not set it to None")
+    frozen = (~active).nonzero().flatten()
+    if frozen.numel() == 0:
+        optimizer.step()
+        return
+    frozen_list = frozen.tolist()
+
+    saved = []
+    for param, owner in owned:
+        if owner is not None and owner not in frozen_list:
+            continue
+        index = frozen if owner is None else slice(None)
+        state = optimizer.state.get(param, {})
+        moments = {}
+        for key in ("exp_avg", "exp_avg_sq"):
+            if key in state:
+                moments[key] = state[key][index].clone()
+            elif state:
+                raise KeyError(f"optimizer state has no '{key}': step_with_frozen_agents needs Adam/AdamW")
+            else:
+                moments[key] = None  # not created yet: a frozen agent's moments stay at zero
+        saved.append((param, index, param.detach()[index].clone(), moments))
+
+    optimizer.step()
+
+    with torch.no_grad():
+        for param, index, weights, moments in saved:
+            param[index] = weights
+            state = optimizer.state[param]
+            for key, value in moments.items():
+                if key not in state:
+                    raise KeyError(f"optimizer state has no '{key}': step_with_frozen_agents needs Adam/AdamW")
+                state[key][index] = 0.0 if value is None else value

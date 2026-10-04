@@ -488,8 +488,9 @@ class SAC(LearnerBase):
 
     # ------------------------------------------------------------------ checkpoints
     def _checkpoint_model_keys(self) -> List[str]:
-        # the targets are EMA copies of the critics; load reconstructs them as target := critic
-        return ["policy", "critic_1", "critic_2"]
+        # the target critics are saved too: resuming must keep their EMA lag, and loading one
+        # slot must not touch any other agent's targets
+        return ["policy", "critic_1", "critic_2", "target_critic_1", "target_critic_2"]
 
     def _checkpoint_optimizer_keys(self) -> List[str]:
         return ["policy_optimizer", "critic_optimizer"]
@@ -531,9 +532,3 @@ class SAC(LearnerBase):
             )
             if self.cfg.learn_entropy:
                 self.log_entropy_coefficient.data[agent].copy_(saved_log.to(self.device))
-        # the targets are not saved: start them at the loaded critics, polyak re-tracks them
-        for target, critic in (
-            (self.target_critic_1, self.critic_1),
-            (self.target_critic_2, self.critic_2),
-        ):
-            target.update_parameters(critic, polyak=1)

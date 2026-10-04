@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from robonuke_rl_core.memory.cfg import replay_depth
 from robonuke_rl_core.memory.multi_random import MultiRandomMemory
 
 NUM_AGENTS = 3
@@ -67,3 +68,15 @@ def test_sampling_stays_inside_the_filled_part():
     torch.manual_seed(0)
     (batch,) = memory.sample(names=["value"], batch_size=16)
     assert bool((batch[0] == 1.0).all())
+
+
+def test_replay_depth_gives_each_agent_memory_size_transitions():
+    assert replay_depth(200_000, 64) == 3125  # 3125 steps x 64 envs = 200_000 per agent
+    assert replay_depth(256, 4) == 64
+
+
+@pytest.mark.parametrize("size", [200_001, 3])
+def test_replay_depth_must_divide_evenly(size):
+    with pytest.raises(ValueError) as err:
+        replay_depth(size, 64)
+    assert "multiple" in str(err.value)
