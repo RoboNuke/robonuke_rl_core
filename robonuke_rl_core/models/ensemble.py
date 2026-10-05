@@ -112,7 +112,9 @@ class VmapEnsemble(nn.Module):
     @staticmethod
     def flatten(batched: torch.Tensor) -> torch.Tensor:
         """``(num_agents, rows, ...) -> (num_agents * rows, ...)``."""
-        return batched.reshape(-1, *batched.shape[2:])
+        # the explicit product (not -1) keeps a zero-column tensor unambiguous, e.g. the
+        # (num_agents, rows, 0) log_std of an all-Bernoulli policy
+        return batched.reshape(batched.shape[0] * batched.shape[1], *batched.shape[2:])
 
     # ------------------------------------------------------------------ per-agent state
     def agent_state_dict(self, agent: int) -> Dict[str, torch.Tensor]:

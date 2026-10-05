@@ -3,8 +3,8 @@
 Shared RL package for Isaac Lab research: skrl agents, several independent agents trained in
 parallel in one Isaac Sim instance on one GPU. Built area by area. **Today the config manager
 (`robonuke_rl_core/config.py`), the learners (`learners/`), the models (`models/`) and the
-memory (`memory/`) exist.** The models and the memory are provisional ports; they get their
-own design pass later.
+memory (`memory/`) exist.** The models got their design pass (plain modules + vmap); the
+memory is still a provisional port and gets its own pass later.
 
 Test env: the `general` conda env (`/home/hunter/miniconda3/envs/general/bin/python`). Never
 create a new conda env for this project.
@@ -111,9 +111,11 @@ sampling: each is per agent. Two consequences that are easy to undo by accident:
   policy loss *and* passes the keep mask to both optimizers: `BlockAdamW.step(keep)` computes
   the update and writes it only where `keep` is true, so a frozen agent comes out
   bit-identical — weights, both Adam moments, and its own step count. When **every** agent is
-  dropped the epoch `break`s out; with the whole agent frozen that skips only masked work, so
-  it couples nothing. (SpinningUp-style "the critic keeps training" is a one-argument change:
-  pass `keep=None` to the value optimizer.)
+  dropped the epoch `break`s out; with the whole agent frozen that skips only masked work —
+  almost: a break in epoch 0 also skips the remaining minibatches' observation-normalizer
+  stat updates (stats train in epoch 0 only) and their logging, for every agent alike. That
+  residue is collective, rare and accepted. (SpinningUp-style "the critic keeps training" is
+  a one-argument change: pass `keep=None` to the value optimizer.)
 * **Loading one agent touches one slot.** Every per-agent tensor (including SAC's target
   critics) is saved and loaded per slot; nothing on load may write a whole block.
 

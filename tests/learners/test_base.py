@@ -344,3 +344,24 @@ def test_learner_metrics_must_be_one_value_per_agent():
     with pytest.raises(TypeError) as err:
         learner.emit_per_agent({"loss/x": torch.zeros(2)}, step=0)
     assert "loss/x" in str(err.value)
+
+
+# ------------------------------------------------------------------ Bernoulli action dims
+@pytest.mark.parametrize("learner_name", ["ppo", "sac"])
+def test_an_all_bernoulli_policy_trains(learner_name):
+    """Every action dim Bernoulli: the entropy, log-prob and optimizer paths must all hold
+    (the block port crashed PPO here: get_entropy returned a 0-d tensor)."""
+    overrides = {"entropy_loss_scale": 0.01} if learner_name == "ppo" else {}
+    learner = build_learner(
+        learner_name, model_overrides={"bernoulli_action_dims": [0, 1]}, **overrides
+    )
+    fill_memory(learner)
+    before = [p.detach().clone() for p in learner.policy.parameters()]
+    learner.update(timestep=10, timesteps=100)
+    after = list(learner.policy.parameters())
+    assert any(not torch.equal(b, a) for b, a in zip(before, after))
+    for p in after:
+        assert torch.isfinite(p).all()
+    # the actions really are mode bits
+    actions, _ = learner.act(torch.randn(learner.num_envs, OBS_DIM), None, timestep=11, timesteps=100)
+    assert set(actions.unique().tolist()) <= {-1.0, 1.0}

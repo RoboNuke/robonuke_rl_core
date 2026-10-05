@@ -101,6 +101,9 @@ def _kept(learner) -> dict:
         # happened, so the masking path is really exercised.
         ("ppo", {"grad_norm_clip": 0.5, "kl_threshold": 0.1, "normalize_observations": False}),
         ("ppo", {"kl_threshold": 0.1, "value_update_ratio": 3, "normalize_observations": False}),
+        # a Bernoulli dim exercises the straight-through and Bernoulli log-prob paths
+        ("ppo", {"model_overrides": {"bernoulli_action_dims": [1]}}),
+        ("sac", {"model_overrides": {"bernoulli_action_dims": [1]}}),
         ("ppo", {"entropy_loss_scale": 0.01, "value_update_ratio": 3}),
     ],
 )

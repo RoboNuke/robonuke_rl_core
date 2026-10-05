@@ -121,8 +121,13 @@ class SimbaActorNet(nn.Module):
                 rows *= (
                     last_layer_scale if scale_rows is None else scale_rows.view(-1, 1)
                 )
+        # no parameter when the std is state dependent, and none for an all-Bernoulli policy:
+        # a zero-element parameter would never enter the graph, so its grad would stay None
+        # and BlockAdamW (which requires every parameter to have a gradient) would raise
         self.log_std = (
-            None if use_state_dependent_std else nn.Parameter(log_std_init.clone())
+            None
+            if use_state_dependent_std or num_continuous == 0
+            else nn.Parameter(log_std_init.clone())
         )
 
     def forward(self, observations: torch.Tensor):
@@ -130,6 +135,8 @@ class SimbaActorNet(nn.Module):
         mean = out[..., : self.policy_out_dim]
         if self.use_state_dependent_std:
             log_std = out[..., self.policy_out_dim :]
+        elif self.log_std is None:  # all-Bernoulli: no continuous dims, no sigma
+            log_std = out.new_zeros(observations.shape[0], 0)
         else:
             log_std = self.log_std.expand(observations.shape[0], self.num_continuous)
         return mean, log_std
@@ -219,6 +226,8 @@ class EnsembleActor(EnsembleModel, GaussianMixin, Model):
         )
         self.num_agents = num_agents
         self.use_state_dependent_std = use_state_dependent_std
+        self._g_distribution = None  # the last act()'s Gaussian, for get_entropy
+        self._b_distribution = None  # the last act()'s Bernoulli, for get_entropy
 
         bernoulli = sorted(set(bernoulli_action_dims or []))
         force_zero = sorted(set(force_zero_action_dims or []))
@@ -318,6 +327,8 @@ class EnsembleActor(EnsembleModel, GaussianMixin, Model):
         actions = raw_out.new_zeros((rows, self.num_actions))
         mean_actions = raw_out.new_zeros((rows, self.num_actions))
         log_prob_parts = []
+        self._g_distribution = None
+        self._b_distribution = None
 
         if self.num_continuous > 0:
             cont_mean = raw_out.index_select(-1, self._cont_out_idx)
@@ -336,6 +347,8 @@ class EnsembleActor(EnsembleModel, GaussianMixin, Model):
 
         if self.num_bernoulli > 0:
             probability = torch.sigmoid(raw_out.index_select(-1, self._bern_out_idx))
+            bernoulli_distribution = torch.distributions.Bernoulli(probs=probability)
+            self._b_distribution = bernoulli_distribution  # get_entropy reads this
             if taken_actions is None:
                 with torch.no_grad():
                     sample = (torch.rand_like(probability) < probability).float()
@@ -345,9 +358,7 @@ class EnsembleActor(EnsembleModel, GaussianMixin, Model):
             # straight through: forward is the sample, backward is the probability
             through = (sample - probability).detach() + probability
             log_prob_parts.append(
-                torch.distributions.Bernoulli(probs=probability)
-                .log_prob(sample)
-                .sum(dim=-1, keepdim=True)
+                bernoulli_distribution.log_prob(sample).sum(dim=-1, keepdim=True)
             )
             actions.index_copy_(-1, self._bern_action_idx, 2.0 * through - 1.0)
             mean_actions.index_copy_(
@@ -361,10 +372,21 @@ class EnsembleActor(EnsembleModel, GaussianMixin, Model):
         return actions, outputs
 
     def get_entropy(self, *, role: str = ""):
-        """Continuous-Gaussian entropy. The squashed/Bernoulli mixture has no closed form."""
-        if getattr(self, "_g_distribution", None) is None:
+        """Per-dim entropy of the last ``act()``: ``(rows, num_continuous + num_bernoulli)``.
+
+        The Gaussian columns are the pre-squash entropy (the tanh-squashed density has no
+        closed form); the Bernoulli columns are exact. Both carry gradients, so PPO's entropy
+        bonus regularizes the Bernoulli dims too — the block port only covered the Gaussian
+        part and returned a 0-d tensor for an all-Bernoulli policy, which crashed PPO.
+        """
+        parts = []
+        if self._g_distribution is not None:
+            parts.append(self._g_distribution.entropy())
+        if self._b_distribution is not None:
+            parts.append(self._b_distribution.entropy())
+        if not parts:
             return torch.tensor(0.0, device=self.device)
-        return self._g_distribution.entropy().to(self.device)
+        return (parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)).to(self.device)
 
 
 class EnsembleQCritic(EnsembleModel, DeterministicMixin, Model):

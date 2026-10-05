@@ -61,9 +61,13 @@ def build_learner(
     asymmetric: bool = False,
     run_dirs_list=None,
     trainer_overrides: Dict[str, Any] | None = None,
+    model_overrides: Dict[str, Any] | None = None,
     **cfg_overrides,
 ):
-    """A learner with tiny networks and an empty memory of depth ``rollout``."""
+    """A learner with tiny networks and an empty memory of depth ``rollout``.
+
+    ``model_overrides`` sets fields on the actor cfg (e.g. ``bernoulli_action_dims``).
+    """
     torch.manual_seed(0)
     num_envs = num_agents * envs_per_agent
     cfg = learner_cfg(learner, **cfg_overrides)
@@ -80,6 +84,10 @@ def build_learner(
     state_space = box(STATE_DIM) if asymmetric else None
     action_space = box(ACT_DIM)
     model_cfg = tiny_model_cfg()
+    for key, value in (model_overrides or {}).items():
+        if not hasattr(model_cfg.actor, key):
+            raise AttributeError(f"actor cfg has no field '{key}'")
+        setattr(model_cfg.actor, key, value)
     models = build_models(
         learner, model_cfg, observation_space, state_space, action_space, num_agents, "cpu"
     )
