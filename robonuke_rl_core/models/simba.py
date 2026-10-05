@@ -1,5 +1,9 @@
 """SimBa networks as plain single-agent modules, plus the ensemble wrappers skrl sees.
 
+SimBa (Lee et al., 2025, https://arxiv.org/abs/2410.09754): residual MLP blocks with
+LayerNorm, an architecture whose simplicity bias lets RL networks scale in parameters.
+Its config lives in ``models/cfg.py`` (``SimbaActorCfg`` / ``SimbaCriticCfg``).
+
 Two layers:
 
 * ``SimbaTrunk`` / ``SimbaActorNet`` / ``SimbaQCriticNet`` / ``SimbaValueCriticNet`` are

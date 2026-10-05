@@ -154,8 +154,11 @@ Proximal Policy Optimization. The rollout buffer is `rollouts` steps per env;
 
 ## model
 
-The networks: plain single-agent modules, stacked across agents with `torch.vmap`. `actor_*`
-sizes feed the policy, `critic_*` the critics.
+The networks: plain single-agent modules, stacked across agents with `torch.vmap`. The only
+architecture today is **SimBa** ([Lee et al., 2025](https://arxiv.org/abs/2410.09754)) —
+residual MLP blocks with LayerNorm — so every field below is SimBa-specific: `actor.*`
+configures the SimBa actor, `critic.*` the SimBa critics. A future architecture gets its own
+clearly named group in this section rather than extra fields in these two.
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |
@@ -175,7 +178,7 @@ sizes feed the policy, `critic_*` the critics.
 | `actor.scale_down_action_dims` | list[int] or null | `null` | action dims that `last_layer_scale` applies to (default: all) |
 | `critic.critic_n` | int | `2` | residual blocks in a critic backbone |
 | `critic.critic_latent` | int | `512` | critic hidden width |
-| `critic.critic_output_init_mean` | float | `0.0` | initial critic output bias (SimBa critics) |
+| `critic.critic_output_init_mean` | float | `0.0` | initial critic output bias |
 | `critic.clip_actions` | bool | `False` | clip actions to the action space inside the critic |
 
 ## memory

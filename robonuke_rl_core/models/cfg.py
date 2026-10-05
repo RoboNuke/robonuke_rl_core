@@ -1,6 +1,10 @@
 """Model configuration: the `model` section.
 
-Fields are the ones the ported networks read. OmegaConf-supported types only.
+Every field here configures the **SimBa** architecture (Lee et al., 2025,
+https://arxiv.org/abs/2410.09754) — residual blocks with LayerNorm, scaled for RL — which is
+the only architecture the package ships today (``models/simba.py``). A future architecture
+gets its own clearly named config group (a new dataclass field on :class:`ModelCfg`), never
+extra fields mixed into the SimBa ones. OmegaConf-supported types only.
 """
 
 from __future__ import annotations
@@ -8,12 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-__all__ = ["ActorCfg", "CriticCfg", "ModelCfg"]
+__all__ = ["SimbaActorCfg", "SimbaCriticCfg", "ModelCfg"]
 
 
 @dataclass
-class ActorCfg:
-    """Policy network. ``*_action_dims`` index the env-facing action vector."""
+class SimbaActorCfg:
+    """SimBa policy network. ``*_action_dims`` index the env-facing action vector."""
 
     actor_n: int = 2
     actor_latent: int = 512
@@ -38,8 +42,8 @@ class ActorCfg:
 
 
 @dataclass
-class CriticCfg:
-    """Critic network."""
+class SimbaCriticCfg:
+    """SimBa critic network."""
 
     critic_n: int = 2
     critic_latent: int = 512
@@ -49,8 +53,11 @@ class CriticCfg:
 
 @dataclass
 class ModelCfg:
-    actor: ActorCfg = field(default_factory=ActorCfg)
-    critic: CriticCfg = field(default_factory=CriticCfg)
+    """The `model` section. ``actor`` and ``critic`` are SimBa groups; a future architecture
+    adds its own group here beside them."""
+
+    actor: SimbaActorCfg = field(default_factory=SimbaActorCfg)
+    critic: SimbaCriticCfg = field(default_factory=SimbaCriticCfg)
 
     REDUCTIONS = ("sum", "mean", "prod", "none")
 

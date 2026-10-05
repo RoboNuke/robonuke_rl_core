@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from robonuke_rl_core.optim import BlockAdamW
-from robonuke_rl_core.models.cfg import ActorCfg, CriticCfg, ModelCfg
+from robonuke_rl_core.models.cfg import SimbaActorCfg, SimbaCriticCfg, ModelCfg
 from robonuke_rl_core.models.factory import MODEL_BUILDERS, build_models
 
 NUM_AGENTS = 3
@@ -28,8 +28,8 @@ def box(dim: int) -> gymnasium.spaces.Box:
 
 def tiny_cfg() -> ModelCfg:
     return ModelCfg(
-        actor=ActorCfg(actor_n=1, actor_latent=8),
-        critic=CriticCfg(critic_n=1, critic_latent=8),
+        actor=SimbaActorCfg(actor_n=1, actor_latent=8),
+        critic=SimbaCriticCfg(critic_n=1, critic_latent=8),
     )
 
 

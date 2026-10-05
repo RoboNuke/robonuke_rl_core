@@ -180,7 +180,12 @@ The LR schedule is `lr_at(update, total_updates, lr, lr_end, schedule)`: `consta
    parameter has a leading agent dimension.
 4. Add a builder to `MODEL_BUILDERS` in `models/factory.py`, keyed by learner name. Critics
    take `state_space` when it is not None (asymmetric actor-critic).
-5. Add its fields to `ModelCfg` in `models/cfg.py` and their rows to the README.
+5. Give the architecture **its own config group**: a new dataclass in `models/cfg.py`, named
+   after the architecture and added as a field on `ModelCfg`, with the paper linked in its
+   docstring — never extra fields mixed into another architecture's group. (`actor` /
+   `critic` are SimBa's groups: `SimbaActorCfg` / `SimbaCriticCfg`,
+   https://arxiv.org/abs/2410.09754.) Add the rows to the README under a line saying which
+   architecture they configure.
 6. Copy the tests: the slot-vs-plain-module equivalence in `tests/models/test_ensemble.py`
    (same outputs **and** same gradients), plus tests 1-3 of `tests/models/test_factory.py`
    (stacked-only parameters, independence on agent 1's rows, checkpoint slicing).

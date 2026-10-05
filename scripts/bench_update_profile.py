@@ -24,7 +24,7 @@ from robonuke_rl_core.learners.cfg import PPOCfg, SACCfg, TrainerCfg  # noqa: E4
 from robonuke_rl_core.learners.ppo import PPO  # noqa: E402
 from robonuke_rl_core.learners.sac import SAC  # noqa: E402
 from robonuke_rl_core.memory.multi_random import MultiRandomMemory  # noqa: E402
-from robonuke_rl_core.models.cfg import ActorCfg, CriticCfg, ModelCfg  # noqa: E402
+from robonuke_rl_core.models.cfg import SimbaActorCfg, SimbaCriticCfg, ModelCfg  # noqa: E402
 from robonuke_rl_core.models.factory import build_models  # noqa: E402
 
 OBS_DIM, STATE_DIM, ACT_DIM = 44, 56, 12
@@ -36,7 +36,7 @@ def box(dim: int) -> gymnasium.spaces.Box:
 
 
 def build(learner_name: str, agents: int, num_envs: int, device: str, rollouts: int, batch: int):
-    model_cfg = ModelCfg(actor=ActorCfg(), critic=CriticCfg())  # real widths: 512 x 2
+    model_cfg = ModelCfg(actor=SimbaActorCfg(), critic=SimbaCriticCfg())  # real widths: 512 x 2
     if learner_name == "ppo":
         cfg = PPOCfg(rollouts=rollouts, learning_epochs=4, mini_batches=4, learning_starts=0)
         depth = rollouts
