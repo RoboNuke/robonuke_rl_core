@@ -22,10 +22,10 @@ import torch
 from skrl.agents.torch import Agent
 from skrl.agents.torch.base import AgentCfg
 from skrl.agents.torch.base import ExperimentCfg as SkrlExperimentCfg
-from skrl.memories.torch import Memory
 from skrl.models.torch import Model
 
 from ..losses.losses import LossContext
+from ..memory.multi_random import MultiRandomMemory
 from ..models.normalizer import BlockRunningNorm
 from .cfg import TrainerCfg
 
@@ -52,7 +52,7 @@ class LearnerBase(Agent):
         self,
         *,
         models: Dict[str, Model],
-        memory: Memory | None,
+        memory: MultiRandomMemory | None,
         observation_space,
         action_space,
         state_space=None,
@@ -98,6 +98,9 @@ class LearnerBase(Agent):
         #: ``fn(agent_idx, metrics, step)``; env metrics arrive as ``(envs_per_agent,)``
         #: tensors, learner metrics as 0-d tensors. Empty by default: nothing is logged.
         self.on_log: List[Callable[[int, Dict[str, torch.Tensor], int], None]] = []
+        #: ``fn(step)``; called once per ``write_interval``, after the episode flush. The
+        #: logger's publish point: metrics accumulate through ``on_log`` and leave here.
+        self.on_flush: List[Callable[[int], None]] = []
         #: ``fn(ctx) -> Tensor | None``; a returned tensor is added to that loss. Empty by default.
         self.aux_loss: List[Callable[[LossContext], Optional[torch.Tensor]]] = []
 
@@ -180,60 +183,148 @@ class LearnerBase(Agent):
         return total
 
     # ------------------------------------------------------------------ env metrics
+    def observe_step(
+        self,
+        *,
+        infos: Any,
+        rewards: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
+        step: int,
+    ) -> None:
+        """Everything the base does with one env step, in one place.
+
+        Forwards both env metric channels and keeps the episode bookkeeping that feeds both
+        ``episode/*`` and the best-checkpoint rule. The learners call this once from
+        ``record_transition``, before they touch the memory.
+        """
+        self._forward_env_metrics(infos, step)
+
+        done = torch.logical_or(terminated.reshape(-1), truncated.reshape(-1))
+        self._episode_return += rewards.reshape(-1)
+        self._episode_length += 1.0
+
+        # The compaction below is the step's only host sync, and only when someone is
+        # listening: with no ``on_log`` hook the episode channels are skipped entirely.
+        slots = self._episode_slots(done) if self.on_log else None
+        if slots is not None:
+            self._emit_finished_episodes(slots, step)
+        self._forward_episode_metrics(infos, slots, step)
+        self._fold_finished_episodes(done)
+
     def _forward_env_metrics(self, infos: Any, step: int) -> None:
         """Slice ``infos["metrics_to_log"]`` to each agent's envs and emit it as is."""
-        if not isinstance(infos, dict):
-            return
-        metrics = infos.get("metrics_to_log")
+        metrics = self._env_metrics(infos, "metrics_to_log")
         if metrics is None:
-            return  # nothing to forward
-        if not isinstance(metrics, dict):
-            raise TypeError(
-                f"infos['metrics_to_log'] must be a dict, got {type(metrics).__name__}"
-            )
-        for name, value in metrics.items():
-            if not torch.is_tensor(value) or value.shape != (self.num_envs,):
-                raise TypeError(
-                    f"infos['metrics_to_log']['{name}'] must be a tensor of shape "
-                    f"({self.num_envs},), got "
-                    f"{tuple(value.shape) if torch.is_tensor(value) else type(value).__name__}"
-                )
+            return
         for agent in range(self.num_agents):
             lo = agent * self.envs_per_agent
             hi = lo + self.envs_per_agent
             self.emit(agent, {name: value[lo:hi] for name, value in metrics.items()}, step)
 
+    def _forward_episode_metrics(
+        self, infos: Any, slots: Optional[List[torch.Tensor]], step: int
+    ) -> None:
+        """Forward ``infos["episode_metrics_to_log"]`` for the envs that finished this step.
+
+        Each agent gets the compacted ``(k,)`` values of its own finished envs; an agent with
+        none gets nothing, so an interval without episodes publishes no point. Slots of envs
+        that did not finish are never read — an env may leave anything there.
+        """
+        metrics = self._env_metrics(infos, "episode_metrics_to_log")
+        if metrics is None or slots is None:
+            return
+        for agent, index in enumerate(slots):
+            if index.numel() == 0:
+                continue
+            lo = agent * self.envs_per_agent
+            hi = lo + self.envs_per_agent
+            self.emit(
+                agent,
+                {
+                    name: value[lo:hi].index_select(0, index)
+                    for name, value in metrics.items()
+                },
+                step,
+            )
+
+    def _env_metrics(self, infos: Any, key: str) -> Optional[Dict[str, torch.Tensor]]:
+        """The validated ``infos[key]`` dict, or None when the env does not provide it."""
+        if not isinstance(infos, dict):
+            return None
+        metrics = infos.get(key)
+        if metrics is None:
+            return None  # nothing to forward
+        if not isinstance(metrics, dict):
+            raise TypeError(f"infos['{key}'] must be a dict, got {type(metrics).__name__}")
+        for name, value in metrics.items():
+            if not torch.is_tensor(value) or value.shape != (self.num_envs,):
+                raise TypeError(
+                    f"infos['{key}']['{name}'] must be a tensor of shape "
+                    f"({self.num_envs},), got "
+                    f"{tuple(value.shape) if torch.is_tensor(value) else type(value).__name__}"
+                )
+        return metrics
+
     # ------------------------------------------------------------------ episode statistics
-    def _track_episodes(self, rewards: torch.Tensor, terminated: torch.Tensor, truncated: torch.Tensor) -> None:
-        """Running per-env return/length; a finished env folds into its agent's sums."""
-        self._episode_return += rewards.reshape(-1)
-        self._episode_length += 1.0
-        done = torch.logical_or(terminated.reshape(-1), truncated.reshape(-1)).to(
-            self._episode_return.dtype
-        )
+    def _episode_slots(self, done: torch.Tensor) -> Optional[List[torch.Tensor]]:
+        """Local env indices of the envs that finished this step, per agent, or None if none."""
+        finished = torch.nonzero(done, as_tuple=False).flatten().tolist()
+        if not finished:
+            return None
+        per_agent: List[List[int]] = [[] for _ in range(self.num_agents)]
+        for env in finished:
+            per_agent[env // self.envs_per_agent].append(env % self.envs_per_agent)
+        return [
+            torch.tensor(local, dtype=torch.long, device=self.device) for local in per_agent
+        ]
+
+    def _emit_finished_episodes(self, slots: List[torch.Tensor], step: int) -> None:
+        """Emit the return and length of every episode that ended this step, per agent."""
+        for agent, index in enumerate(slots):
+            if index.numel() == 0:
+                continue
+            lo = agent * self.envs_per_agent
+            hi = lo + self.envs_per_agent
+            self.emit(
+                agent,
+                {
+                    "episode/return": self._episode_return[lo:hi].index_select(0, index),
+                    "episode/length": self._episode_length[lo:hi].index_select(0, index),
+                },
+                step,
+            )
+
+    def _fold_finished_episodes(self, done: torch.Tensor) -> None:
+        """Fold finished envs into their agent's interval sums, then reset those envs.
+
+        On-device and sync-free: this is what the best-checkpoint rule reads, so it runs
+        whether or not anything is logging.
+        """
+        done_f = done.to(self._episode_return.dtype)
         blocks = (self.num_agents, self.envs_per_agent)
-        self._finished_count += done.view(blocks).sum(dim=1)
-        self._finished_returns += (self._episode_return * done).view(blocks).sum(dim=1)
-        self._finished_lengths += (self._episode_length * done).view(blocks).sum(dim=1)
-        keep = 1.0 - done
+        self._finished_count += done_f.view(blocks).sum(dim=1)
+        self._finished_returns += (self._episode_return * done_f).view(blocks).sum(dim=1)
+        self._finished_lengths += (self._episode_length * done_f).view(blocks).sum(dim=1)
+        keep = 1.0 - done_f
         self._episode_return *= keep
         self._episode_length *= keep
 
     def _flush_episode_stats(self, step: int) -> None:
-        """Emit per-agent mean episode return/length for this interval, then clear."""
+        """Close the interval: refresh the per-agent mean return and emit the episode count.
+
+        The returns and lengths themselves left through :meth:`_emit_finished_episodes` as the
+        episodes ended; what is left here is the one value the best-checkpoint rule needs (a
+        single sync per interval) and the interval's episode count.
+        """
         counts = self._finished_count.tolist()  # the interval's single sync
         returns = self._finished_returns.tolist()
-        lengths = self._finished_lengths.tolist()
         for agent, count in enumerate(counts):
             if count > 0:
                 self._mean_return[agent] = returns[agent] / count
                 self.emit(
                     agent,
-                    {
-                        "episode/return": torch.tensor(self._mean_return[agent], device=self.device),
-                        "episode/length": torch.tensor(lengths[agent] / count, device=self.device),
-                        "episode/count": torch.tensor(count, device=self.device),
-                    },
+                    {"episode/count": torch.tensor(count, device=self.device)},
                     step,
                 )
         self._finished_count.zero_()
@@ -258,6 +349,8 @@ class LearnerBase(Agent):
         write_interval = self.trainer_cfg.write_interval
         if write_interval > 0 and step % write_interval == 0:
             self._flush_episode_stats(timestep)
+            for hook in self.on_flush:
+                hook(timestep)
             if self.training:
                 self._write_best_checkpoints(timestep)
         checkpoint_interval = self.trainer_cfg.checkpoint_interval

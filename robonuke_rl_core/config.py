@@ -52,8 +52,14 @@ class WandbCfg:
     project: str = MISSING
     group: str = MISSING
     tags: List[str] = field(default_factory=list)
+    #: "online", "offline" or "disabled" (what wandb.init's mode accepts)
+    mode: str = "online"
 
     def validate(self, cfg: Config) -> None:
+        from .logging import MODES
+
+        if self.mode not in MODES:
+            raise ValueError(f"wandb.mode must be one of {MODES}, got {self.mode!r}")
         if not self.group or any(char.isspace() or char == "/" for char in self.group):
             raise ValueError(
                 f"wandb.group must be non-empty and free of whitespace and '/', got {self.group!r}: "

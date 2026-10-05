@@ -79,6 +79,7 @@ run-name field.
 | `project` | str | required | wandb project; also the first level of the run directory |
 | `group` | str | required | wandb group; run names and the run directory derive from it. No whitespace or `/` |
 | `tags` | list[str] | `[]` | wandb tags |
+| `mode` | str | `"online"` | `online`, `offline` or `disabled`; passed to `wandb.init`. One run per agent either way |
 
 ## trainer
 

@@ -33,7 +33,10 @@ def main() -> int:
     from skrl.envs.wrappers.torch import wrap_env
     from skrl.trainers.torch import SequentialTrainer, SequentialTrainerCfg
 
+    from omegaconf import OmegaConf
+
     from robonuke_rl_core.learners.base import run_dirs
+    from robonuke_rl_core.logging import WandbLogger
     from robonuke_rl_core.losses import build_aux_losses
     from robonuke_rl_core.learners.ppo import PPO
     from robonuke_rl_core.learners.sac import SAC
@@ -52,7 +55,8 @@ def main() -> int:
     # one file for the whole run, written once the env exists so it records what the env
     # really runs with (every agent in this process shares it)
     group_dir = Path(cfg.trainer.output_dir) / cfg.wandb.project / cfg.wandb.group
-    print(f"[train] config: {dump(cfg, group_dir, env.unwrapped.cfg)}")
+    config_path = dump(cfg, group_dir, env.unwrapped.cfg)
+    print(f"[train] config: {config_path}")
     env = wrap_env(env, wrapper="isaaclab")
 
     torch.manual_seed(cfg.experiment.seed)
@@ -101,15 +105,28 @@ def main() -> int:
         learner.aux_loss.append(aux)
         print(f"[train] aux losses: {[t.name for t in cfg.losses.terms]}")
 
+    # one wandb run per agent, carrying exactly what resolved_config.yaml holds
+    logger = WandbLogger.from_config(
+        cfg,
+        OmegaConf.to_container(OmegaConf.load(config_path), resolve=True),
+        device=env.device,
+    )
+    learner.on_log.append(logger)
+    learner.on_flush.append(logger.flush)
+
     print(f"[train] {learner_name}: {num_agents} agents x {total_envs // num_agents} envs")
     print(f"[train] runs: {', '.join(str(d) for d in dirs)}")
+    print(f"[train] wandb: mode={cfg.wandb.mode} group={cfg.wandb.group}")
 
     trainer = SequentialTrainer(
         env=env,
         agents=learner,
         cfg=SequentialTrainerCfg(timesteps=cfg.trainer.total_timesteps, headless=True),
     )
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        logger.close()  # publish what is pending and finish every run
 
     env.close()
     app_launcher.app.close()

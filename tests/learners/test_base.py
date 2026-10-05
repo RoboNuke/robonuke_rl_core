@@ -24,10 +24,23 @@ def collector():
     return seen, lambda agent, metrics, step: seen.append((agent, dict(metrics), step))
 
 
-def step_once(learner, metrics_to_log=None, rewards=None, terminated=None, step: int = 0):
+def step_once(
+    learner,
+    metrics_to_log=None,
+    rewards=None,
+    terminated=None,
+    step: int = 0,
+    episode_metrics_to_log=None,
+    truncated=None,
+):
     num_envs = learner.num_envs
     observations = torch.zeros(num_envs, OBS_DIM)
     actions = torch.zeros(num_envs, ACT_DIM)
+    infos = {}
+    if metrics_to_log is not None:
+        infos["metrics_to_log"] = metrics_to_log
+    if episode_metrics_to_log is not None:
+        infos["episode_metrics_to_log"] = episode_metrics_to_log
     learner.record_transition(
         observations=observations,
         states=None,
@@ -36,8 +49,8 @@ def step_once(learner, metrics_to_log=None, rewards=None, terminated=None, step:
         next_observations=observations,
         next_states=None,
         terminated=torch.zeros(num_envs, 1, dtype=torch.bool) if terminated is None else terminated,
-        truncated=torch.zeros(num_envs, 1, dtype=torch.bool),
-        infos={} if metrics_to_log is None else {"metrics_to_log": metrics_to_log},
+        truncated=torch.zeros(num_envs, 1, dtype=torch.bool) if truncated is None else truncated,
+        infos=infos,
         timestep=step,
         timesteps=100,
     )
@@ -85,7 +98,7 @@ def test_a_missing_metrics_key_forwards_nothing():
 
 
 # ------------------------------------------------------------------ 6. episode statistics
-def test_episode_statistics_are_per_agent():
+def test_episode_returns_are_emitted_per_finished_episode_and_per_agent():
     learner = build_learner(
         "sac", num_agents=2, envs_per_agent=2, trainer_overrides={"write_interval": 3}
     )
@@ -98,18 +111,85 @@ def test_episode_statistics_are_per_agent():
     all_done = torch.ones(4, 1, dtype=torch.bool)
     step_once(learner, rewards=rewards, terminated=none_done, step=0)
     step_once(learner, rewards=rewards, terminated=none_done, step=1)
+    assert seen == []  # nothing finished yet
     step_once(learner, rewards=rewards, terminated=all_done, step=2)
-    learner._flush_episode_stats(step=2)
 
-    stats = {agent: metrics for agent, metrics, _ in seen}
-    assert float(stats[0]["episode/return"]) == pytest.approx(3.0)
-    assert float(stats[1]["episode/return"]) == pytest.approx(30.0)
-    assert float(stats[0]["episode/length"]) == pytest.approx(3.0)
-    assert float(stats[0]["episode/count"]) == pytest.approx(2.0)  # two envs finished
+    # one emit per agent, carrying that agent's two finished episodes
+    episodes = {agent: metrics for agent, metrics, _ in seen}
+    assert sorted(episodes) == [0, 1]
+    assert torch.allclose(episodes[0]["episode/return"], torch.tensor([3.0, 3.0]))
+    assert torch.allclose(episodes[1]["episode/return"], torch.tensor([30.0, 30.0]))
+    assert torch.allclose(episodes[0]["episode/length"], torch.tensor([3.0, 3.0]))
+    assert all(metrics["episode/return"].shape == (2,) for metrics in episodes.values())
+
+    # the interval flush publishes the count and refreshes the best-checkpoint mean
+    seen.clear()
+    learner._flush_episode_stats(step=2)
+    counts = {agent: metrics["episode/count"] for agent, metrics, _ in seen}
+    assert float(counts[0]) == pytest.approx(2.0) and float(counts[1]) == pytest.approx(2.0)
+    assert learner.mean_returns == pytest.approx([3.0, 30.0])
     # the interval is cleared, so the next flush publishes nothing
     seen.clear()
     learner._flush_episode_stats(step=3)
     assert seen == []
+
+
+def test_only_the_agents_with_a_finished_episode_emit():
+    learner = build_learner("sac", num_agents=3, envs_per_agent=2)
+    seen, hook = collector()
+    learner.on_log.append(hook)
+
+    terminated = torch.zeros(6, 1, dtype=torch.bool)
+    terminated[3] = True  # one env of agent 1 only
+    step_once(learner, rewards=torch.ones(6, 1), terminated=terminated, step=7)
+
+    assert [agent for agent, _, _ in seen] == [1]
+    agent, metrics, step = seen[0]
+    assert step == 7
+    assert torch.allclose(metrics["episode/return"], torch.tensor([1.0]))
+    # agent 1's other env keeps accumulating
+    assert float(learner._episode_return[2]) == pytest.approx(1.0)
+    assert float(learner._episode_return[3]) == 0.0
+
+
+def test_episode_metrics_are_masked_to_the_envs_that_finished():
+    learner = build_learner("sac", num_agents=2, envs_per_agent=3)
+    seen, hook = collector()
+    learner.on_log.append(hook)
+
+    truncated = torch.zeros(6, 1, dtype=torch.bool)
+    truncated[1] = True  # agent 0, local env 1
+    truncated[5] = True  # agent 1, local env 2
+    values = torch.arange(6, dtype=torch.float32) * 10.0
+    step_once(
+        learner,
+        episode_metrics_to_log={"env/success": values},
+        truncated=truncated,
+        step=5,
+    )
+
+    emitted = {agent: metrics for agent, metrics, _ in seen}
+    assert sorted(emitted) == [0, 1]
+    assert torch.allclose(emitted[0]["env/success"], torch.tensor([10.0]))
+    assert torch.allclose(emitted[1]["env/success"], torch.tensor([50.0]))
+
+
+def test_episode_metrics_with_nothing_finished_emit_nothing():
+    learner = build_learner("sac", num_agents=2, envs_per_agent=3)
+    seen, hook = collector()
+    learner.on_log.append(hook)
+    step_once(learner, episode_metrics_to_log={"env/success": torch.ones(6)})
+    assert seen == []
+
+
+def test_a_wrong_episode_metric_shape_raises():
+    learner = build_learner("sac", num_agents=2, envs_per_agent=3)
+    learner.on_log.append(lambda *_: None)
+    with pytest.raises(TypeError) as err:
+        step_once(learner, episode_metrics_to_log={"env/success": torch.ones(7)})
+    assert "episode_metrics_to_log" in str(err.value) and "env/success" in str(err.value)
+    with pytest.raises(TypeError):
+        step_once(learner, episode_metrics_to_log={"env/success": 1.0})
 
 
 def test_best_checkpoint_follows_the_highest_mean_return(tmp_path):

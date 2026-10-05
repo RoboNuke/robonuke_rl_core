@@ -172,8 +172,13 @@ class SAC(LearnerBase):
         timestep: int,
         timesteps: int,
     ) -> None:
-        self._forward_env_metrics(infos, timestep)
-        self._track_episodes(rewards, terminated, truncated)
+        self.observe_step(
+            infos=infos,
+            rewards=rewards,
+            terminated=terminated,
+            truncated=truncated,
+            step=timestep,
+        )
 
         if not self.training:
             return
