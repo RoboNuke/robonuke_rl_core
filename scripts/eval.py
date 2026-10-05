@@ -33,6 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from robonuke_rl_core.config import dump, load_from_run  # noqa: E402
+from robonuke_rl_core.envs.build import build_env, describe, prepare_task  # noqa: E402
 from robonuke_rl_core.recording import EvalRecorder, install_recorder_camera  # noqa: E402
 from robonuke_rl_core.evaluation import (  # noqa: E402
     build_eval_policy,
@@ -124,11 +125,22 @@ def main() -> int:
             width=cfg.eval.video_width,
             height=cfg.eval.video_height,
         )
+    if cfg.wrappers.efficient_reset.enabled:
+        raise ValueError(
+            "wrappers.efficient_reset.enabled is true, which eval cannot use: a partial reset "
+            "teleports a finished env onto another env's state, and the accounting here needs "
+            "every episode to start from an independently sampled initial condition. Set "
+            "wrappers.efficient_reset.enabled: false in the eval config."
+        )
+    prepare_task(cfg, cfg.task_name, cfg.task_cfg)
     env = gym.make(cfg.task_name, cfg=cfg.task_cfg)
     # the eval's own resolved config, written from the live env cfg: this also raises if the
     # env discarded any task.cfg value the eval config set (check_env_kept_overrides)
     print(f"[eval] config: {dump(cfg, out_dir, env.unwrapped.cfg)}", flush=True)
     max_episode_length = int(env.unwrapped.max_episode_length)
+    env = build_env(cfg, env, cfg.task_name)
+    if describe(cfg):
+        print(f"[eval] env wrappers: {' -> '.join(describe(cfg))}", flush=True)
     env = wrap_env(env, wrapper="isaaclab")
 
     torch.manual_seed(cfg.experiment.seed)

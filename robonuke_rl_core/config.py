@@ -511,6 +511,7 @@ def load_from_args(args: argparse.Namespace, overrides: Any = None) -> Config:
 # at the top, because the config classes they bring in import nothing from this module.
 from .learners.cfg import PPOCfg, SACCfg, TrainerCfg  # noqa: E402
 from .losses.cfg import LossesCfg  # noqa: E402
+from .envs.cfg import ControllerCfg, WrappersCfg  # noqa: E402
 from .evaluation import EvalCfg  # noqa: E402
 from .memory.cfg import MemoryCfg  # noqa: E402
 from .models.cfg import SimbaModelCfg, model_cfg_class  # noqa: E402
@@ -524,3 +525,5 @@ register_section("model", SimbaModelCfg)  # the default; model.architecture swap
 register_section("memory", MemoryCfg)
 register_section("losses", LossesCfg)
 register_section("eval", EvalCfg)
+register_section("controller", ControllerCfg)
+register_section("wrappers", WrappersCfg)

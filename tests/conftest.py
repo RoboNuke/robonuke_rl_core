@@ -30,6 +30,7 @@ def pytest_configure(config):
     )
 
 
+
 @pytest.fixture(scope="session")
 def isaac_sim():
     """Start the sim app once for the whole session."""
@@ -41,8 +42,8 @@ def isaac_sim():
     argv = sys.argv[:]
     sys.argv = argv[:1]
     try:
-        # enable_cameras: the session env carries the recorder camera (see gpu_env_factory),
-        # and Isaac Lab refuses to spawn a camera without it
+        # enable_cameras: the shared env always carries the recorder camera, so that one
+        # `pytest -m gpu` exercises the recording path too
         launcher = AppLauncher(headless=True, enable_cameras=True)
     finally:
         sys.argv = argv
@@ -71,17 +72,19 @@ def gpu_env_factory(isaac_sim):
         import gymnasium as gym
         from skrl.envs.wrappers.torch import wrap_env
 
+        # Both install pre-make, and only one env may exist per process, so the shared env
+        # carries both ALWAYS: one `pytest -m gpu` then covers the recording and contact
+        # paths as well. It costs about 10 s of render time; testing everything is worth it.
+        from robonuke_rl_core.envs.forge.contact import install_contact_sensor
         from robonuke_rl_core.recording import install_recorder_camera
 
-        # The recorder camera goes in for the whole session: only one env may exist per
-        # process, so the recording test has to share this one. It costs some render time
-        # for every GPU test, which is the price of testing the record path at all.
         install_recorder_camera(
             cfg.task_name,
             cfg.task_cfg,
             width=cfg.eval.video_width,
             height=cfg.eval.video_height,
         )
+        install_contact_sensor(cfg.task_name, cfg.task_cfg, cfg.wrappers.contact)
         return wrap_env(gym.make(cfg.task_name, cfg=cfg.task_cfg), wrapper="isaaclab")
 
     return make

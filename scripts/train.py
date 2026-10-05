@@ -35,6 +35,7 @@ def main() -> int:
 
     from omegaconf import OmegaConf
 
+    from robonuke_rl_core.envs.build import build_env, describe, prepare_task
     from robonuke_rl_core.learners.base import run_dirs
     from robonuke_rl_core.logging import WandbLogger
     from robonuke_rl_core.losses import build_aux_losses
@@ -51,12 +52,17 @@ def main() -> int:
     num_agents = cfg.experiment.num_agents
     dirs = run_dirs(cfg)
 
+    prepare_task(cfg, cfg.task_name, cfg.task_cfg)  # before gym.make: sensors and obs layout
     env = gym.make(cfg.task_name, cfg=cfg.task_cfg)
     # one file for the whole run, written once the env exists so it records what the env
     # really runs with (every agent in this process shares it)
     group_dir = Path(cfg.trainer.output_dir) / cfg.wandb.project / cfg.wandb.group
     config_path = dump(cfg, group_dir, env.unwrapped.cfg)
     print(f"[train] config: {config_path}", flush=True)
+    # our wrappers go on before skrl's, so the models are built from the wrapped spaces
+    env = build_env(cfg, env, cfg.task_name)
+    if describe(cfg):
+        print(f"[train] env wrappers: {' -> '.join(describe(cfg))}", flush=True)
     env = wrap_env(env, wrapper="isaaclab")
 
     torch.manual_seed(cfg.experiment.seed)

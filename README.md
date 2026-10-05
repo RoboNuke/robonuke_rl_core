@@ -281,6 +281,78 @@ task:
       num_envs: 64
 ```
 
+## controller
+
+The unified operational-space controller, attached as an env wrapper when `enabled`. One
+torque path serves every configuration:
+
+```
+tau = J^T [ S (K e_pose - D v) + (I - S) K_f (f_d - f) ] + nullspace
+```
+
+`S` multiplies the pose branch, so `S = 1` on an axis means that axis is position-controlled.
+**The action layout is inferred from the capabilities, never configured** — there is no mode
+field. The selection block exists exactly when both branches are on, because that is the only
+case where the policy has a choice to make:
+
+| `use_pose` | `use_force` | action layout | fixed |
+| --- | --- | --- | --- |
+| ✓ | — | `[pose \| gains?]` | `S = I`, `f_d = 0` |
+| — | ✓ | `[force \| gains?]` | `S = 0` |
+| ✓ | ✓ | `[pose \| selection \| force \| gains?]` | — |
+
+`gains?` is empty under `gain_mapping: constant`; under `variable_diagonal` it is one action
+per axis of each live branch (`[K \| K_f]`). How wide the force side is comes from
+`force_axes`: `[1,1,1,0,0,0]` is the usual 3-D hybrid (12 action dims with constant gains),
+`[1]*6` is 6-D (18), `[0,0,1,0,0,0]` is force on z alone (8). Selection actions are 0/1 by
+construction, so `model.actor.bernoulli_action_dims` must be exactly the selection block's
+indices — the config refuses to load otherwise.
+
+Everything Forge's own control config already defines — `ema_factor`, the dead zone,
+`pos_action_bounds`, `default_task_prop_gains`, `kp_null`/`kd_null` — is **not** repeated
+here. The wrapper reads it from the live env at runtime, so those defaults are Forge's and an
+experiment tunes them under `task.cfg.ctrl.*`.
+
+| field | type | default | what it does |
+| --- | --- | --- | --- |
+| `enabled` | bool | `False` | attach the controller wrapper at all; off leaves the env's own controller in charge |
+| `use_pose` | bool | `True` | pose branch on, and pose-target actions in the layout |
+| `use_force` | bool | `False` | force branch on, and force-target actions in the layout |
+| `gain_mapping` | str | `"constant"` | `constant` (gains from config, 0 action dims) or `variable_diagonal` (one gain action per axis of each live branch, geometric per-axis scaling) |
+| `force_axes` | list[int] | `[1, 1, 1, 1, 1, 1]` | length-6 binary mask of the axes the force branch may take — this is what makes hybrid control 3-D (`[1,1,1,0,0,0]`), 6-D, or z-only. The selection, force-target and K_f blocks are each as wide as its sum; an axis outside it is always position-controlled |
+| `native_action_dim` | int | `7` | the env's **own** action width, handed through untouched as the first block: Forge is 7 (3 position + 3 rotation + the success prediction its reward reads), Factory is 6. Re-checked against the live env, which names the right value |
+| `gain_min` | list[float] | `[100, 100, 100, 5, 5, 5]` | per-axis lower bound of the pose stiffness K, `[x, y, z, Rx, Ry, Rz]` |
+| `gain_max` | list[float] | `[2000, 2000, 2000, 100, 100, 100]` | per-axis upper bound of K; also the constant K when the env supplies none |
+| `damping_ratio` | float | `1.0` | `D = 2 * damping_ratio * sqrt(K)`; 1.0 is critical damping. D is always derived, never commanded |
+| `force_gain_min` | list[float] | `[1, 1, 1, 1, 1, 1]` | per-axis lower bound of the force stiffness K_f |
+| `force_gain_max` | list[float] | `[100, 100, 100, 10, 10, 10]` | per-axis upper bound of K_f |
+| `default_force_gains` | list[float] | `[0.1, 0.1, 0.1, 0.01, 0.01, 0.01]` | K_f under `gain_mapping: constant` (Forge's ctrl cfg has no force gains) |
+| `force_target_bounds` | list[float] | `[50, 50, 50, 5, 5, 5]` | the force action in [-1, 1] scales to ± these, in N and Nm |
+
+Setting any force field while `use_force: false` raises, rather than being silently ignored.
+
+## wrappers
+
+Env wrappers, each off by default. They are applied in a fixed order (controller → efficient
+reset → fragile → contact); see `CLAUDE.md` for why.
+
+| field | type | default | what it does |
+| --- | --- | --- | --- |
+| `fragile.enabled` | bool | `False` | terminate an env when the held object's contact load breaks it |
+| `fragile.break_force` | list[float] | `[100.0]` | `[magnitude]`, or `[shear, normal]` with `direction_break_force` |
+| `fragile.direction_break_force` | bool | `False` | split the load into shear and axial components on the live peg axis instead of one magnitude |
+| `fragile.require_contact` | bool | `False` | also fail an episode that loses contact after making it; needs `contact.enabled` |
+| `fragile.require_contact_grace_steps` | int | `5` | steps at the start of an episode where loss of contact cannot fail it |
+| `fragile.require_contact_debounce_steps` | int | `3` | consecutive out-of-contact steps before loss of contact counts as a break (1 = any single step) |
+| `efficient_reset.enabled` | bool | `False` | reset a finished env by teleporting it onto another env's fresh state. **Training only** — `scripts/eval.py` refuses it, because the accounting needs independently sampled conditions |
+| `contact.enabled` | bool | `False` | mount a contact sensor on the held asset and publish per-axis in-contact flags. Needs `task.cfg.scene.clone_in_fabric: false` (a contact reporter needs real per-env prims) |
+| `contact.force_threshold` | float | `1.0` | \|f\| above this on an end-effector axis counts as contact, in N |
+| `contact.append_to_policy_obs` | bool | `False` | append the 3 flags to the policy observation (grows the observation space) |
+| `contact.append_to_critic_state` | bool | `False` | append the 3 flags to the critic state (asymmetric tasks only) |
+| `contact.held_prim_expr` | str | `"/World/envs/env_.*/HeldAsset"` | prim path of the sensor's asset root |
+| `contact.fixed_prim_expr` | str | `"/World/envs/env_.*/FixedAsset"` | prim path the contact is filtered against |
+| `orientation.mode` | str | `"quat"` | `quat` (the env's own `(w, x, y, z)`) or `6d_rot_mat` (first two columns of R, Zhou et al. 2019 — continuous, no double cover) |
+
 ## derived and meta
 
 Written by the pipeline into `resolved_config.yaml`; never set them in a config.

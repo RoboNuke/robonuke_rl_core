@@ -1,0 +1,52 @@
+# A hybrid-control Forge experiment: 3-D force/position control on a fragile peg, with
+# contact sensing in the observation.
+#
+#   python scripts/train.py --config examples/forge_hybrid.yaml --headless
+base: forge_base.yaml
+
+experiment:
+  num_agents: 4
+  seed: 10
+
+wandb:
+  group: hybrid_fragile
+
+task:
+  cfg:
+    scene:
+      num_envs: 256
+      # the contact sensor needs real per-env prims, not Fabric-cloned ones
+      clone_in_fabric: false
+
+controller:
+  enabled: true
+  use_pose: true
+  use_force: true
+  # hybrid on the translation axes only; orientation stays position-controlled
+  force_axes: [1, 1, 1, 0, 0, 0]
+  gain_mapping: variable_diagonal
+
+model:
+  actor:
+    # the selection block: [native_action_dim .. +3) = [7, 8, 9] for Forge's 7-wide action.
+    # These are 0/1 switches, so they must be exactly the actor's Bernoulli dims — the config
+    # refuses to load if they are not.
+    bernoulli_action_dims: [7, 8, 9]
+
+wrappers:
+  fragile:
+    enabled: true
+    # shear breaks a thin peg long before the axial load does
+    direction_break_force: true
+    break_force: [15.0, 60.0]
+    require_contact: true
+  contact:
+    enabled: true
+    force_threshold: 1.0
+    append_to_policy_obs: true
+  efficient_reset:
+    # a fragile peg terminates envs one at a time; this keeps the survivors from paying for it.
+    # Training only — eval refuses it.
+    enabled: true
+  orientation:
+    mode: 6d_rot_mat

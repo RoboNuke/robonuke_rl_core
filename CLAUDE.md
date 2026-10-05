@@ -3,8 +3,9 @@
 Shared RL package for Isaac Lab research: skrl agents, several independent agents trained in
 parallel in one Isaac Sim instance on one GPU. Built area by area. **Today the config manager
 (`robonuke_rl_core/config.py`), the learners (`learners/`), the models (`models/`), the memory
-(`memory/`), the logging layer (`logging.py`) and eval + recording (`evaluation.py`,
-`recording.py`) exist.** `scripts/`: `train.py`, `eval.py`.
+(`memory/`), the logging layer (`logging.py`), eval + recording (`evaluation.py`,
+`recording.py`) and the envs (`envs/`: the unified controller and the Forge wrappers)
+exist.** `scripts/`: `train.py`, `eval.py`, `debug.py`.
 
 Test env: the `general` conda env (`/home/hunter/miniconda3/envs/general/bin/python`). Never
 create a new conda env for this project.
@@ -315,6 +316,116 @@ weights, optimizer state, normalizer stats, learner extras, the step and the mea
 `load_agent(path, slot)` loads one file into any slot; optimizer state only with
 `with_optimizer=True`, which needs `num_agents == 1`.
 
+## Envs: the controller and the Forge wrappers
+
+### One controller, many faces
+
+`robonuke_rl_core/envs/forge/control.py` has a single torque path:
+
+```
+tau = J^T [ S (K e_pose - D v) + (I - S) K_f (f_d - f) ] + nullspace
+```
+
+`S` multiplies the **pose** branch, so `S = 1` on an axis means that axis is
+position-controlled. The expression is linear in `S`, so the degenerate cases are exact, not
+approximations: `S = I` with `f_d = 0` *is* Factory's own controller. That is a tested claim,
+not a hopeful one — `tests/envs/GPU/test_controller.py` runs our math beside Isaac Lab's
+`compute_dof_torque` on live env state for 50 steps and requires agreement (measured: a
+worst-case difference of **0.0**, bit for bit). Which is why pose control needs no separate
+path.
+
+**There is no mode field.** The action layout is inferred from the capabilities:
+
+| `use_pose` | `use_force` | layout | fixed |
+| --- | --- | --- | --- |
+| ✓ | — | `[pose \| gains?]` | `S = I`, `f_d = 0` |
+| — | ✓ | `[force \| gains?]` | `S = 0` |
+| ✓ | ✓ | `[pose \| selection \| force \| gains?]` | — |
+
+The selection block exists exactly when both branches do, because that is the only case where
+the policy has a choice to make. `controller.force_axes` (a length-6 binary mask) sets how
+wide the force side is — `[1,1,1,0,0,0]` for the usual 3-D hybrid, `[1]*6` for 6-D — and the
+selection, force-target and K_f blocks are all that wide. `gain_mapping` is orthogonal:
+`constant` costs no action dims, `variable_diagonal` adds one per axis of each live branch and
+maps it geometrically onto `[gain_min, gain_max]`. Adding a mapping is a new entry in
+`ActionLayout.gain_dims`, not a rewrite.
+
+Two invariants worth keeping:
+
+* **The pose block is the env's own action vector**, `controller.native_action_dim` wide — 7
+  on Forge (6 pose dims plus the success prediction its reward reads), 6 on Factory. It is
+  handed to the env untouched, so the env's EMA, position bounds, upright constraint and
+  `prev_actions` observation channel all behave exactly as they did. The wrapper replaces only
+  the step that turns a target pose into joint torque.
+* **Selection actions are Bernoulli by construction**, so `controller.validate` requires
+  `model.actor.bernoulli_action_dims` to be exactly the selection block's indices. A shifted
+  index would make a continuous action a 0/1 switch with no crash and no symptom, so it fails
+  when the config loads.
+
+**Forge's own control defaults are inherited at runtime, not by subclassing.** `ema_factor`,
+the dead zone, `pos_action_bounds`, `default_task_prop_gains`, `kp_null`/`kd_null` and
+`default_dof_pos_tensor` are read from `env.unwrapped.cfg.ctrl` each step, so the defaults are
+Forge's and an experiment tunes them in one place: `task.cfg.ctrl.*`. The `controller` section
+holds only what Forge's ctrl cfg does not.
+
+### The Forge rule
+
+Forge-family envs expose internals other Isaac Lab envs do not: a smoothed wrist wrench, an
+operational-space `cfg.ctrl`, fingertip state on the env object, `_reset_idx` semantics a
+wrapper can lean on. So **anything that reads those lives in `robonuke_rl_core/envs/forge/`,
+carries a `Forge` class-name prefix, and calls `require_forge_env` before it touches
+anything** — and the rule that function enforces is the **task name**: a Forge env is one
+whose name contains `"forge"`, case-insensitively. Not duck typing, not a capability probe.
+A wrapper applied to another family then fails up front, naming the task, the rule and the
+attributes it would have needed, instead of dying on a missing attribute mid-rollout. A
+wrapper for a different env family starts a **sibling directory**, never a special case
+inside `forge/`.
+
+Env-agnostic pieces — the action-interface math (`envs/interface.py`), the 6-D rotation
+(`envs/orientation.py`), the composer (`envs/build.py`) — stay directly under `envs/`.
+
+### The wrapper order
+
+`build_env` applies exactly what the config enables, innermost first, and the order is fixed
+(`WRAPPER_ORDER`): **controller → efficient reset → fragile → contact**. The controller is
+innermost because it owns the action space; efficient reset wraps `_reset_idx` and must see
+the env's own reset chain; fragile wraps `_get_dones` and triggers those resets; contact is
+last because it appends to the observation, so nothing that edits obs may wrap after it.
+
+Two things run **before** `gym.make` (`prepare_task`, beside the recorder camera): the contact
+sensor and the orientation rewrite, because both change what the env's spaces are sized from.
+Both also need `task.cfg.scene.clone_in_fabric: false` — a contact reporter and a camera need
+real per-env prims — and both say so rather than failing cryptically.
+
+### The wrappers
+
+* **`ForgeFragileObjectWrapper`** — breaks the held object on force magnitude, or on the
+  axial/shear split measured against the peg's live axis (a thin peg shears long before it
+  crushes), and optionally on loss of contact with a grace period and a debounce. Terminations
+  go through `_get_dones`; `fragile/broke` rides the episode channel and `fragile/force` the
+  step channel.
+* **`ForgeEfficientResetWrapper`** — a full reset runs the env's chain and caches the scene;
+  a partial reset runs only `DirectRLEnv._reset_idx` and teleports the finished env onto a
+  random donor's cached state, then copies the bookkeeping the lightweight path skips,
+  re-samples Forge's per-episode randomization and clears the force smoothing. **Training
+  only**: `scripts/eval.py` refuses it, because eval's accounting needs every episode to start
+  from an independently sampled condition.
+* **`ForgeContactSensorWrapper`** — per-axis in-contact flags from a real contact sensor,
+  published on the step channel, on `env.in_contact` for other wrappers, and optionally
+  appended to the observation. The sensor is built *after* `clone_environments`, because the
+  PhysX contact API sits on an asset-specific child prim that does not exist until the stage
+  is cloned.
+
+### Orientation
+
+`wrappers.orientation.mode: 6d_rot_mat` swaps every `*_quat` observation channel for the 6-D
+rotation representation (Zhou et al. 2019 — the first two columns of R). `q` and `-q` give the
+same answer, which is the point: the quaternion double cover makes the obvious representation
+discontinuous. The rewrite registers the new dims, swaps `obs_order`/`state_order`, and
+augments the observation dict inside `factory_utils.collapse_obs_dict` — the one function both
+Factory and Forge flatten through, so neither env's observation method has to be copied into
+this package.
+
 ## Eval, recording and debug
 
 `scripts/eval.py` evaluates one trained policy under conditions an eval config names, and
@@ -510,9 +621,12 @@ pytest -m gpu   # the Isaac Sim tests, on the GPU machine
 ```
 
 Every GPU test shares **one** env (`gpu_env`), because Isaac Lab hangs when a second one is
-created in a process, and that env carries the recorder camera so the record and reset-video
-paths are testable at all — which is why `pytest -m gpu` takes a few minutes rather than
-seconds, and why its config sets `task.cfg.scene.clone_in_fabric=false`.
+created in a process. That env always carries **both** the recorder camera and the contact
+sensor: each installs before `gym.make`, so the decision is made once per process, and having
+both on means a single `pytest -m gpu` covers the recording, reset-video and contact paths
+too. It costs roughly 10 s of render time and is why the config sets
+`task.cfg.scene.clone_in_fabric=false` (a camera and a contact reporter both need real per-env
+prims).
 
 No test is skipped silently: a GPU test that cannot start Isaac Sim fails. Report each run as
 passed / failed / total.

@@ -76,6 +76,7 @@ def test_every_section_loads_with_its_defaults(tmp_path):
     cfg = load_config(write(tmp_path))
     assert set(cfg.sections) == {
         "experiment", "wandb", "trainer", "sac", "ppo", "model", "memory", "losses", "eval",
+        "controller", "wrappers",
     }
     assert cfg.trainer.learner == "sac"
     assert cfg.sac.batch_size == 64  # a class default, not set by the file
@@ -83,6 +84,8 @@ def test_every_section_loads_with_its_defaults(tmp_path):
     assert cfg.memory.memory_size == 1_000_000
     assert cfg.losses.terms == []
     assert cfg.eval.num_rollouts == 64  # eval defaults ride along; only eval.py reads them
+    assert cfg.controller.enabled is False  # no controller wrapper unless asked for
+    assert cfg.wrappers.contact.enabled is False
 
 
 def test_round_trip(tmp_path):

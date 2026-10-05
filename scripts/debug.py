@@ -39,6 +39,7 @@ from robonuke_rl_core.evaluation import (  # noqa: E402
     force_env_reset,
     resolved_config_path,
 )
+from robonuke_rl_core.envs.build import build_env, describe, prepare_task  # noqa: E402
 from robonuke_rl_core.recording import (  # noqa: E402
     install_recorder_camera,
     render_resets,
@@ -189,7 +190,12 @@ def main() -> int:
             width=cfg.eval.video_width,
             height=cfg.eval.video_height,
         )
+    prepare_task(cfg, cfg.task_name, cfg.task_cfg)
     env = gym.make(cfg.task_name, cfg=cfg.task_cfg, render_mode=None if headless else "human")
+    # the same stack training uses, so what you watch is what trains
+    env = build_env(cfg, env, cfg.task_name)
+    if describe(cfg):
+        print(f"[debug] env wrappers: {' -> '.join(describe(cfg))}", flush=True)
     env = wrap_env(env, wrapper="isaaclab")
     torch.manual_seed(cfg.experiment.seed)
 
