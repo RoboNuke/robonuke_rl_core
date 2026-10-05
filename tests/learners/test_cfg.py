@@ -75,13 +75,14 @@ def write(tmp_path, extra: str = "", name: str = "exp.yaml"):
 def test_every_section_loads_with_its_defaults(tmp_path):
     cfg = load_config(write(tmp_path))
     assert set(cfg.sections) == {
-        "experiment", "wandb", "trainer", "sac", "ppo", "model", "memory", "losses",
+        "experiment", "wandb", "trainer", "sac", "ppo", "model", "memory", "losses", "eval",
     }
     assert cfg.trainer.learner == "sac"
     assert cfg.sac.batch_size == 64  # a class default, not set by the file
     assert cfg.model.actor.actor_latent == 512
     assert cfg.memory.memory_size == 1_000_000
     assert cfg.losses.terms == []
+    assert cfg.eval.num_rollouts == 64  # eval defaults ride along; only eval.py reads them
 
 
 def test_round_trip(tmp_path):

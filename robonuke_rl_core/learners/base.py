@@ -29,7 +29,16 @@ from ..memory.multi_random import MultiRandomMemory
 from ..models.normalizer import BlockRunningNorm
 from .cfg import TrainerCfg
 
-__all__ = ["LearnerBase", "run_dirs"]
+__all__ = ["LearnerBase", "run_dirs", "CHECKPOINT_EXTENSION", "CHECKPOINT_BEST", "checkpoint_name"]
+
+#: one place for the checkpoint file naming, so eval, wandb and the loader cannot disagree
+CHECKPOINT_EXTENSION = "ckpt"
+CHECKPOINT_BEST = f"ckpt_best.{CHECKPOINT_EXTENSION}"
+
+
+def checkpoint_name(step: int) -> str:
+    """The file name for a periodic checkpoint at ``step``."""
+    return f"ckpt_{int(step)}.{CHECKPOINT_EXTENSION}"
 
 
 @dataclass
@@ -101,6 +110,9 @@ class LearnerBase(Agent):
         #: ``fn(step)``; called once per ``write_interval``, after the episode flush. The
         #: logger's publish point: metrics accumulate through ``on_log`` and leave here.
         self.on_flush: List[Callable[[int], None]] = []
+        #: ``fn(agent_idx, step, path)``; called for every checkpoint file written, so a
+        #: logger can mirror it. Empty by default: checkpoints are local files only.
+        self.on_checkpoint: List[Callable[[int, int, Path], None]] = []
         #: ``fn(ctx) -> Tensor | None``; a returned tensor is added to that loss. Empty by default.
         self.aux_loss: List[Callable[[LossContext], Optional[torch.Tensor]]] = []
 
@@ -428,18 +440,23 @@ class LearnerBase(Agent):
         return self.run_dirs[agent] / "checkpoints"
 
     def save_checkpoints(self, step: int) -> List[Path]:
-        """Write ``ckpt_{step}.pt`` for every agent; return the paths."""
+        """Write one checkpoint per agent (see :func:`checkpoint_name`); return the paths."""
         paths = []
         for agent in range(self.num_agents):
             directory = self.checkpoint_dir(agent)
             directory.mkdir(parents=True, exist_ok=True)
-            path = directory / f"ckpt_{step}.pt"
+            path = directory / checkpoint_name(step)
             torch.save(self._build_checkpoint(agent, step), path)
+            self._announce_checkpoint(agent, step, path)
             paths.append(path)
         return paths
 
+    def _announce_checkpoint(self, agent: int, step: int, path: Path) -> None:
+        for hook in self.on_checkpoint:
+            hook(agent, int(step), path)
+
     def _write_best_checkpoints(self, step: int) -> None:
-        """Rewrite ``ckpt_best.pt`` for each agent whose mean episode return improved."""
+        """Rewrite the best checkpoint for each agent whose mean episode return improved."""
         if self.trainer_cfg.checkpoint_interval <= 0 or self.run_dirs is None:
             return
         for agent in range(self.num_agents):
@@ -449,7 +466,9 @@ class LearnerBase(Agent):
             self._best_return[agent] = mean_return
             directory = self.checkpoint_dir(agent)
             directory.mkdir(parents=True, exist_ok=True)
-            torch.save(self._build_checkpoint(agent, step), directory / "ckpt_best.pt")
+            path = directory / CHECKPOINT_BEST
+            torch.save(self._build_checkpoint(agent, step), path)
+            self._announce_checkpoint(agent, step, path)
 
     def load_agent(self, path: str | Path, slot: int, *, with_optimizer: bool = True) -> Dict[str, Any]:
         """Load one agent's checkpoint file into slot ``slot``; return its metadata.
@@ -503,11 +522,13 @@ class LearnerBase(Agent):
 
     @staticmethod
     def latest_checkpoint(directory: str | Path) -> Path:
-        """The highest-step ``ckpt_<step>.pt`` in ``directory``."""
-        candidates = glob.glob(os.path.join(str(directory), "ckpt_*.pt"))
-        steps = [(int(m.group(1)), p) for p in candidates if (m := re.search(r"ckpt_(\d+)\.pt$", p))]
+        """The highest-step periodic checkpoint in ``directory``."""
+        extension = CHECKPOINT_EXTENSION
+        candidates = glob.glob(os.path.join(str(directory), f"ckpt_*.{extension}"))
+        pattern = re.compile(rf"ckpt_(\d+)\.{extension}$")
+        steps = [(int(m.group(1)), p) for p in candidates if (m := pattern.search(p))]
         if not steps:
-            raise FileNotFoundError(f"no ckpt_<step>.pt files in {directory}")
+            raise FileNotFoundError(f"no ckpt_<step>.{extension} files in {directory}")
         return Path(max(steps)[1])
 
     # ------------------------------------------------------------------ small helpers

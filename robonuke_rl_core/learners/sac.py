@@ -130,7 +130,12 @@ class SAC(LearnerBase):
         self.memory.create_tensor(name="actions", size=self.action_space, dtype=torch.float32)
         self.memory.create_tensor(name="rewards", size=1, dtype=torch.float32)
         self.memory.create_tensor(name="terminated", size=1, dtype=torch.bool)
-        self._tensors_names = ["observations", "actions", "rewards", "next_observations", "terminated"]
+        # truncated is stored too, because the bootstrap must tell a terminal state from the
+        # clock running out: Isaac Lab's Factory and Forge raise BOTH flags at the time limit
+        self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
+        self._tensors_names = [
+            "observations", "actions", "rewards", "next_observations", "terminated", "truncated",
+        ]
         if self._asymmetric:
             self.memory.create_tensor(name="states", size=self.state_space, dtype=torch.float32)
             self.memory.create_tensor(name="next_states", size=self.state_space, dtype=torch.float32)
@@ -197,6 +202,7 @@ class SAC(LearnerBase):
             rewards=self.shape_rewards(rewards, timestep, timesteps),
             next_observations=next_observations,
             terminated=terminated,
+            truncated=truncated,
             **extra,
         )
 
@@ -220,9 +226,17 @@ class SAC(LearnerBase):
             )
             entropy = self.expand_per_agent(self._entropy_coefficient, rows)
             target_q = torch.min(target_q1, target_q2) - entropy * outputs["log_prob"]
-            target_values = sampled["rewards"] + self.cfg.discount_factor * sampled[
-                "terminated"
-            ].logical_not() * target_q
+            # Bootstrap unless the next state is genuinely terminal. A time limit is not the
+            # end of the world: the episode had a future, it just stopped being observed, so
+            # dropping gamma*V(next) there would teach the critic that running out the clock
+            # is worth nothing. Isaac Lab's Factory and Forge raise terminated AND truncated
+            # at the limit (``_get_dones`` returns one ``time_out`` tensor twice), so reading
+            # ``terminated`` alone would do exactly that to every episode.
+            terminal = sampled["terminated"] & sampled["truncated"].logical_not()
+            target_values = (
+                sampled["rewards"]
+                + self.cfg.discount_factor * terminal.logical_not() * target_q
+            )
 
         critic_1_values, _ = self.critic_1.act(
             {**critic_inputs, "taken_actions": sampled["actions"]}, role="critic_1"

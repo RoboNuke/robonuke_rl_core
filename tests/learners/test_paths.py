@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from robonuke_rl_core.learners.base import CHECKPOINT_BEST, checkpoint_name
 from helpers import ACT_DIM, OBS_DIM, STATE_DIM, build_learner, fill_memory
 
 
@@ -236,9 +237,9 @@ def test_latest_checkpoint_picks_the_highest_step(tmp_path):
     from robonuke_rl_core.learners.base import LearnerBase
 
     for step in (5, 40, 7):
-        (tmp_path / f"ckpt_{step}.pt").write_text("")
-    (tmp_path / "ckpt_best.pt").write_text("")  # never the "latest"
-    assert LearnerBase.latest_checkpoint(tmp_path).name == "ckpt_40.pt"
+        (tmp_path / checkpoint_name(step)).write_text("")
+    (tmp_path / CHECKPOINT_BEST).write_text("")  # never the "latest"
+    assert LearnerBase.latest_checkpoint(tmp_path).name == checkpoint_name(40)
 
     with pytest.raises(FileNotFoundError):
         LearnerBase.latest_checkpoint(tmp_path / "empty")
@@ -298,3 +299,52 @@ def test_ppo_gae_matches_a_per_env_reference_loop():
     )
     assert torch.allclose(memory.time_view("returns"), reference + values, atol=1e-5)
     assert torch.allclose(memory.time_view("advantages"), standardized, atol=1e-5)
+
+
+# ------------------------------------------------------------------ the SAC bootstrap
+def test_sac_bootstraps_through_a_timeout_but_not_a_terminal_state():
+    """A time limit is not the end of the world; only ``terminated & ~truncated`` is.
+
+    Isaac Lab's Factory and Forge raise both flags at the limit, so reading ``terminated``
+    alone would drop gamma*V(next) on every single episode.
+    """
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2, normalize_observations=False)
+    fill_memory(learner, steps=4)
+    rows = 3
+    sampled = dict(
+        zip(
+            learner._tensors_names,
+            learner.memory.sample(names=learner._tensors_names, batch_size=rows)[0],
+        )
+    )
+    inputs = {"observations": sampled["observations"]}
+    next_inputs = {"observations": sampled["next_observations"]}
+
+    def target_for(terminated: bool, truncated: bool) -> torch.Tensor:
+        flags = dict(
+            terminated=torch.full_like(sampled["terminated"], terminated),
+            truncated=torch.full_like(sampled["truncated"], truncated),
+        )
+        torch.manual_seed(0)  # the target policy samples next_actions
+        _, _, _, target_values = learner._compute_critic_loss(
+            sampled={**sampled, **flags},
+            inputs=inputs,
+            next_inputs=next_inputs,
+            critic_inputs=inputs,
+            critic_next_inputs=next_inputs,
+            rows=rows,
+        )
+        return target_values
+
+    rewards = sampled["rewards"]
+    running = target_for(False, False)
+    timeout = target_for(True, True)  # the Factory/Forge time limit: both flags
+    truncated_only = target_for(False, True)
+    terminal = target_for(True, False)
+
+    # the bootstrap survives a timeout, however the env labels it
+    assert torch.allclose(timeout, running)
+    assert torch.allclose(truncated_only, running)
+    assert not torch.allclose(running, rewards)  # there IS a bootstrap term to keep
+    # a genuine terminal state has no future: the target is the reward alone
+    assert torch.allclose(terminal, rewards)

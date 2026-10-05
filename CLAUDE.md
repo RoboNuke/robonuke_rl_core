@@ -2,9 +2,9 @@
 
 Shared RL package for Isaac Lab research: skrl agents, several independent agents trained in
 parallel in one Isaac Sim instance on one GPU. Built area by area. **Today the config manager
-(`robonuke_rl_core/config.py`), the learners (`learners/`), the models (`models/`) and the
-memory (`memory/`) exist.** The models got their design pass (plain modules + vmap); the
-memory is still a provisional port and gets its own pass later.
+(`robonuke_rl_core/config.py`), the learners (`learners/`), the models (`models/`), the memory
+(`memory/`), the logging layer (`logging.py`) and eval + recording (`evaluation.py`,
+`recording.py`) exist.** `scripts/`: `train.py`, `eval.py`.
 
 Test env: the `general` conda env (`/home/hunter/miniconda3/envs/general/bin/python`). Never
 create a new conda env for this project.
@@ -119,6 +119,15 @@ sampling: each is per agent. Two consequences that are easy to undo by accident:
   stat updates (stats train in epoch 0 only) and their logging, for every agent alike. That
   residue is collective, rare and accepted. (SpinningUp-style "the critic keeps training" is
   a one-argument change: pass `keep=None` to the value optimizer.)
+* **A time limit is not a terminal state.** The value bootstrap drops `gamma*V(next)` only
+  where `terminated & ~truncated`; a timeout keeps it. This is not pedantry: Isaac Lab's
+  Factory and Forge `_get_dones` returns one `time_out` tensor for *both* flags, so reading
+  `terminated` alone would cut the bootstrap on every episode, since those tasks end only on
+  the clock. SAC stores `truncated` beside `terminated` for exactly this. PPO instead adds
+  `gamma*V(next)` to the reward when `truncated` is set (`ppo.time_limit_bootstrap`) and
+  treats any done as the end of the GAE chain, which comes to the same thing — but with
+  `time_limit_bootstrap: False` on these tasks, PPO does cut the bootstrap at every timeout,
+  so set it True there. Eval labels outcomes by the same rule (`terminal` vs `timeout`).
 * **Loading one agent touches one slot.** Every per-agent tensor (including SAC's target
   critics) is saved and loaded per slot; nothing on load may write a whole block.
 
@@ -268,7 +277,12 @@ the host), it happens once per step, and only while an `on_log` hook is attached
   count is zero.
 * `WandbLogger` owns one wandb run per agent (`derived.run_names`, grouped by `wandb.group`,
   with the resolved config attached) and is itself the `on_log` hook; `flush` is the `on_flush`
-  hook and `close()` finishes the runs. `wandb` is imported lazily, so the package imports
+  hook, `checkpoint` is the `on_checkpoint` hook and `close()` finishes the runs.
+* **Files go up as plain run files, never as Artifacts.** `resolved_config.yaml` once and each
+  checkpoint as it is written, stored under their base names (`run.save(..., policy="now")`),
+  because eval downloads them back by name. An eval launched with `--run` pushes its own
+  outputs back to the *same* training run under `eval/<eval-config-stem>_<timestamp>/`, and
+  logs no metrics: the parquet trace is the data. `wandb` is imported lazily, so the package imports
   without it. Runs are created with `reinit="create_new"` and logged through their own
   `run.log(data, step=...)` — never the global `wandb.log`, which with several live runs would
   publish to whichever started last. A wandb older than `MIN_WANDB_VERSION` cannot keep N runs
@@ -286,17 +300,139 @@ Both lists live on the learner and are **empty by default** (nothing is logged, 
   metrics as 0-d tensors.
 * `on_flush`: `fn(step: int)`, called once per `trainer.write_interval` right after the episode
   flush. Where a logger publishes.
+* `on_checkpoint`: `fn(agent_idx: int, step: int, path: Path)`, called for every checkpoint
+  file written (periodic and best). `WandbLogger.checkpoint` is the hook that mirrors it to
+  that agent's run.
 * `aux_loss`: `fn(ctx: AuxLossContext) -> Tensor | None`, called for `ctx.target == "policy"`
   and `"critic"`. A returned tensor is added to that loss.
 
 ### Checkpoints
 
 Per agent, at `{trainer.output_dir}/{wandb.project}/{wandb.group}/{run_name}/checkpoints/`:
-`ckpt_{step}.pt` every `trainer.checkpoint_interval` steps, plus `ckpt_best.pt` whenever an
+`ckpt_{step}.ckpt` every `trainer.checkpoint_interval` steps, plus `ckpt_best.ckpt` whenever an
 agent's mean episode return over a write interval improves. A file holds that agent's model
 weights, optimizer state, normalizer stats, learner extras, the step and the mean return.
 `load_agent(path, slot)` loads one file into any slot; optimizer state only with
 `with_optimizer=True`, which needs `num_agents == 1`.
+
+## Eval, recording and debug
+
+`scripts/eval.py` evaluates one trained policy under conditions an eval config names, and
+`scripts/debug.py` lets you watch one. `robonuke_rl_core/evaluation.py` holds the parts worth
+testing (accounting, state capture, run loading) and `robonuke_rl_core/recording.py` the
+camera and video path. Both scripts take the same policy sources and config layering.
+
+### The accounting rule
+
+**One round = one global reset, up to `max_episode_length` steps, and each env contributes
+exactly its FIRST episode of the round.** Isaac Lab keeps auto-resetting envs mid-round;
+every step after an env's first done is masked out of the counts, the returns, the metrics,
+the trace and the video — one mask (`EvalAccounting.step` returns it) drives all of them, so
+they cannot disagree. `ceil(num_rollouts / num_envs)` rounds run, and the last one uses only
+the envs still needed.
+
+Two details that are easy to get wrong:
+
+* **A round ends when nothing is valid, not after a fixed count.** Factory and Forge time out
+  at `max_episode_length - 1`, so stepping the full budget would run one step of a fresh,
+  discarded episode. `max_episode_length` is the upper bound and stepping past it raises.
+* **`terminal` means `terminated & ~truncated`.** Those tasks raise both flags at the limit,
+  so anything else would label every timeout a terminal outcome. Episodes keep both raw flags.
+* **Rounds really reset.** skrl's `IsaacLabWrapper.reset()` is a no-op after the first call,
+  so `force_env_reset` clears the `_reset_once` guard down the wrapper stack and then checks
+  `episode_length_buf == 0`, failing loudly rather than collecting mid-rollout fragments.
+
+### Where the policy comes from
+
+`--run entity/project/<run id or name>` (the usual way) downloads `resolved_config.yaml` and
+the checkpoint from that run's **plain files** into `~/.cache/robonuke_rl_core/...`, shaped
+like a local run dir; `--local <run dir>` skips wandb. Either way the config for the eval is
+the run's resolved config, then the `--eval_config` file (with its own `base` chain), then
+CLI overrides — so the eval config sets the test conditions and the env count, and anything
+it omits keeps the trained run's value. `--checkpoint` takes `best` (default), a step number
+or an exact file name. The policy is a 1-agent shell whatever the run trained, loaded with
+`load_agent(..., with_optimizer=False)`, normalizers frozen, `mean_actions` unless
+`eval.deterministic: false`.
+
+### What an eval writes
+
+Under `<run dir>/eval/<eval-config-stem>_<timestamp>/`: `summary.yaml` (aggregates plus one
+row per episode), `<stem>.parquet` (the per-step trace: one row per valid (round, env, step),
+vector signals expanded to `name_0..k`, NaN back-fill so it stays rectangular),
+`resolved_config.yaml` (the eval's own, so it reproduces like a run), and `videos/` when
+recording. With `--run`, those same files go back to the training run under
+`eval/<stem>_<timestamp>/`; nothing is ever logged as a wandb metric.
+
+### Capture an env signal in eval
+
+* Per step: `infos["metrics_to_log"]`, as in training.
+* At episode end: `infos["episode_metrics_to_log"]`, masked to the envs that finished.
+* Whole-state: `infos["eval_state"]`, a dict of `(num_envs, ...)` tensors — trailing dims are
+  allowed here, and every element becomes its own parquet column. Shape-policed like the
+  metric channels, and only read on valid steps.
+
+### Add an overlay
+
+Subclass `Overlay` in the project, set `name`, implement `apply(frame, step) -> frame` where
+`frame` is `(H, W, 3)` uint8 and `step` is a `StepData` (env, step, reward, return so far,
+the done flags, that env's metric values), decorate with `@register_overlay` at import time,
+and list the name in `eval.overlays`. The package ships `hud`; an unknown name raises when
+the config loads, not when the camera starts rolling.
+
+### Debug the env or the policy
+
+`scripts/debug.py` runs **one** env (it forces `task.cfg.scene.num_envs=1`) and collects
+nothing. Same `--run` / `--local`, `--checkpoint` and optional `--eval_config` as eval.
+
+* **Live viewer** (default, needs a window): the policy acts while you watch. `j` pauses,
+  `k` resets, `l` quits.
+* **Reset viewer** (`--resets`): a reset every `--hold_seconds` seconds of wall clock, `k`
+  resets now, `l` quits. Between resets the sim is **rendered but never stepped**, so what you see is exactly
+  the initial condition the env sampled, not a pose physics has already pulled on.
+* **Headless reset video** (`--resets --headless --num_resets N --out resets.mp4`): the same
+  loop through `recording.render_resets`, holding each condition for `hold_seconds` of video
+  (`round(hold_seconds * video_fps)` frames). It injects
+  `task.cfg.scene.clone_in_fabric=false` as a CLI-layer override, because it needs a camera
+  and has no config of its own to say so; eval instead *requires* the eval config to state it,
+  since recording there is a choice that config makes.
+
+**Pausing and holding still means `sim.render()`, never `app.update()`.** `app.update()`
+steps physics — Isaac Lab says so itself, in the FIXME inside `SimulationContext.step()` — so
+a "paused" loop built on it keeps the robot moving. `SimulationContext.render()` is
+`app.update()` wrapped in `/app/player/playSimulations = False`: the viewport stays live and
+keeps taking input, and physics does not advance. That is what both debug viewers and
+`render_resets` use between steps.
+
+Keys go through the carb input interface the way Isaac Lab's own devices do
+(`isaaclab/devices/keyboard/se2_keyboard.py`): `carb.input.acquire_input_interface()`, the app
+window's keyboard, `subscribe_to_keyboard_events`, and `event.input.name` on `KEY_PRESS`.
+
+**Do not bind a letter the viewport already owns.** Kit claims `p` (Parent Prim), `w/e/r`
+(gizmos), `f` (frame selected) and others, consumes the event before this script's
+subscription sees it, and answers with a toast — so the viewer looks like it ignored the key.
+`j/k/l` are the defaults for that reason, `--key_pause` / `--key_reset` / `--key_quit`
+override them, the mapping is printed when a viewer starts, and the first key press of any
+kind prints a line, so "Kit ate it" and "wrong binding" are distinguishable. Note the
+interface spells the teardown `unsubscribe_to_keyboard_events`; `unsubscribe_from_...` does
+not exist (Isaac Lab's own device calls the missing name inside `__del__`, where Python
+swallows the error).
+
+**The keyboard paths cannot be tested automatically** — the headless reset video has a GPU
+test, the rest is this checklist, worth one pass whenever `debug.py` changes:
+
+1. `--local <run> ` opens a window, the robot moves, no files are written anywhere.
+2. `r` snaps the scene back to a fresh initial condition.
+3. `p` freezes the robot; the viewport still orbits and zooms; `p` again resumes.
+4. `s` exits cleanly (no hang, no traceback).
+5. `--resets` cycles initial conditions on the timer, each held perfectly still.
+6. `r` in `--resets` jumps to the next condition immediately; `q` exits cleanly.
+
+Recording needs the camera in the scene **before** `gym.make`
+(`install_recorder_camera(task_name, task_cfg, ...)`, which also forces
+`scene.clone_in_fabric=False` — a `TiledCamera` needs real per-env prims) and the app
+launched with `enable_cameras=True`. One mp4 per (round, env) is written as the round runs,
+so memory is one frame per env. The GPU test suite therefore carries the camera on its shared
+env, which is why `pytest -m gpu` takes about three minutes rather than ninety seconds.
 
 ## Add a config class (package or project)
 
@@ -372,6 +508,11 @@ fixture incomplete.
 pytest          # CPU tests only (addopts = -m 'not gpu')
 pytest -m gpu   # the Isaac Sim tests, on the GPU machine
 ```
+
+Every GPU test shares **one** env (`gpu_env`), because Isaac Lab hangs when a second one is
+created in a process, and that env carries the recorder camera so the record and reset-video
+paths are testable at all — which is why `pytest -m gpu` takes a few minutes rather than
+seconds, and why its config sets `task.cfg.scene.clone_in_fabric=false`.
 
 No test is skipped silently: a GPU test that cannot start Isaac Sim fails. Report each run as
 passed / failed / total.

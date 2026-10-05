@@ -511,3 +511,80 @@ def test_a_type_change_in_the_task_cfg_cannot_reach_the_env():
     with pytest.raises(TypeError) as err:
         load_config(FIXTURES / "minimal.yaml", ["task.cfg.device=3"])
     assert "task.cfg.device" in str(err.value)
+
+
+# ------------------------------------------------------------------ 11. extra file layers
+def _eval_files(tmp_path):
+    """An eval config plus the base it chains to, as eval.py will pass them."""
+    base = tmp_path / "eval_base.yaml"
+    base.write_text(
+        "experiment:\n  num_agents: 1\ntask:\n  cfg:\n    scene:\n      num_envs: 8\n"
+    )
+    extra = tmp_path / "harder.yaml"
+    extra.write_text(
+        f"base: {base.name}\n"
+        "task:\n  cfg:\n    decimation: 12\n    scene:\n      num_envs: 16\n"
+        "wandb:\n  tags:\n    - eval\n"
+    )
+    return base, extra
+
+
+def test_an_extra_file_layer_lands_on_top_of_the_run(tmp_path):
+    first = load_config(FIXTURES / "minimal.yaml")
+    dump(first, tmp_path / "run", first.task_cfg)
+    _, extra = _eval_files(tmp_path)
+
+    cfg = load_from_run(tmp_path / "run", extra_files=[extra])
+    # the extra file's own base chain was followed, then the file itself won
+    assert cfg.task_cfg.scene.num_envs == 16
+    assert cfg.task_cfg.decimation == 12
+    assert cfg.experiment.num_agents == 1
+    assert cfg.wandb.tags == ["eval"]
+    # untouched values still come from the run
+    assert cfg.wandb.group == first.wandb.group
+    assert cfg.experiment.seed == first.experiment.seed
+
+
+def test_the_cli_still_beats_an_extra_file(tmp_path):
+    first = load_config(FIXTURES / "minimal.yaml")
+    dump(first, tmp_path / "run", first.task_cfg)
+    _, extra = _eval_files(tmp_path)
+
+    cfg = load_from_run(
+        tmp_path / "run",
+        ["task.cfg.scene.num_envs=2", "experiment.num_agents=3"],
+        extra_files=[extra],
+    )
+    assert cfg.task_cfg.scene.num_envs == 2
+    assert cfg.experiment.num_agents == 3
+    assert cfg.task_cfg.decimation == 12  # the extra file still wins over the run
+
+
+def test_several_extra_files_apply_in_order(tmp_path):
+    first = load_config(FIXTURES / "minimal.yaml")
+    dump(first, tmp_path / "run", first.task_cfg)
+    _, extra = _eval_files(tmp_path)
+    last = tmp_path / "last.yaml"
+    last.write_text("task:\n  cfg:\n    scene:\n      num_envs: 32\n")
+
+    cfg = load_from_run(tmp_path / "run", extra_files=[extra, last])
+    assert cfg.task_cfg.scene.num_envs == 32
+    assert cfg.task_cfg.decimation == 12
+
+
+def test_a_missing_extra_file_raises_with_its_path(tmp_path):
+    first = load_config(FIXTURES / "minimal.yaml")
+    dump(first, tmp_path / "run", first.task_cfg)
+    with pytest.raises(FileNotFoundError) as err:
+        load_from_run(tmp_path / "run", extra_files=[tmp_path / "nope.yaml"])
+    assert "nope.yaml" in str(err.value)
+
+
+def test_an_extra_file_may_not_set_the_task_seed(tmp_path):
+    first = load_config(FIXTURES / "minimal.yaml")
+    dump(first, tmp_path / "run", first.task_cfg)
+    extra = tmp_path / "seeded.yaml"
+    extra.write_text("task:\n  cfg:\n    seed: 7\n")
+    with pytest.raises(ValueError) as err:
+        load_from_run(tmp_path / "run", extra_files=[extra])
+    assert "task.cfg.seed" in str(err.value)

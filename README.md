@@ -16,16 +16,34 @@ the auxiliary losses (`losses/`).
 
 ## Running
 
+Run from the repo root, with the `general` conda env's interpreter (`conda activate general`,
+or call `/home/hunter/miniconda3/envs/general/bin/python` directly — the base env has no Isaac
+Lab):
+
 ```bash
+# train: every agent in one Isaac Sim instance, one wandb run each
 python scripts/train.py --config examples/forge_exp.yaml --headless \
     task.cfg.scene.num_envs=128 experiment.seed=3
 
-python scripts/train.py --from_run runs/forge_pih/fgain_k100 --headless   # rerun a past run
+# evaluate a trained policy under the conditions an eval config names
+python scripts/eval.py --run entity/project/run_id \
+    --eval_config examples/eval/quick.yaml --headless [--checkpoint best] [--record]
+python scripts/eval.py --local runs/proj/group/group_a0 \
+    --eval_config examples/eval/quick.yaml --headless
+
+# watch one env: the policy acting, or the initial conditions it spawns
+python scripts/debug.py --run entity/project/run_id
+python scripts/debug.py --local runs/proj/group/group_a0 --resets --hold_seconds 2
+python scripts/debug.py --run entity/project/run_id --resets --headless \
+    --num_resets 10 --out resets.mp4
 ```
 
-Exactly one of `--config` / `--from_run` is required. Every leftover argument is a dotted-path
-override; values parse as YAML (`x=null`, `x=[1,2]`, `x={a: 1}`), and floats need a decimal
-point (`1.0e-4`, not `1e-4`).
+`--run` takes `entity/project/<run id or exact run name>` and pulls the config and checkpoint
+from that run's files; `--local` takes a run directory instead. `--checkpoint` accepts `best`
+(the default), a step number, or a file name. An eval writes `summary.yaml`, a per-step
+`.parquet` trace, its own resolved config and (with `--record`) one mp4 per episode under
+`<run dir>/eval/<eval-config-stem>_<timestamp>/`, and with `--run` mirrors them back to the
+training run. See `CLAUDE.md` for the episode accounting rule and the debug keys.
 
 ## Tests
 
@@ -80,6 +98,11 @@ run-name field.
 | `group` | str | required | wandb group; run names and the run directory derive from it. No whitespace or `/` |
 | `tags` | list[str] | `[]` | wandb tags |
 | `mode` | str | `"online"` | `online`, `offline` or `disabled`; passed to `wandb.init`. One run per agent either way |
+
+Each run's Files tab gets `resolved_config.yaml` and every checkpoint (`ckpt_{step}.ckpt`,
+`ckpt_best.ckpt`) as ordinary run files — the Artifacts API is never used. That is what
+`scripts/eval.py --run entity/project/run` downloads, and an eval pushes its own results back
+to the same run under `eval/<eval-config-stem>_<timestamp>/`.
 
 ## trainer
 
@@ -149,7 +172,7 @@ Proximal Policy Optimization. The rollout buffer is `rollouts` steps per env;
 | `entropy_loss_scale` | float | `0.0` | entropy bonus weight (0 disables the term) |
 | `value_loss_scale` | float | `1.0` | value-loss weight |
 | `kl_threshold` | float | `0.0` | per-agent KL early stop: an agent above this is frozen — policy **and** critic, including the `value_update_ratio` passes (weights and Adam moments unchanged) — for the rest of the epoch while the others continue (0 disables) |
-| `time_limit_bootstrap` | bool | `False` | add `discount_factor * V(next)` to the reward on truncation |
+| `time_limit_bootstrap` | bool | `False` | add `discount_factor * V(next)` to the reward on truncation. **Set this True on Factory/Forge-style tasks**, which raise `terminated` and `truncated` together at the time limit; left False, every timeout is treated as a terminal state. SAC needs no flag: it bootstraps unless `terminated & ~truncated` |
 | `normalize_values` | bool | `True` | per-agent running normalization of values and returns |
 | `value_update_ratio` | int | `1` | extra value-only updates per minibatch after the combined update (1 = none) |
 
@@ -219,6 +242,44 @@ losses:
 `@register_loss` (registered before the config is loaded). A penalty on action magnitude
 belongs in the env's reward, not in a policy-side term. See the "Add a loss" checklist in
 `CLAUDE.md`.
+
+## eval
+
+Read by `scripts/eval.py` and `scripts/debug.py`; training ignores it. An eval layers its own
+config file on top of the run being evaluated (`--run entity/project/run --eval_config <file>`,
+or `--local <run_dir>`), and that file is where the test conditions (`task.cfg.*`), the env
+count and these fields are set. Anything it leaves out keeps the trained run's value.
+
+`num_rollouts` counts **valid episodes, not steps**: the runner takes
+`ceil(num_rollouts / task.cfg.scene.num_envs)` rounds, and each env contributes exactly one
+episode per round — its first, which either hit a terminal condition or ran out of the
+`max_episode_length` budget. Everything an env does after its first done is masked out of the
+data, the counts and the video. The last round uses only as many envs as are still needed.
+
+An episode counts as terminal only when `terminated` is set **without** `truncated`: Isaac
+Lab's Factory and Forge tasks raise both at the time limit (`_get_dones` returns the same
+`time_out` tensor twice), so anything else would report every timeout as a terminal outcome.
+
+| field | type | default | what it does |
+| --- | --- | --- | --- |
+| `num_rollouts` | int | `64` | valid episodes to collect |
+| `deterministic` | bool | `True` | act on the distribution's mean (Bernoulli dims thresholded); `false` samples |
+| `save_state` | bool | `True` | capture the full per-step state (observations, states, actions, rewards, dones, both metric channels, `infos["eval_state"]`) into the eval's `<stem>.parquet` trace, one row per (round, env, step) |
+| `record` | bool | `False` | write one mp4 per (round, env); `--record` forces it on. Use few envs by setting `task.cfg.scene.num_envs` in the eval config |
+| `overlays` | list[str] | `["hud"]` | registered overlay names, drawn in this order |
+| `video_fps` | int | `30` | playback rate of the written mp4s |
+| `video_height` | int | `180` | per-env camera height in pixels |
+| `video_width` | int | `240` | per-env camera width in pixels |
+
+```yaml
+# quick.yaml -- used as: --run entity/project/run_id --eval_config quick.yaml
+eval:
+  num_rollouts: 256
+task:
+  cfg:
+    scene:
+      num_envs: 64
+```
 
 ## derived and meta
 

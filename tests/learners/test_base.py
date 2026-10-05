@@ -7,7 +7,7 @@ import copy
 import pytest
 import torch
 
-from robonuke_rl_core.learners.base import run_dirs
+from robonuke_rl_core.learners.base import CHECKPOINT_BEST, checkpoint_name, run_dirs
 from robonuke_rl_core.losses import LossContext
 
 from helpers import ACT_DIM, OBS_DIM, build_learner, fill_memory
@@ -208,7 +208,7 @@ def test_best_checkpoint_follows_the_highest_mean_return(tmp_path):
         learner.post_interaction(timestep=step, timesteps=100)
 
     finish_episode(5.0, step=0)
-    best = dirs[0] / "checkpoints" / "ckpt_best.pt"
+    best = dirs[0] / "checkpoints" / CHECKPOINT_BEST
     assert best.is_file()
     first_return = torch.load(best, weights_only=False)["mean_return"]
     assert first_return == pytest.approx(5.0)
@@ -445,3 +445,24 @@ def test_an_all_bernoulli_policy_trains(learner_name):
     # the actions really are mode bits
     actions, _ = learner.act(torch.randn(learner.num_envs, OBS_DIM), None, timestep=11, timesteps=100)
     assert set(actions.unique().tolist()) <= {-1.0, 1.0}
+
+
+def test_the_checkpoint_hook_reports_every_file_written(tmp_path):
+    """A logger mirrors checkpoints through this hook; it is empty by default."""
+    dirs = [tmp_path / "a0", tmp_path / "a1"]
+    learner = build_learner(
+        "sac", num_agents=2, envs_per_agent=2, run_dirs_list=dirs,
+        trainer_overrides={"write_interval": 1, "checkpoint_interval": 1},
+    )
+    seen: list[tuple[int, int, str]] = []
+    learner.on_checkpoint.append(lambda agent, step, path: seen.append((agent, step, path.name)))
+
+    paths = learner.save_checkpoints(step=5)
+    assert seen == [(0, 5, checkpoint_name(5)), (1, 5, checkpoint_name(5))]
+    assert [p.name for p in paths] == [name for _, _, name in seen]
+
+    # the best-checkpoint writer announces its file too
+    seen.clear()
+    learner._mean_return = [1.0, -1.0]
+    learner._write_best_checkpoints(step=6)
+    assert seen == [(0, 6, CHECKPOINT_BEST), (1, 6, CHECKPOINT_BEST)]

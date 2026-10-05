@@ -41,7 +41,9 @@ def isaac_sim():
     argv = sys.argv[:]
     sys.argv = argv[:1]
     try:
-        launcher = AppLauncher(headless=True)
+        # enable_cameras: the session env carries the recorder camera (see gpu_env_factory),
+        # and Isaac Lab refuses to spawn a camera without it
+        launcher = AppLauncher(headless=True, enable_cameras=True)
     finally:
         sys.argv = argv
     _STARTED = True
@@ -69,6 +71,17 @@ def gpu_env_factory(isaac_sim):
         import gymnasium as gym
         from skrl.envs.wrappers.torch import wrap_env
 
+        from robonuke_rl_core.recording import install_recorder_camera
+
+        # The recorder camera goes in for the whole session: only one env may exist per
+        # process, so the recording test has to share this one. It costs some render time
+        # for every GPU test, which is the price of testing the record path at all.
+        install_recorder_camera(
+            cfg.task_name,
+            cfg.task_cfg,
+            width=cfg.eval.video_width,
+            height=cfg.eval.video_height,
+        )
         return wrap_env(gym.make(cfg.task_name, cfg=cfg.task_cfg), wrapper="isaaclab")
 
     return make
@@ -83,7 +96,14 @@ def gpu_cfg(isaac_sim, tmp_path_factory):
     # a task-cfg override on the CLI as well as a section one, so the GPU tests prove both
     # layers reach the live env (the file sets num_envs: 8)
     return load_config(
-        GPU_CONFIG, [f"trainer.output_dir={output_dir}", "task.cfg.scene.num_envs=4"]
+        GPU_CONFIG,
+        [
+            f"trainer.output_dir={output_dir}",
+            "task.cfg.scene.num_envs=4",
+            # the session env carries the recorder camera (see gpu_env_factory), which needs
+            # real per-env prims rather than Fabric-cloned ones
+            "task.cfg.scene.clone_in_fabric=false",
+        ],
     )
 
 

@@ -1,0 +1,17 @@
+# A recording eval: 4 episodes on 2 envs, one mp4 per (round, env).
+#
+#   python scripts/eval.py --run entity/project/run_id --eval_config examples/eval/record.yaml --headless
+#
+# Few envs on purpose: every env renders its own camera every step.
+base: quick.yaml
+
+eval:
+  num_rollouts: 4
+  record: true
+
+task:
+  cfg:
+    scene:
+      num_envs: 2
+      # a TiledCamera needs real per-env prims; recording refuses to start otherwise
+      clone_in_fabric: false

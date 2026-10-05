@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# wandb writes its local run data into the working directory
+wandb/
+
+# trainer.output_dir defaults to runs/
+runs/

@@ -228,8 +228,16 @@ def load_config(path: str | Path, overrides: Any = None) -> Config:
     return _build(layers)
 
 
-def load_from_run(run_dir: str | Path, overrides: Any = None) -> Config:
-    """Use a past run's ``resolved_config.yaml`` as the only file layer, then CLI overrides."""
+def load_from_run(
+    run_dir: str | Path, overrides: Any = None, extra_files: Any = None
+) -> Config:
+    """Rebuild a past run's config, optionally with extra file layers on top.
+
+    Layer order is the run's ``resolved_config.yaml``, then each file in ``extra_files``
+    (each following its own ``base`` chain), then the CLI. That is the mechanism eval uses:
+    the run says what was trained, the eval config says what to test it under, the CLI still
+    wins. A missing extra file raises naming the path.
+    """
     path = Path(run_dir).expanduser()
     if path.is_dir():
         path = path / RESOLVED_NAME
@@ -241,7 +249,12 @@ def load_from_run(run_dir: str | Path, overrides: Any = None) -> Config:
     task_cfg = OmegaConf.select(layer, "task.cfg")
     if task_cfg is not None:
         task_cfg.pop("seed", None)  # written from experiment.seed, never a layer's own value
-    return _build([(str(path), layer), ("CLI", _cli_layer(overrides))])
+
+    layers = [(str(path), layer)]
+    for extra in list(extra_files or []):
+        layers += [(str(p), _file_layer(p)) for p in _chain(extra)]
+    layers.append(("CLI", _cli_layer(overrides)))
+    return _build(layers)
 
 
 def _build(layers: List[tuple]) -> Config:
@@ -498,6 +511,7 @@ def load_from_args(args: argparse.Namespace, overrides: Any = None) -> Config:
 # at the top, because the config classes they bring in import nothing from this module.
 from .learners.cfg import PPOCfg, SACCfg, TrainerCfg  # noqa: E402
 from .losses.cfg import LossesCfg  # noqa: E402
+from .evaluation import EvalCfg  # noqa: E402
 from .memory.cfg import MemoryCfg  # noqa: E402
 from .models.cfg import SimbaModelCfg, model_cfg_class  # noqa: E402
 
@@ -509,3 +523,4 @@ register_section("ppo", PPOCfg)
 register_section("model", SimbaModelCfg)  # the default; model.architecture swaps it
 register_section("memory", MemoryCfg)
 register_section("losses", LossesCfg)
+register_section("eval", EvalCfg)

@@ -19,10 +19,15 @@ class FakeRun:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.logged: list[tuple[dict, int | None]] = []
+        self.saved: list[tuple[str, str, str]] = []
         self.finished = False
 
     def log(self, data, step=None):
         self.logged.append((dict(data), step))
+
+    def save(self, path, base_path=None, policy=None):
+        # plain run files only; an Artifacts call would be an AttributeError here
+        self.saved.append((path, base_path, policy))
 
     def finish(self):
         self.finished = True
@@ -258,3 +263,33 @@ def test_a_learner_feeds_both_channels_through_the_logger():
     assert "env/success" not in second
     assert "episode/return" not in second
     assert backend.runs[0].logged[0][1] == 1  # x-axis: the global env timestep
+
+
+# ------------------------------------------------------------------ 7. plain run files
+def test_the_resolved_config_is_uploaded_once_to_every_run(tmp_path):
+    config_path = tmp_path / "resolved_config.yaml"
+    config_path.write_text("experiment:\n  seed: 3\n")
+    log, backend = logger(num_agents=2, config_path=config_path)
+
+    for run in backend.runs:
+        assert [name for name, _, _ in run.saved] == [str(config_path)]
+        # stored under its base name, which is what an eval downloads by
+        assert run.saved[0][1] == str(tmp_path)
+        assert run.saved[0][2] == "now"
+
+
+def test_a_checkpoint_goes_only_to_its_own_agents_run(tmp_path):
+    log, backend = logger(num_agents=2)
+    first = tmp_path / "ckpt_10.ckpt"
+    first.write_bytes(b"weights")
+
+    log.checkpoint(1, 10, first)
+    assert backend.runs[0].saved == []
+    assert [name for name, _, _ in backend.runs[1].saved] == [str(first)]
+
+
+def test_uploading_a_file_that_is_not_there_raises(tmp_path):
+    log, _ = logger()
+    with pytest.raises(FileNotFoundError) as err:
+        log.save_file(tmp_path / "missing.ckpt")
+    assert "missing.ckpt" in str(err.value)

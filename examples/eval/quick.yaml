@@ -1,0 +1,9 @@
+# A small eval: 8 episodes on 4 envs (two rounds), deterministic actions, state saved.
+# Used as `--eval_config examples/eval/quick.yaml`, layered on a run's resolved config.
+eval:
+  num_rollouts: 8
+
+task:
+  cfg:
+    scene:
+      num_envs: 4

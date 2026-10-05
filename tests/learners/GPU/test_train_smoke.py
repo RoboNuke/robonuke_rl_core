@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from robonuke_rl_core.learners.base import run_dirs
+from robonuke_rl_core.learners.base import CHECKPOINT_EXTENSION, run_dirs
 
 pytestmark = pytest.mark.gpu
 
@@ -95,7 +95,7 @@ def test_train_loop_and_checkpoints(gpu_cfg, gpu_env, tmp_path, learner_name):
 
     # one checkpoint per agent, and it loads back into its slot
     for agent in range(num_agents):
-        files = sorted((dirs[agent] / "checkpoints").glob("ckpt_*.pt"))
+        files = sorted((dirs[agent] / "checkpoints").glob(f"ckpt_*.{CHECKPOINT_EXTENSION}"))
         assert files, f"no checkpoint for agent {agent} in {dirs[agent]}"
         meta = learner.load_agent(files[-1], slot=agent)
         assert meta["agent_idx"] == agent

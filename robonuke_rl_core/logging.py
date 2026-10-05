@@ -124,6 +124,7 @@ class WandbLogger:
         tags: Iterable[str] = (),
         mode: str = "online",
         config: Optional[Dict[str, Any]] = None,
+        config_path: Optional[Any] = None,
         device: Optional[Any] = None,
         backend: Any = None,
     ) -> None:
@@ -157,6 +158,29 @@ class WandbLogger:
             )
             for name in names
         ]
+        if config_path is not None:
+            # the resolved config as a plain run file, so an eval can fetch it back verbatim
+            self.save_file(config_path)
+
+    # ------------------------------------------------------------------ files
+    def save_file(self, path: Any, agent: Optional[int] = None) -> None:
+        """Add a plain file to one run's Files tab, or to every run's when ``agent`` is None.
+
+        Ordinary run files (``run.save``), never the Artifacts API: an eval downloads these
+        back by name, so a file is stored under its base name and nothing else.
+        """
+        from pathlib import Path
+
+        source = Path(path)
+        if not source.is_file():
+            raise FileNotFoundError(f"cannot upload {source}: not a file")
+        runs = self.runs if agent is None else [self.runs[agent]]
+        for run in runs:
+            run.save(str(source), base_path=str(source.parent), policy="now")
+
+    def checkpoint(self, agent: int, step: int, path: Any) -> None:
+        """The learner's ``on_checkpoint`` hook: mirror that agent's checkpoint file."""
+        self.save_file(path, agent=agent)
 
     @classmethod
     def from_config(
@@ -164,6 +188,7 @@ class WandbLogger:
         cfg: Any,
         config: Optional[Dict[str, Any]] = None,
         *,
+        config_path: Optional[Any] = None,
         device: Optional[Any] = None,
         backend: Any = None,
     ) -> "WandbLogger":
@@ -176,6 +201,7 @@ class WandbLogger:
             tags=list(cfg.wandb.tags),
             mode=cfg.wandb.mode,
             config=config,
+            config_path=config_path,
             device=device,
             backend=backend,
         )

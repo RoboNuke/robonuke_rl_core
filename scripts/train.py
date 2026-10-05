@@ -56,7 +56,7 @@ def main() -> int:
     # really runs with (every agent in this process shares it)
     group_dir = Path(cfg.trainer.output_dir) / cfg.wandb.project / cfg.wandb.group
     config_path = dump(cfg, group_dir, env.unwrapped.cfg)
-    print(f"[train] config: {config_path}")
+    print(f"[train] config: {config_path}", flush=True)
     env = wrap_env(env, wrapper="isaaclab")
 
     torch.manual_seed(cfg.experiment.seed)
@@ -103,20 +103,22 @@ def main() -> int:
     aux = build_aux_losses(cfg.losses, num_agents)
     if aux is not None:
         learner.aux_loss.append(aux)
-        print(f"[train] aux losses: {[t.name for t in cfg.losses.terms]}")
+        print(f"[train] aux losses: {[t.name for t in cfg.losses.terms]}", flush=True)
 
     # one wandb run per agent, carrying exactly what resolved_config.yaml holds
     logger = WandbLogger.from_config(
         cfg,
         OmegaConf.to_container(OmegaConf.load(config_path), resolve=True),
+        config_path=config_path,  # uploaded once, as a plain run file
         device=env.device,
     )
     learner.on_log.append(logger)
     learner.on_flush.append(logger.flush)
+    learner.on_checkpoint.append(logger.checkpoint)  # every checkpoint mirrors to its run
 
-    print(f"[train] {learner_name}: {num_agents} agents x {total_envs // num_agents} envs")
+    print(f"[train] {learner_name}: {num_agents} agents x {total_envs // num_agents} envs", flush=True)
     print(f"[train] runs: {', '.join(str(d) for d in dirs)}")
-    print(f"[train] wandb: mode={cfg.wandb.mode} group={cfg.wandb.group}")
+    print(f"[train] wandb: mode={cfg.wandb.mode} group={cfg.wandb.group}", flush=True)
 
     trainer = SequentialTrainer(
         env=env,
