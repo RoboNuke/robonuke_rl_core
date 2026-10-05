@@ -32,7 +32,7 @@ def test_periodic_reset_rebuilds_the_networks_and_keeps_the_buffer():
 
     before_policy = params_of(learner.policy)
     before_stats = learner.observation_normalizer.running_mean.clone()
-    filled = learner.memory.memory_index
+    filled = learner.memory.size
 
     learner._maybe_periodic_reset(timestep=4)  # on the frequency boundary
     assert learner._n_periodic_resets == 1
@@ -45,7 +45,7 @@ def test_periodic_reset_rebuilds_the_networks_and_keeps_the_buffer():
         learner.cfg.initial_entropy_value
     )
     # the replay buffer and the normalizer statistics survive
-    assert learner.memory.memory_index == filled
+    assert learner.memory.size == filled
     assert torch.equal(before_stats, learner.observation_normalizer.running_mean)
 
     # the targets start equal to the fresh critics
@@ -131,7 +131,8 @@ def test_a_reward_shaper_is_resolved_and_applied():
         timestep=0,
         timesteps=100,
     )
-    stored = learner.memory.get_tensor_by_name("rewards")[0]
+    # step 0 of every env, back in env order: (num_agents, envs_per_agent, 1) -> (num_envs, 1)
+    stored = learner.memory.time_view("rewards")[:, 0].reshape(learner.num_envs, 1)
     assert torch.allclose(stored, rewards * 10.0)
     # the episode statistics use the RAW reward, not the shaped one
     assert float(learner._episode_return[0]) == pytest.approx(1.0)
@@ -224,7 +225,7 @@ def test_time_limit_bootstrap_adds_the_next_value_on_truncation():
         timestep=0,
         timesteps=100,
     )
-    stored = learner.memory.get_tensor_by_name("rewards")[0]
+    stored = learner.memory.time_view("rewards")[:, 0].reshape(num_envs, 1)
     expected = learner.cfg.discount_factor * float(next_values[0])
     assert float(stored[0]) == pytest.approx(expected, rel=1e-5)
     assert float(stored[1]) == 0.0  # not truncated: unchanged
@@ -241,3 +242,59 @@ def test_latest_checkpoint_picks_the_highest_step(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         LearnerBase.latest_checkpoint(tmp_path / "empty")
+
+
+# ------------------------------------------------------------------ GAE over the memory layout
+def test_ppo_gae_matches_a_per_env_reference_loop():
+    """The time view really is (agent, step, env): GAE must not mix steps across envs."""
+    num_agents, envs_per_agent, rollout = 3, 2, 4
+    learner = build_learner(
+        "ppo",
+        num_agents=num_agents,
+        envs_per_agent=envs_per_agent,
+        rollout=rollout,
+        normalize_observations=False,
+        normalize_values=False,
+        time_limit_bootstrap=False,
+    )
+    torch.manual_seed(5)
+    fill_memory(learner, steps=rollout)
+    memory = learner.memory
+
+    # what the update will read, snapshotted in (agent, step, env) form
+    rewards = memory.time_view("rewards").clone()
+    values = memory.time_view("values").clone()
+    terminated = memory.time_view("terminated").clone()
+    with torch.no_grad():
+        last_values, _ = learner.value.act(
+            {"observations": learner._next_observations}, role="value"
+        )
+    last_values = last_values.view(num_agents, envs_per_agent, 1)
+
+    learner.update(timestep=0, timesteps=100)
+
+    discount, lambda_ = learner.cfg.discount_factor, learner.cfg.gae_lambda
+    reference = torch.zeros_like(rewards)
+    for agent in range(num_agents):
+        for env in range(envs_per_agent):
+            advantage = 0.0
+            for step in reversed(range(rollout)):
+                next_value = (
+                    values[agent, step + 1, env]
+                    if step < rollout - 1
+                    else last_values[agent, env]
+                )
+                not_done = 0.0 if bool(terminated[agent, step, env]) else 1.0
+                advantage = (
+                    rewards[agent, step, env]
+                    - values[agent, step, env]
+                    + discount * not_done * (next_value + lambda_ * advantage)
+                )
+                reference[agent, step, env] = advantage
+
+    flat = reference.reshape(num_agents, -1)
+    standardized = (reference - flat.mean(1).view(-1, 1, 1, 1)) / (
+        flat.std(1).view(-1, 1, 1, 1) + 1e-8
+    )
+    assert torch.allclose(memory.time_view("returns"), reference + values, atol=1e-5)
+    assert torch.allclose(memory.time_view("advantages"), standardized, atol=1e-5)

@@ -39,16 +39,16 @@ def build(learner_name: str, agents: int, num_envs: int, device: str, rollouts: 
     model_cfg = SimbaModelCfg(actor=SimbaActorCfg(), critic=SimbaCriticCfg())  # real widths: 512 x 2
     if learner_name == "ppo":
         cfg = PPOCfg(rollouts=rollouts, learning_epochs=4, mini_batches=4, learning_starts=0)
-        depth = rollouts
+        steps = rollouts
     else:
         cfg = SACCfg(batch_size=batch, gradient_steps=1, learning_starts=0)
-        depth = 64
+        steps = 64
     observation_space, state_space, action_space = box(OBS_DIM), box(STATE_DIM), box(ACT_DIM)
     models = build_models(
         learner_name, model_cfg, observation_space, state_space, action_space, agents, device
     )
     memory = MultiRandomMemory(
-        memory_size=depth, num_envs=num_envs, num_agents=agents, device=device
+        capacity=steps * (num_envs // agents), num_envs=num_envs, num_agents=agents, device=device
     )
     extra = {"model_cfg": model_cfg} if learner_name == "sac" else {}
     learner = CLASSES[learner_name](
@@ -69,7 +69,7 @@ def build(learner_name: str, agents: int, num_envs: int, device: str, rollouts: 
 
     # fill the buffer with plausible data, through the learner's own record path
     torch.manual_seed(0)
-    for step in range(depth):
+    for step in range(steps):
         observations = torch.randn(num_envs, OBS_DIM, device=device)
         states = torch.randn(num_envs, STATE_DIM, device=device)
         actions, _ = learner.act(observations, states, timestep=step, timesteps=10_000)

@@ -32,38 +32,33 @@ def compute_gae(
     discount_factor: float,
     lambda_coefficient: float,
     time_limit_bootstrap: bool,
-    num_agents: int,
-    envs_per_agent: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GAE with **per-agent** advantage normalization.
 
-    Tensors are ``(rollout, total_envs, 1)`` with the env axis laid out
-    ``[agent 0 envs, agent 1 envs, ...]``. GAE runs per env over time; the advantages are then
-    standardized within each agent's block, so one agent's returns never shift another's
-    advantages (stock PPO normalizes globally).
+    Tensors are the memory's time view, ``(num_agents, steps, envs_per_agent, 1)``, and
+    ``last_values`` is ``(num_agents, envs_per_agent, 1)``. GAE runs per env over the step
+    axis; the advantages are then standardized within each agent's slab, so one agent's returns
+    never shift another's advantages (stock PPO normalizes globally).
     """
     advantage = 0
     advantages = torch.zeros_like(rewards)
     not_done = ((terminated | truncated) if time_limit_bootstrap else terminated).logical_not()
-    memory_size = rewards.shape[0]
+    steps = rewards.shape[1]
 
-    for i in reversed(range(memory_size)):
-        next_values = values[i + 1] if i < memory_size - 1 else last_values
+    for i in reversed(range(steps)):
+        next_values = values[:, i + 1] if i < steps - 1 else last_values
         advantage = (
-            rewards[i]
-            - values[i]
-            + discount_factor * not_done[i] * (next_values + lambda_coefficient * advantage)
+            rewards[:, i]
+            - values[:, i]
+            + discount_factor * not_done[:, i] * (next_values + lambda_coefficient * advantage)
         )
-        advantages[i] = advantage
+        advantages[:, i] = advantage
 
     returns = advantages + values
 
-    rollout = advantages.shape[0]
-    blocks = advantages.view(rollout, num_agents, envs_per_agent, -1)
-    mean = blocks.mean(dim=(0, 2), keepdim=True)
-    std = blocks.std(dim=(0, 2), keepdim=True)
-    advantages = ((blocks - mean) / (std + 1e-8)).view(rollout, num_agents * envs_per_agent, -1)
-    return returns, advantages
+    mean = advantages.mean(dim=(1, 2, 3), keepdim=True)
+    std = advantages.std(dim=(1, 2, 3), keepdim=True)
+    return returns, (advantages - mean) / (std + 1e-8)
 
 
 class PPO(LearnerBase):
@@ -163,15 +158,17 @@ class PPO(LearnerBase):
             return values
         return self.value_normalizer(values, train=train, inverse=inverse)
 
-    def normalize_value_block(self, values: torch.Tensor, train: bool = False, inverse: bool = False) -> torch.Tensor:
-        """Same, for a rollout-shaped ``(T, total_envs, 1)`` tensor (agent axis is dim 1)."""
+    def normalize_value_buffer(self, values: torch.Tensor, train: bool = False, inverse: bool = False) -> torch.Tensor:
+        """Same, for a stored ``(num_agents, capacity, 1)`` buffer tensor.
+
+        The memory stores each agent's rows contiguously, so flattening dims 0 and 1 already
+        gives the block order the normalizer expects.
+        """
         if self.value_normalizer is None:
             return values
-        rollout, envs, dim = values.shape
-        # env-major flattening puts every agent's rows together, which is what the normalizer wants
-        flat = values.permute(1, 0, 2).reshape(envs * rollout, dim)
-        out = self.value_normalizer(flat, train=train, inverse=inverse)
-        return out.view(envs, rollout, dim).permute(1, 0, 2)
+        agents, rows, dim = values.shape
+        out = self.value_normalizer(values.reshape(agents * rows, dim), train=train, inverse=inverse)
+        return out.view(agents, rows, dim)
 
     def _value_inputs(self, observations: torch.Tensor, states: torch.Tensor, *, train: bool = False) -> dict:
         if self._asymmetric:
@@ -260,21 +257,22 @@ class PPO(LearnerBase):
             last_values = self.normalize_values(last_values, inverse=True)
 
         values = self.memory.get_tensor_by_name("values")
+        # the time view is (num_agents, steps, envs_per_agent, 1): GAE walks the step axis
+        shape = values.shape
         returns, advantages = compute_gae(
-            rewards=self.memory.get_tensor_by_name("rewards"),
-            terminated=self.memory.get_tensor_by_name("terminated"),
-            truncated=self.memory.get_tensor_by_name("truncated"),
-            values=values,
-            last_values=last_values,
+            rewards=self.memory.time_view("rewards"),
+            terminated=self.memory.time_view("terminated"),
+            truncated=self.memory.time_view("truncated"),
+            values=self.memory.time_view("values"),
+            last_values=last_values.view(num_agents, self.memory.envs_per_agent, -1),
             discount_factor=self.cfg.discount_factor,
             lambda_coefficient=self.cfg.gae_lambda,
             time_limit_bootstrap=self.cfg.time_limit_bootstrap,
-            num_agents=num_agents,
-            envs_per_agent=self.memory.num_envs // num_agents,
         )
-        self.memory.set_tensor_by_name("values", self.normalize_value_block(values, train=True))
-        self.memory.set_tensor_by_name("returns", self.normalize_value_block(returns, train=True))
-        self.memory.set_tensor_by_name("advantages", advantages)
+        returns = returns.reshape(shape)
+        self.memory.set_tensor_by_name("values", self.normalize_value_buffer(values, train=True))
+        self.memory.set_tensor_by_name("returns", self.normalize_value_buffer(returns, train=True))
+        self.memory.set_tensor_by_name("advantages", advantages.reshape(shape))
 
         accumulated: Dict[str, List[torch.Tensor]] = {}
 

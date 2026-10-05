@@ -191,7 +191,7 @@ Fields for `architecture: simba`:
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |
-| `memory_size` | int | `1000000` | SAC replay capacity in transitions **per agent**; must be a multiple of the envs per agent. PPO's buffer is sized by `ppo.rollouts` instead |
+| `memory_size` | int | `1000000` | SAC replay capacity in transitions **per agent**, used exactly as given (any positive int). PPO's buffer is sized by `ppo.rollouts` instead: `rollouts * envs_per_agent` transitions per agent |
 
 ## losses
 

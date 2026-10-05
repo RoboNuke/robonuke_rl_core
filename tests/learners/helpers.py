@@ -92,7 +92,7 @@ def build_learner(
         learner, model_cfg, observation_space, state_space, action_space, num_agents, "cpu"
     )
     memory = MultiRandomMemory(
-        memory_size=rollout, num_envs=num_envs, num_agents=num_agents, device="cpu"
+        capacity=rollout * envs_per_agent, num_envs=num_envs, num_agents=num_agents, device="cpu"
     )
     extra = {"model_cfg": model_cfg} if learner == "sac" else {}
     instance = LEARNER_CLASSES[learner](
@@ -117,7 +117,7 @@ def build_learner(
 def fill_memory(learner, steps: int | None = None, seed: int = 1) -> None:
     """Write random transitions for every env, through the learner's own record path."""
     torch.manual_seed(seed)
-    steps = steps or learner.memory.memory_size
+    steps = steps or learner.memory.num_steps
     num_envs = learner.num_envs
     for step in range(steps):
         observations = torch.randn(num_envs, OBS_DIM)

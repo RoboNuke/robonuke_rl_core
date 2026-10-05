@@ -50,16 +50,14 @@ def assert_same(left, right, path: str = "") -> None:
 
 
 def make_extreme(learner, agent: int) -> None:
-    """Scale one agent's stored data far out of range; its envs only."""
-    low = agent * learner.envs_per_agent
-    high = low + learner.envs_per_agent
+    """Scale one agent's stored data far out of range; its own slab only."""
     memory = learner.memory
-    memory.get_tensor_by_name("rewards")[:, low:high] *= 1.0e6
+    memory.get_tensor_by_name("rewards")[agent] *= 1.0e6
     for name in ("observations", "next_observations"):
         if name in memory.tensors:
-            memory.get_tensor_by_name(name)[:, low:high] *= 1.0e3
+            memory.get_tensor_by_name(name)[agent] *= 1.0e3
     if "values" in memory.tensors:
-        memory.get_tensor_by_name("values")[:, low:high] *= 1.0e6
+        memory.get_tensor_by_name("values")[agent] *= 1.0e6
 
 
 def run_updates(learner, count: int = 3, seed: int = 7) -> None:
@@ -173,8 +171,7 @@ def test_ppo_kl_early_stop_drops_only_the_offending_agent():
     # the other agents' advantage scale is unaffected by agent 1's huge rewards
     advantages = learner.memory.get_tensor_by_name("advantages")
     for agent in UNTOUCHED:
-        low = agent * learner.envs_per_agent
-        block = advantages[:, low : low + learner.envs_per_agent]
+        block = advantages[agent]
         assert abs(float(block.mean())) < 1.0e-5
         assert abs(float(block.std()) - 1.0) < 0.2
 
