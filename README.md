@@ -148,7 +148,7 @@ Proximal Policy Optimization. The rollout buffer is `rollouts` steps per env;
 | `value_clip` | float | `0.2` | value clip around the stored value (0 disables) |
 | `entropy_loss_scale` | float | `0.0` | entropy bonus weight (0 disables the term) |
 | `value_loss_scale` | float | `1.0` | value-loss weight |
-| `kl_threshold` | float | `0.0` | per-agent KL early stop: an agent above this has its policy frozen (weights and Adam moments unchanged) for the rest of the epoch while the others continue; its critic keeps training (0 disables) |
+| `kl_threshold` | float | `0.0` | per-agent KL early stop: an agent above this is frozen — policy **and** critic, including the `value_update_ratio` passes (weights and Adam moments unchanged) — for the rest of the epoch while the others continue (0 disables) |
 | `time_limit_bootstrap` | bool | `False` | add `discount_factor * V(next)` to the reward on truncation |
 | `normalize_values` | bool | `True` | per-agent running normalization of values and returns |
 | `value_update_ratio` | int | `1` | extra value-only updates per minibatch after the combined update (1 = none) |

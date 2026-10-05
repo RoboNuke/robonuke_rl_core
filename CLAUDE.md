@@ -216,28 +216,76 @@ The LR schedule is `lr_at(update, total_updates, lr, lr_end, schedule)`: `consta
 
 ### Memory
 
-One memory class (`MultiRandomMemory`), unchanged by the vmap restructure. Batch sizes are
-**per agent**: `sample(batch_size=B)`
-returns `B * num_agents` rows as `[agent 0 | agent 1 | ...]`, drawn from each agent's own envs,
-and `sample_all` keeps that order so a block-parallel reshape routes each agent's rows to its
-own parameters. `memory.memory_size` is SAC's capacity in transitions **per agent**:
-`replay_depth(memory_size, envs_per_agent)` gives the per-env depth and raises unless
-`memory_size` is a multiple of the envs per agent. PPO's buffer is `ppo.rollouts` steps per env.
+One self-contained class (`MultiRandomMemory`) — no skrl base. Every registered name is one
+tensor of shape `(num_agents, capacity, dim)`, so an agent's transitions are a contiguous slab
+and nothing it samples can come from another agent's rows.
+
+* **Capacity** is transitions **per agent**, used exactly as given, for any positive integer
+  (no multiple-of rule). SAC passes `capacity=memory.memory_size`; PPO passes
+  `capacity=ppo.rollouts * envs_per_agent` and fills it exactly each rollout.
+* **Writing**: `add_samples(**tensors)` takes one env-step as `(num_envs, dim)` tensors in env
+  order and advances one shared pointer by `envs_per_agent` rows (every agent writes the same
+  number of rows per step, so one pointer is enough). When full it wraps, overwriting the
+  oldest rows uniformly per agent, mid-step if the capacity is not divisible.
+* **Row order**: row `step * envs_per_agent + env` within an agent's slab. `time_view(name)`
+  is the `(num_agents, steps, envs_per_agent, dim)` view this implies and is how PPO gets the
+  time axis GAE needs; it raises unless the capacity divides by the envs per agent.
+* **Sampling** is batched, never a Python loop over envs: `sample(batch_size=B)` draws
+  `torch.randint((num_agents, B))` and gathers, returning `B * num_agents` rows as
+  `[agent 0 | agent 1 | ...]` for the vmap reshape; `sample_all` permutes with one
+  `argsort(rand(num_agents, rows))` and splits into equal mini-batches, so every row is used
+  exactly once per pass and `mini_batches` must divide the stored rows. Draw shapes never
+  depend on the data, so the shared RNG stream cannot couple the agents.
+* Float tensors start as NaN: a row sampled before it is written shows up as a NaN loss instead
+  of a plausible zero.
 
 ### Emit a metric
 
-* **Env side:** put a `(num_envs,)` tensor in `infos["metrics_to_log"]`. The learner slices it
-  to each agent's envs and forwards it unchanged — no aggregation, no renaming. A wrong shape
-  raises; a missing key forwards nothing.
+Two env channels, both `(num_envs,)` tensors, both forwarded unchanged — no aggregation, no
+renaming. A wrong shape or a non-dict raises, naming the key; a missing key forwards nothing.
+
+* **Every step:** `infos["metrics_to_log"]`. The learner slices it to each agent's envs and
+  emits the `(envs_per_agent,)` slice.
+* **End of episode:** `infos["episode_metrics_to_log"]`. The learner masks the slice with that
+  step's `terminated | truncated` and emits the compacted `(k,)` tensor of the envs that
+  finished; an agent with none emits nothing, so an interval with no episodes publishes no
+  point (a gap, not a zero). Slots of envs that did not finish are never read, so an env may
+  leave anything there — there is no NaN convention.
 * **Learner side:** build a `(num_agents,)` tensor and call `emit_per_agent({name: value},
-  step)`. The name is free.
+  step)`. The name is free. `episode/return` and `episode/length` ride the episode channel as
+  the episodes end; `episode/count` comes once per write interval.
+
+The episode channel is the only host sync in the rollout path (compacting needs the count on
+the host), it happens once per step, and only while an `on_log` hook is attached.
+
+### Logging
+
+`logging.py` holds the whole logging layer; the learners only route.
+
+* `MetricAccumulator` keeps per `(agent, name)` sums on the device and counts on the host
+  between flushes, so no metric costs a GPU->CPU sync when it is emitted. `flush()` converts
+  the whole interval in one `tolist()` and returns the mean per agent, skipping any name whose
+  count is zero.
+* `WandbLogger` owns one wandb run per agent (`derived.run_names`, grouped by `wandb.group`,
+  with the resolved config attached) and is itself the `on_log` hook; `flush` is the `on_flush`
+  hook and `close()` finishes the runs. `wandb` is imported lazily, so the package imports
+  without it. Runs are created with `reinit="create_new"` and logged through their own
+  `run.log(data, step=...)` — never the global `wandb.log`, which with several live runs would
+  publish to whichever started last. A wandb older than `MIN_WANDB_VERSION` cannot keep N runs
+  alive, so the logger raises instead of merging the agents into one run.
+* The x-axis of every point is the global env timestep, and the publish cadence is the
+  learner's `trainer.write_interval` (one flush point, in `post_interaction`).
+* `wandb.mode` is `online`, `offline` or `disabled`; tests and debug runs use `disabled`.
 
 ### Hooks
 
 Both lists live on the learner and are **empty by default** (nothing is logged, no extra loss):
 
-* `on_log`: `fn(agent_idx: int, metrics: dict[str, Tensor], step: int)`. Env metrics arrive as
-  `(envs_per_agent,)` tensors, learner metrics as 0-d tensors.
+* `on_log`: `fn(agent_idx: int, metrics: dict[str, Tensor], step: int)`. Per-step env metrics
+  arrive as `(envs_per_agent,)` tensors, episode metrics as compacted `(k,)` tensors, learner
+  metrics as 0-d tensors.
+* `on_flush`: `fn(step: int)`, called once per `trainer.write_interval` right after the episode
+  flush. Where a logger publishes.
 * `aux_loss`: `fn(ctx: AuxLossContext) -> Tensor | None`, called for `ctx.target == "policy"`
   and `"critic"`. A returned tensor is added to that loss.
 
