@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from robonuke_rl_core.optim import BlockAdamW
-from robonuke_rl_core.models.cfg import SimbaActorCfg, SimbaCriticCfg, ModelCfg
+from robonuke_rl_core.models.cfg import SimbaActorCfg, SimbaCriticCfg, SimbaModelCfg
 from robonuke_rl_core.models.factory import MODEL_BUILDERS, build_models
 
 NUM_AGENTS = 3
@@ -19,15 +19,15 @@ OBS_DIM = 4
 STATE_DIM = 6
 ACT_DIM = 2
 ROWS = 5
-LEARNERS = sorted(MODEL_BUILDERS)
+LEARNERS = sorted({learner for _, learner in MODEL_BUILDERS})
 
 
 def box(dim: int) -> gymnasium.spaces.Box:
     return gymnasium.spaces.Box(low=-np.inf, high=np.inf, shape=(dim,), dtype=np.float32)
 
 
-def tiny_cfg() -> ModelCfg:
-    return ModelCfg(
+def tiny_cfg() -> SimbaModelCfg:
+    return SimbaModelCfg(
         actor=SimbaActorCfg(actor_n=1, actor_latent=8),
         critic=SimbaCriticCfg(critic_n=1, critic_latent=8),
     )
@@ -163,5 +163,18 @@ def test_asymmetric_critics_take_the_state_space(learner):
 
 def test_the_builders_cover_the_registered_learners():
     from robonuke_rl_core.learners.cfg import LEARNERS as CONFIGURED
+    from robonuke_rl_core.models.cfg import MODEL_ARCHITECTURES
 
-    assert set(MODEL_BUILDERS) == set(CONFIGURED)
+    # every (architecture, learner) pair has a builder
+    expected = {(arch, learner) for arch in MODEL_ARCHITECTURES for learner in CONFIGURED}
+    assert set(MODEL_BUILDERS) == expected
+
+
+def test_an_unknown_architecture_learner_pair_raises():
+    import dataclasses
+
+    cfg = tiny_cfg()
+    bad = dataclasses.replace(cfg, architecture="resnet")
+    with pytest.raises(ValueError) as err:
+        build_models("ppo", bad, box(OBS_DIM), None, box(ACT_DIM), 2, "cpu")
+    assert "resnet" in str(err.value) and "simba" in str(err.value)

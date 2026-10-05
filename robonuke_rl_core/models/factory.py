@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict
 from skrl.models.torch import Model
 
 from .simba import EnsembleActor, EnsembleQCritic, EnsembleValueCritic
-from .cfg import ModelCfg
+from .cfg import SimbaModelCfg
 
 __all__ = ["MODEL_BUILDERS", "build_models"]
 
@@ -23,7 +23,7 @@ def _kwargs(section: Any) -> dict:
     return dataclasses.asdict(section)
 
 
-def _build_sac(model_cfg: ModelCfg, obs_space, state_space, action_space, num_agents, device):
+def _build_sac(model_cfg: SimbaModelCfg, obs_space, state_space, action_space, num_agents, device):
     """Squashed-Gaussian actor + twin Q critics + their targets."""
     critic_space = state_space if state_space is not None else obs_space
 
@@ -51,7 +51,7 @@ def _build_sac(model_cfg: ModelCfg, obs_space, state_space, action_space, num_ag
     }
 
 
-def _build_ppo(model_cfg: ModelCfg, obs_space, state_space, action_space, num_agents, device):
+def _build_ppo(model_cfg: SimbaModelCfg, obs_space, state_space, action_space, num_agents, device):
     """Squashed-Gaussian actor + one state-value critic."""
     critic_space = state_space if state_space is not None else obs_space
     return {
@@ -72,7 +72,7 @@ def _build_ppo(model_cfg: ModelCfg, obs_space, state_space, action_space, num_ag
     }
 
 
-def _critic_kwargs(model_cfg: ModelCfg) -> dict:
+def _critic_kwargs(model_cfg: SimbaModelCfg) -> dict:
     critic = model_cfg.critic
     return {
         "critic_n": critic.critic_n,
@@ -82,31 +82,34 @@ def _critic_kwargs(model_cfg: ModelCfg) -> dict:
     }
 
 
-#: learner name -> builder. A new learner adds its entry here.
-MODEL_BUILDERS: Dict[str, Callable[..., Dict[str, Model]]] = {
-    "sac": _build_sac,
-    "ppo": _build_ppo,
+#: (architecture, learner) -> builder. A new architecture or learner adds its pairs here.
+MODEL_BUILDERS: Dict[tuple, Callable[..., Dict[str, Model]]] = {
+    ("simba", "sac"): _build_sac,
+    ("simba", "ppo"): _build_ppo,
 }
 
 
 def build_models(
     learner: str,
-    model_cfg: ModelCfg,
+    model_cfg,
     observation_space,
     state_space,
     action_space,
     num_agents: int,
     device,
 ) -> Dict[str, Model]:
-    """Build the networks ``learner`` needs.
+    """Build the networks ``learner`` needs, for ``model_cfg``'s architecture.
 
-    ``state_space`` not None means asymmetric actor-critic: the critic consumes the state
-    vector while the actor keeps the policy observation.
+    ``model_cfg`` is the loaded `model` section; its ``architecture`` field picks the
+    builder. ``state_space`` not None means asymmetric actor-critic: the critic consumes
+    the state vector while the actor keeps the policy observation.
     """
-    if learner not in MODEL_BUILDERS:
+    key = (model_cfg.architecture, learner)
+    if key not in MODEL_BUILDERS:
         raise ValueError(
-            f"no model builder for learner '{learner}'; known: {sorted(MODEL_BUILDERS)}"
+            f"no model builder for architecture '{model_cfg.architecture}' and learner "
+            f"'{learner}'; known pairs: {sorted(MODEL_BUILDERS)}"
         )
-    return MODEL_BUILDERS[learner](
+    return MODEL_BUILDERS[key](
         model_cfg, observation_space, state_space, action_space, num_agents, device
     )

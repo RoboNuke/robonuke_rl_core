@@ -36,7 +36,10 @@ Load order: class defaults and task defaults → most-base file → … → pass
 2. Check every leftover CLI arg is `a.b.c=value` and build that layer with `from_dotlist`.
 3. Per layer: reject `${...}` interpolation and `task.cfg.seed`, and record every
    `task.cfg` path the layer sets (`Config.task_overrides`). The last layer that sets
-   `task.name` wins (CLI included); raise if none does.
+   `task.name` wins (CLI included); raise if none does. `model.architecture` is picked the
+   same way (default `simba`); it selects which registered dataclass builds the `model`
+   node in step 4, so the YAML keys stay `model.actor.*` / `model.critic.*` while the
+   schema behind them is the chosen architecture's.
 4. Build the root: one `OmegaConf.structured` node per registered section plus
    `task: {name, cfg}` from the task's env cfg defaults, then `set_struct(True)` so unknown
    keys raise at every level.
@@ -178,14 +181,18 @@ The LR schedule is `lr_at(update, total_updates, lr, lr_end, schedule)`: `consta
    tensors as parameters. Everything else then works unchanged — `BlockAdamW`,
    `clip_grad_norm_per_agent`, and the per-agent checkpoint slices — because every stacked
    parameter has a leading agent dimension.
-4. Add a builder to `MODEL_BUILDERS` in `models/factory.py`, keyed by learner name. Critics
-   take `state_space` when it is not None (asymmetric actor-critic).
-5. Give the architecture **its own config group**: a new dataclass in `models/cfg.py`, named
-   after the architecture and added as a field on `ModelCfg`, with the paper linked in its
-   docstring — never extra fields mixed into another architecture's group. (`actor` /
-   `critic` are SimBa's groups: `SimbaActorCfg` / `SimbaCriticCfg`,
-   https://arxiv.org/abs/2410.09754.) Add the rows to the README under a line saying which
-   architecture they configure.
+4. Add a builder to `MODEL_BUILDERS` in `models/factory.py`, keyed by
+   `(architecture, learner)`. Critics take `state_space` when it is not None (asymmetric
+   actor-critic).
+5. Give the architecture **its own section class**: `<Arch>ModelCfg` in `models/cfg.py` —
+   an `architecture` field whose default is the architecture's name, plus its own actor /
+   critic dataclasses, with the paper linked in the docstring — registered with
+   `register_architecture("<arch>", <Arch>ModelCfg)`. Experiments select it with
+   `model.architecture: <arch>`; the YAML keys stay `model.actor.*` / `model.critic.*`,
+   and struct mode rejects another architecture's fields. SimBa is the default
+   (`SimbaModelCfg`, https://arxiv.org/abs/2410.09754). Add the README rows under a
+   "Fields for `architecture: <arch>`" table, and a config test like
+   `tests/config/test_model_architecture.py`'s swap test.
 6. Copy the tests: the slot-vs-plain-module equivalence in `tests/models/test_ensemble.py`
    (same outputs **and** same gradients), plus tests 1-3 of `tests/models/test_factory.py`
    (stacked-only parameters, independence on agent 1's rows, checkpoint slicing).

@@ -154,11 +154,17 @@ Proximal Policy Optimization. The rollout buffer is `rollouts` steps per env;
 
 ## model
 
-The networks: plain single-agent modules, stacked across agents with `torch.vmap`. The only
-architecture today is **SimBa** ([Lee et al., 2025](https://arxiv.org/abs/2410.09754)) —
-residual MLP blocks with LayerNorm — so every field below is SimBa-specific: `actor.*`
-configures the SimBa actor, `critic.*` the SimBa critics. A future architecture gets its own
-clearly named group in this section rather than extra fields in these two.
+The networks: plain single-agent modules, stacked across agents with `torch.vmap`. The keys
+are always `actor.*` and `critic.*`; `architecture` picks which architecture's fields sit
+behind them (the way `task.name` picks the env cfg), and another architecture's fields are
+rejected loudly. The only architecture today is **SimBa**
+([Lee et al., 2025](https://arxiv.org/abs/2410.09754)) — residual MLP blocks with LayerNorm.
+
+| field | type | default | what it does |
+| --- | --- | --- | --- |
+| `architecture` | str | `"simba"` | which registered architecture's dataclasses back `actor` / `critic`; the last layer that sets it wins |
+
+Fields for `architecture: simba`:
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |

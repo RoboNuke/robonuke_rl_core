@@ -17,7 +17,7 @@ from robonuke_rl_core.learners.cfg import PPOCfg, SACCfg, TrainerCfg
 from robonuke_rl_core.learners.ppo import PPO
 from robonuke_rl_core.learners.sac import SAC
 from robonuke_rl_core.memory.multi_random import MultiRandomMemory
-from robonuke_rl_core.models.cfg import SimbaActorCfg, SimbaCriticCfg, ModelCfg
+from robonuke_rl_core.models.cfg import SimbaActorCfg, SimbaCriticCfg, SimbaModelCfg
 from robonuke_rl_core.models.factory import build_models
 
 OBS_DIM = 4
@@ -26,8 +26,8 @@ ACT_DIM = 2
 LEARNER_CLASSES = {"sac": SAC, "ppo": PPO}
 
 
-def tiny_model_cfg() -> ModelCfg:
-    return ModelCfg(
+def tiny_model_cfg() -> SimbaModelCfg:
+    return SimbaModelCfg(
         actor=SimbaActorCfg(actor_n=1, actor_latent=8),
         critic=SimbaCriticCfg(critic_n=1, critic_latent=8),
     )

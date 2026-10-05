@@ -239,15 +239,21 @@ def load_from_run(run_dir: str | Path, overrides: Any = None) -> Config:
 
 
 def _build(layers: List[tuple]) -> Config:
-    # 3. the task name: the last layer that sets it wins. Also per layer: no interpolation,
-    #    no task.cfg.seed, and record every task.cfg path the layer sets.
+    # 3. the task name: the last layer that sets it wins. The model architecture is picked
+    #    the same way (default 'simba'); it decides which dataclasses sit behind
+    #    model.actor / model.critic in step 4. Also per layer: no interpolation, no
+    #    task.cfg.seed, and record every task.cfg path the layer sets.
     task_name = None
+    model_architecture = None  # (value, which layer set it)
     task_overrides: Dict[str, str] = {}
     for where, layer in layers:
         _reject_interpolation(OmegaConf.to_container(layer, resolve=False), where)
         name = OmegaConf.select(layer, "task.name")
         if name is not None:
             task_name = name
+        architecture = OmegaConf.select(layer, "model.architecture")
+        if architecture is not None:
+            model_architecture = (architecture, where)
         layer_task_cfg = OmegaConf.select(layer, "task.cfg")
         if layer_task_cfg is not None:
             if "seed" in layer_task_cfg:
@@ -265,6 +271,11 @@ def _build(layers: List[tuple]) -> Config:
     task_defaults = task_cfg_to_dict(env_cfg)
     root = OmegaConf.create({"task": {"name": MISSING, "cfg": task_defaults}})
     for name, cls in SECTIONS.items():
+        if name == "model" and model_architecture is not None:
+            try:
+                cls = model_cfg_class(model_architecture[0])
+            except ValueError as exc:
+                raise ValueError(f"config error from {model_architecture[1]}: {exc}") from exc
         root[name] = OmegaConf.structured(cls)
     OmegaConf.set_struct(root, True)
 
@@ -482,13 +493,13 @@ def load_from_args(args: argparse.Namespace, overrides: Any = None) -> Config:
 from .learners.cfg import PPOCfg, SACCfg, TrainerCfg  # noqa: E402
 from .losses.cfg import LossesCfg  # noqa: E402
 from .memory.cfg import MemoryCfg  # noqa: E402
-from .models.cfg import ModelCfg  # noqa: E402
+from .models.cfg import SimbaModelCfg, model_cfg_class  # noqa: E402
 
 register_section("experiment", ExperimentCfg)
 register_section("wandb", WandbCfg)
 register_section("trainer", TrainerCfg)
 register_section("sac", SACCfg)
 register_section("ppo", PPOCfg)
-register_section("model", ModelCfg)
+register_section("model", SimbaModelCfg)  # the default; model.architecture swaps it
 register_section("memory", MemoryCfg)
 register_section("losses", LossesCfg)
