@@ -624,20 +624,32 @@ python scripts/train.py --config examples/forge_exp.yaml --headless \
 Rerun or evaluate a past run: `--from_run <run_dir>` plus overrides. Exactly one of
 `--config` / `--from_run` is required.
 
-Entry script shape:
+Entry points: the real `main(argv=None, setup=None)` of train, eval and debug lives IN the
+package (`robonuke_rl_core/train.py`, `eval.py`, `debug.py`); this repo's `scripts/` are
+thin callers, and a project repo writes its own thin caller the same way. The `setup` hook
+runs **after** `AppLauncher` (so Isaac imports work) and **before** the config loads — it is
+where a project imports its tasks (`gym.register`) and registers its sections, losses,
+overlays and architectures. Everything a project registers goes inside `setup`, never at
+the script's module top, because task modules import Isaac Lab:
 
 ```python
-parser = argparse.ArgumentParser()
-add_config_args(parser)                       # --config / --from_run
-AppLauncher.add_app_launcher_args(parser)
-args, overrides = parser.parse_known_args()
-app_launcher = AppLauncher(args)              # start the sim app before loading the task
+from robonuke_rl_core.train import main
 
-register_section("controller", ControllerCfg)  # project sections, before loading
-cfg = load_from_args(args, overrides)
-env = gym.make(cfg.task_name, cfg=cfg.task_cfg)
-dump(cfg, run_dir, env.unwrapped.cfg)          # once, after the env exists
+def setup():
+    import my_project.tasks                     # gym.register, after the app is up
+    from robonuke_rl_core.config import register_section
+    from my_project.cfg import RewardCfg
+    register_section("reward", RewardCfg)       # project sections, before loading
+
+if __name__ == "__main__":
+    raise SystemExit(main(setup=setup))
 ```
+
+Inside `main`, the order is unchanged: parse args -> `AppLauncher` -> `setup()` ->
+`load_from_args` -> `prepare_task` -> `gym.make` -> `dump` (once, after the env exists) ->
+`build_env` -> models/learner/logger -> train. The package install is one editable clone
+shared by every project (`pip install -e`, see the README); it expects an Isaac Lab env
+(0.47.1 / Isaac Sim 5.1.0, Python 3.11) and brings its other dependencies itself.
 
 ## Test layout
 

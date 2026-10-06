@@ -14,6 +14,28 @@ Built area by area. Today: the config manager (`robonuke_rl_core/config.py`), th
 (`learners/`), the models (`models/`), the optimizer (`optim.py`), the memory (`memory/`) and
 the auxiliary losses (`losses/`).
 
+## Install
+
+The package assumes an **Isaac Lab environment is already installed** and documents what it
+was built against — it never installs Isaac Lab, torch or gymnasium itself:
+
+* Python 3.11, Isaac Lab **0.47.1**, Isaac Sim **5.1.0**, torch 2.7.0+cu128, gymnasium 1.2.1
+
+Install it **once, editable, from one clone** into that environment; every project then
+imports the same copy, and a `git pull` in the clone updates all of them (each run records
+`meta.pkg_commit`, so results stay attributable to a package state):
+
+```bash
+conda activate general
+pip install -e ~/robonuke_rl_core
+```
+
+The remaining dependencies (omegaconf, skrl, wandb, pandas, pyarrow, imageio) install
+automatically with the package. A project repo consuming the package starts from
+https://github.com/RoboNuke/robonuke_project_template ("Use this template"): its scripts call
+`robonuke_rl_core.train.main(setup=...)` and register the project's tasks and config sections
+in the `setup` hook.
+
 ## Running
 
 Run from the repo root, with the `general` conda env's interpreter (`conda activate general`,

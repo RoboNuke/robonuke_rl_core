@@ -6,8 +6,21 @@ build-backend = "setuptools.build_meta"
 name = "robonuke_rl_core"
 version = "0.1.0"
 description = "Shared RL core for Isaac Lab: config manager, models, skrl integration, training and eval."
-requires-python = ">=3.10"
-dependencies = ["pyyaml", "omegaconf"]
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "RoboNuke" }]
+# Only what an Isaac Lab environment does NOT already provide. Isaac Lab (and its
+# torch/gymnasium/numpy) must already be installed -- see README "Install". Built against
+# Isaac Lab 0.47.1 / Isaac Sim 5.1.0 / Python 3.11.
+dependencies = [
+    "pyyaml",
+    "omegaconf>=2.3",
+    "skrl>=2.1",
+    "wandb>=0.19.10",
+    "pandas",
+    "pyarrow",
+    "imageio[ffmpeg]",
+]
 
 [project.optional-dependencies]
 test = ["pytest"]
