@@ -16,14 +16,40 @@ from skrl.models.torch import Model
 from .simba import EnsembleActor, EnsembleQCritic, EnsembleValueCritic
 from .cfg import SimbaModelCfg
 
-__all__ = ["MODEL_BUILDERS", "build_models"]
+__all__ = ["MODEL_BUILDERS", "build_models", "actor_kwargs"]
 
 
 def _kwargs(section: Any) -> dict:
     return dataclasses.asdict(section)
 
 
-def _build_sac(model_cfg: SimbaModelCfg, obs_space, state_space, action_space, num_agents, device):
+def actor_kwargs(model_cfg, controller_cfg=None) -> dict:
+    """The actor's config fields plus whatever the action layout contributes.
+
+    The gated ``(pose, force)`` pairs ``selection_distribution: match`` conditions on are
+    **derived**, never configured: they follow from the controller's capabilities and its
+    ``force_axes`` mask, which is the same object that decides where the selection block
+    sits. An experiment that hand-wrote them could shift one index and silently gate the
+    wrong axis. No controller (or one with no selection block) contributes nothing, and an
+    actor asked for ``match`` then raises for want of pairs.
+    """
+    kwargs = _kwargs(model_cfg.actor)
+    if controller_cfg is None or not getattr(controller_cfg, "enabled", False):
+        return kwargs
+    from ..envs.interface import ActionLayout
+
+    layout = ActionLayout(controller_cfg)
+    if not layout.selection_dim:
+        return kwargs
+    kwargs["pos_component_dims"] = layout.pos_component_indices
+    kwargs["force_component_dims"] = layout.force_component_indices
+    kwargs["selection_names"] = layout.selection_axis_names
+    return kwargs
+
+
+def _build_sac(
+    model_cfg: SimbaModelCfg, obs_space, state_space, action_space, num_agents, device, actor
+):
     """Squashed-Gaussian actor + twin Q critics + their targets."""
     critic_space = state_space if state_space is not None else obs_space
 
@@ -42,7 +68,7 @@ def _build_sac(model_cfg: SimbaModelCfg, obs_space, state_space, action_space, n
             action_space=action_space,
             device=device,
             num_agents=num_agents,
-            **_kwargs(model_cfg.actor),
+            **actor,
         ),
         "critic_1": make_q(),
         "critic_2": make_q(),
@@ -51,7 +77,9 @@ def _build_sac(model_cfg: SimbaModelCfg, obs_space, state_space, action_space, n
     }
 
 
-def _build_ppo(model_cfg: SimbaModelCfg, obs_space, state_space, action_space, num_agents, device):
+def _build_ppo(
+    model_cfg: SimbaModelCfg, obs_space, state_space, action_space, num_agents, device, actor
+):
     """Squashed-Gaussian actor + one state-value critic."""
     critic_space = state_space if state_space is not None else obs_space
     return {
@@ -60,7 +88,7 @@ def _build_ppo(model_cfg: SimbaModelCfg, obs_space, state_space, action_space, n
             action_space=action_space,
             device=device,
             num_agents=num_agents,
-            **_kwargs(model_cfg.actor),
+            **actor,
         ),
         "value": EnsembleValueCritic(
             observation_space=critic_space,
@@ -97,12 +125,15 @@ def build_models(
     action_space,
     num_agents: int,
     device,
+    controller_cfg=None,
 ) -> Dict[str, Model]:
     """Build the networks ``learner`` needs, for ``model_cfg``'s architecture.
 
     ``model_cfg`` is the loaded `model` section; its ``architecture`` field picks the
     builder. ``state_space`` not None means asymmetric actor-critic: the critic consumes
-    the state vector while the actor keeps the policy observation.
+    the state vector while the actor keeps the policy observation. ``controller_cfg`` is the
+    loaded `controller` section when there is one: it is where the MATCH pairs and the
+    selection axis names come from (see :func:`actor_kwargs`).
     """
     key = (model_cfg.architecture, learner)
     if key not in MODEL_BUILDERS:
@@ -111,5 +142,11 @@ def build_models(
             f"'{learner}'; known pairs: {sorted(MODEL_BUILDERS)}"
         )
     return MODEL_BUILDERS[key](
-        model_cfg, observation_space, state_space, action_space, num_agents, device
+        model_cfg,
+        observation_space,
+        state_space,
+        action_space,
+        num_agents,
+        device,
+        actor_kwargs(model_cfg, controller_cfg),
     )

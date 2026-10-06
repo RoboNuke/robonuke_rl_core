@@ -44,8 +44,8 @@ class FakeLearner:
 class ActionSquaredLoss(AuxLoss):
     """A project-style loss: mean squared action magnitude, one value per agent.
 
-    The package ships no built-in loss (an action penalty belongs in the reward), so the
-    tests register this one themselves — which is also how a project does it.
+    An action penalty belongs in the env's reward, so the package does not ship this one;
+    the tests register it themselves, which is also how a project does it.
     """
 
     name = "action_squared"
@@ -287,11 +287,16 @@ def test_a_loss_must_declare_a_name_and_valid_targets():
             supported_targets = ("policy",)
 
 
-def test_the_package_ships_no_built_in_loss():
-    """An action-magnitude penalty belongs in the env reward, not in a policy-side term."""
+def test_the_only_built_in_loss_is_the_selection_supervision():
+    """The bar for shipping a loss: it must read a model output, not an env quantity.
+
+    An action-magnitude penalty is expressible as a reward, so it stays in the env (the
+    fixture's ``action_squared`` is a stand-in for a project's own). The supervised
+    selection loss is not: it names what a head of the network should output.
+    """
     known = dict(LOSSES)
     known.pop("action_squared")  # the fixture's own
-    assert known == {}
+    assert sorted(known) == ["supervised_selection"]
 
 
 def test_a_loss_reading_a_field_its_target_does_not_set_raises():
@@ -400,3 +405,132 @@ def test_an_unknown_field_in_a_term_raises(tmp_path, fake_task):
             path, ['losses.terms=[{name: action_squared, target: policy, weight: 0.1, scale: 2}]']
         )
     assert "scale" in str(err.value)
+
+
+# ------------------------------------------------------------------ the selection loss
+#  BCE between the actor's probability of FORCE control and whether the axis is in contact.
+AXES = 3
+
+
+def selection_ctx(learner, probability, contact, step: int = 5) -> LossContext:
+    return LossContext(
+        learner=learner,
+        target="policy",
+        step=step,
+        policy_outputs={"selection_prob": probability},
+        sampled={"in_contact": contact},
+    )
+
+
+def selection_loss(**kwargs):
+    from robonuke_rl_core.losses.losses import SupervisedSelectionLoss
+
+    return SupervisedSelectionLoss(**{"num_axes": AXES, **kwargs})
+
+
+def test_the_selection_loss_is_the_bce_against_the_contact_flags():
+    learner = FakeLearner()
+    torch.manual_seed(0)
+    probability = torch.rand(NUM_AGENTS * ROWS, AXES)
+    contact = (torch.rand(NUM_AGENTS * ROWS, AXES) > 0.5).float()
+
+    value = selection_loss().compute(selection_ctx(learner, probability, contact))
+    expected = torch.nn.functional.binary_cross_entropy(
+        probability, contact, reduction="none"
+    ).view(NUM_AGENTS, -1).mean(dim=-1)
+    assert value.shape == (NUM_AGENTS,)
+    assert torch.allclose(value, expected, atol=1e-6)
+
+
+def test_a_perfect_prediction_costs_almost_nothing_and_a_wrong_one_costs_a_lot():
+    learner = FakeLearner()
+    contact = torch.tensor([[1.0, 0.0, 1.0]]).expand(NUM_AGENTS * ROWS, AXES).contiguous()
+    right = selection_loss().compute(selection_ctx(learner, contact.clone(), contact))
+    wrong = selection_loss().compute(selection_ctx(learner, 1.0 - contact, contact))
+    # clamped at 1e-7, so neither is infinite and the ordering is the whole point
+    assert float(right.max()) < 1.0e-6
+    assert float(wrong.min()) > 10.0
+    assert torch.isfinite(wrong).all()
+
+
+def test_the_selection_loss_is_per_agent():
+    """Agent 1's contacts must not move agent 0's or agent 2's value."""
+    learner = FakeLearner()
+    torch.manual_seed(1)
+    probability = torch.rand(NUM_AGENTS * ROWS, AXES)
+    contact = (torch.rand(NUM_AGENTS * ROWS, AXES) > 0.5).float()
+    before = selection_loss().compute(selection_ctx(learner, probability, contact))
+
+    extreme = contact.clone()
+    extreme[ROWS : 2 * ROWS] = 1.0 - extreme[ROWS : 2 * ROWS]
+    after = selection_loss().compute(selection_ctx(learner, probability, extreme))
+    assert torch.equal(before[[0, 2]], after[[0, 2]])
+    assert not torch.equal(before[1], after[1])
+
+
+def test_the_gradient_reaches_the_probability_and_only_the_right_rows():
+    learner = FakeLearner()
+    probability = torch.full((NUM_AGENTS * ROWS, AXES), 0.5, requires_grad=True)
+    contact = torch.zeros(NUM_AGENTS * ROWS, AXES)
+    contact[0, 0] = 1.0
+    selection_loss().compute(selection_ctx(learner, probability, contact)).sum().backward()
+    # pushing toward force where there is contact, away from it elsewhere
+    assert float(probability.grad[0, 0]) < 0.0
+    assert float(probability.grad[0, 1]) > 0.0
+
+
+def test_the_selection_loss_declares_what_it_needs_from_the_memory():
+    assert selection_loss().required_memory_keys() == {"in_contact": AXES}
+    assert selection_loss(num_axes=6).required_memory_keys() == {"in_contact": 6}
+    with pytest.raises(ValueError, match="num_axes"):
+        selection_loss(num_axes=0)
+
+
+def test_build_aux_losses_carries_the_memory_keys_to_the_learner():
+    aux = build_aux_losses(
+        LossesCfg(
+            terms=[
+                LossTermCfg(
+                    name="supervised_selection",
+                    target="policy",
+                    weight=1.0,
+                    kwargs={"num_axes": AXES},
+                )
+            ]
+        ),
+        NUM_AGENTS,
+    )
+    assert aux.memory_keys == {"in_contact": AXES}
+    # and a config with no term at all still asks for nothing
+    assert build_aux_losses(LossesCfg(terms=[]), NUM_AGENTS) is None
+
+
+def test_a_missing_contact_tensor_says_how_to_make_it_appear():
+    learner = FakeLearner()
+    probability = torch.rand(NUM_AGENTS * ROWS, AXES)
+    ctx = LossContext(
+        learner=learner, target="policy", policy_outputs={"selection_prob": probability}
+    )
+    with pytest.raises(RuntimeError) as err:
+        selection_loss().compute(ctx)
+    assert "in_contact" in str(err.value) and "required_memory_keys" in str(err.value)
+
+
+def test_a_policy_without_a_selection_head_says_so():
+    learner = FakeLearner()
+    ctx = LossContext(
+        learner=learner,
+        target="policy",
+        policy_outputs={"selection_prob": None},
+        sampled={"in_contact": torch.zeros(NUM_AGENTS * ROWS, AXES)},
+    )
+    with pytest.raises(RuntimeError, match="bernoulli_action_dims"):
+        selection_loss().compute(ctx)
+
+
+def test_a_width_mismatch_names_both_widths():
+    learner = FakeLearner()
+    probability = torch.rand(NUM_AGENTS * ROWS, AXES)
+    contact = torch.zeros(NUM_AGENTS * ROWS, 2)
+    with pytest.raises(ValueError, match="num_axes"):
+        selection_loss().compute(selection_ctx(learner, probability, contact))

@@ -857,6 +857,7 @@ def build_eval_policy(
         raise ValueError(f"cannot evaluate learner {learner_name!r}; known: {sorted(LEARNERS)}")
 
     state_space = env.state_space
+    controller_cfg = getattr(cfg, "controller", None)
     models = build_models(
         learner_name,
         cfg.model,
@@ -865,8 +866,13 @@ def build_eval_policy(
         env.action_space,
         1,  # one agent
         env.device,
+        controller_cfg,
     )
-    extra = {"model_cfg": cfg.model} if learner_name == "sac" else {}
+    extra = (
+        {"model_cfg": cfg.model, "controller_cfg": controller_cfg}
+        if learner_name == "sac"
+        else {}
+    )
     learner = classes[learner_name](
         models=models,
         memory=None,  # eval stores nothing in a replay buffer

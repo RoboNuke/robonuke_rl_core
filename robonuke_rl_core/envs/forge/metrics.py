@@ -59,6 +59,7 @@ class ForgeTaskMetricsWrapper(gym.Wrapper):
         self.num_envs = int(unwrapped.num_envs)
 
         self._terms: Dict[str, torch.Tensor] = {}
+        self._unloggable: set = set()
         self._successes: Optional[torch.Tensor] = None
         self._prediction: Optional[torch.Tensor] = None
 
@@ -96,11 +97,32 @@ class ForgeTaskMetricsWrapper(gym.Wrapper):
         return unwrapped._get_curr_successes(success_threshold=threshold, check_rot=False)
 
     def step_metrics(self, dtype: torch.dtype) -> Dict[str, torch.Tensor]:
-        """Per-step, per-env: the reward decomposition."""
-        return {
-            f"reward/{name}": value.reshape(self.num_envs).to(dtype)
-            for name, value in self._terms.items()
-        }
+        """Per-step, per-env: the reward decomposition.
+
+        A term is normally one value per env, but a task is free to publish one that is
+        already reduced (a scalar) or that carries trailing dimensions. Both are useful to
+        log, so a scalar is broadcast to every env and trailing dimensions are averaged; a
+        term that is neither is named once and skipped rather than crashing a training run
+        over a logging detail.
+        """
+        out: Dict[str, torch.Tensor] = {}
+        for name, value in self._terms.items():
+            flat = value.reshape(value.shape[0], -1) if value.dim() > 1 else value.reshape(-1)
+            if flat.dim() > 1 and flat.shape[0] == self.num_envs:
+                out[f"reward/{name}"] = flat.mean(dim=1).to(dtype)
+            elif flat.numel() == self.num_envs:
+                out[f"reward/{name}"] = flat.to(dtype)
+            elif flat.numel() == 1:
+                # the task reduced it already: the same number for every env
+                out[f"reward/{name}"] = flat.reshape(()).expand(self.num_envs).to(dtype)
+            elif name not in self._unloggable:
+                self._unloggable.add(name)
+                print(
+                    f"[task-metrics] reward term {name!r} is {tuple(value.shape)}, neither "
+                    f"per-env ({self.num_envs}) nor scalar: not logged",
+                    flush=True,
+                )
+        return out
 
     def episode_metrics(self, terminated, truncated, dtype: torch.dtype) -> Dict[str, torch.Tensor]:
         """Per-episode, per-env: outcome, timing, cause and prediction quality."""

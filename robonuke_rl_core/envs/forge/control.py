@@ -1,12 +1,16 @@
 """The controller core: one torque path for pose, force, and anything between.
 
-    tau = J^T [ S (K e_pose - D v) + (I - S) K_f (f_d - f) ] + nullspace
+    tau = J^T [ (I - S) (K e_pose - D v) + S K_f (f_d - f) ] + nullspace
 
 Ported from Factory's ``factory_control`` (the pose branch, the dead zone and the nullspace,
 op for op) and from the hybrid force/position wrapper in
-RoboNuke/generalized_hybrid_vic_action_space (the force branch). ``S`` multiplies the pose
-branch, so ``S = I`` with ``f_d = 0`` is exactly Factory's own controller — which is what the
-parity test in ``tests/envs/GPU`` checks, and why pose control does not need a separate path.
+RoboNuke/generalized_hybrid_vic_action_space (the force branch).
+
+**``S`` selects FORCE.** ``S = 1`` on an axis means that axis is force-controlled and ``S = 0``
+means position-controlled — one convention, everywhere in this package: the policy's selection
+bit, the action vector, the metrics and this matrix all say "1 is force". So ``S = 0`` with
+``f_d = 0`` is exactly Factory's own controller, which is what the parity test in
+``tests/envs/GPU`` checks, and why pose control does not need a separate path.
 
 Isaac Lab's own quaternion helpers are used for the pose error rather than reimplemented: the
 parity gate is only meaningful if the error term is computed the same way, down to the
@@ -82,7 +86,7 @@ def force_wrench(
 
 def unified_wrench(
     *,
-    selection: torch.Tensor,
+    force_selection: torch.Tensor,
     delta_pose: torch.Tensor,
     linvel: torch.Tensor,
     angvel: torch.Tensor,
@@ -92,17 +96,22 @@ def unified_wrench(
     force_measured: Optional[torch.Tensor] = None,
     force_gains: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``S (K e - D v) + (I - S) K_f (f_d - f)`` for a diagonal ``S``.
+    """``(I - S) (K e - D v) + S K_f (f_d - f)`` for a diagonal ``S``.
 
-    ``S`` is ``(num_envs, 6)`` of 0/1 with 1 meaning position-controlled, so the whole
-    expression is linear in it and the degenerate cases are exact rather than approximate:
-    ``S = I`` leaves the impedance term alone, ``S = 0`` leaves the force term alone.
+    ``force_selection`` is ``S``: ``(num_envs, 6)`` of 0/1 with **1 meaning force-controlled**.
+    The whole expression is linear in it, so the degenerate cases are exact rather than
+    approximate: ``S = 0`` leaves the impedance term alone, ``S = I`` leaves the force term
+    alone. The argument is named rather than positional, and was renamed when the convention
+    was fixed, so a caller that still means the old sense fails with a TypeError instead of
+    inverting every axis in silence.
     """
-    wrench = selection * pose_wrench(delta_pose, linvel, angvel, stiffness, damping)
+    wrench = (1.0 - force_selection) * pose_wrench(
+        delta_pose, linvel, angvel, stiffness, damping
+    )
     if force_target is not None:
         if force_measured is None or force_gains is None:
             raise ValueError("the force branch needs force_measured and force_gains too")
-        wrench = wrench + (1.0 - selection) * force_wrench(
+        wrench = wrench + force_selection * force_wrench(
             force_target, force_measured, force_gains
         )
     return wrench

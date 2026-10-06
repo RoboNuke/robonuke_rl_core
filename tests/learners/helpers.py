@@ -62,11 +62,17 @@ def build_learner(
     run_dirs_list=None,
     trainer_overrides: Dict[str, Any] | None = None,
     model_overrides: Dict[str, Any] | None = None,
+    controller_cfg: Any = None,
+    action_dim: int = ACT_DIM,
+    aux_loss=None,
     **cfg_overrides,
 ):
     """A learner with tiny networks and an empty memory of depth ``rollout``.
 
-    ``model_overrides`` sets fields on the actor cfg (e.g. ``bernoulli_action_dims``).
+    ``model_overrides`` sets fields on the actor cfg (e.g. ``bernoulli_action_dims``);
+    ``controller_cfg`` is what the model factory derives the MATCH pairs and the selection
+    axis names from. ``aux_loss`` hooks are appended **before** ``init()``, which is the only
+    point at which their ``memory_keys`` can still become memory tensors.
     """
     torch.manual_seed(0)
     num_envs = num_agents * envs_per_agent
@@ -82,19 +88,28 @@ def build_learner(
 
     observation_space = box(OBS_DIM)
     state_space = box(STATE_DIM) if asymmetric else None
-    action_space = box(ACT_DIM)
+    action_space = box(action_dim)
     model_cfg = tiny_model_cfg()
     for key, value in (model_overrides or {}).items():
         if not hasattr(model_cfg.actor, key):
             raise AttributeError(f"actor cfg has no field '{key}'")
         setattr(model_cfg.actor, key, value)
     models = build_models(
-        learner, model_cfg, observation_space, state_space, action_space, num_agents, "cpu"
+        learner,
+        model_cfg,
+        observation_space,
+        state_space,
+        action_space,
+        num_agents,
+        "cpu",
+        controller_cfg,
     )
     memory = MultiRandomMemory(
         capacity=rollout * envs_per_agent, num_envs=num_envs, num_agents=num_agents, device="cpu"
     )
-    extra = {"model_cfg": model_cfg} if learner == "sac" else {}
+    extra = (
+        {"model_cfg": model_cfg, "controller_cfg": controller_cfg} if learner == "sac" else {}
+    )
     instance = LEARNER_CLASSES[learner](
         models=models,
         memory=memory,
@@ -109,13 +124,19 @@ def build_learner(
         run_dirs=run_dirs_list,
         **extra,
     )
+    for hook in aux_loss or []:
+        instance.aux_loss.append(hook)
     instance.init()
     instance.enable_training_mode(True)
     return instance
 
 
-def fill_memory(learner, steps: int | None = None, seed: int = 1) -> None:
-    """Write random transitions for every env, through the learner's own record path."""
+def fill_memory(learner, steps: int | None = None, seed: int = 1, infos_fn=None) -> None:
+    """Write random transitions for every env, through the learner's own record path.
+
+    ``infos_fn(step, num_envs)`` supplies the step's ``infos`` when a loss or a metric needs
+    something in it; the default is an empty dict.
+    """
     torch.manual_seed(seed)
     steps = steps or learner.memory.num_steps
     num_envs = learner.num_envs
@@ -140,7 +161,7 @@ def fill_memory(learner, steps: int | None = None, seed: int = 1) -> None:
             next_states=next_states,
             terminated=terminated,
             truncated=truncated,
-            infos={},
+            infos={} if infos_fn is None else infos_fn(step, num_envs),
             timestep=step,
             timesteps=100,
         )

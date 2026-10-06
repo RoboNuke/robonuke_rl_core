@@ -22,8 +22,8 @@ controller:
   enabled: true
   use_pose: true
   use_force: true
-  # hybrid on the translation axes only; orientation stays position-controlled
-  force_axes: [1, 1, 1, 0, 0, 0]
+  # force_axes defaults to [1, 1, 1, 0, 0, 0]: hybrid on the translation axes only,
+  # orientation always position-controlled
   gain_mapping: variable_diagonal
 
 model:

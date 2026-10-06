@@ -73,6 +73,9 @@ def main(argv=None, setup=None) -> int:
     total_envs = env.num_envs
     # asymmetric actor-critic when the env advertises a state space
     state_space = env.state_space
+    # the controller section, when the project registered one: the actor's MATCH pairs and
+    # the selection axis names are derived from its action layout, never configured
+    controller_cfg = getattr(cfg, "controller", None)
     models = build_models(
         learner_name,
         cfg.model,
@@ -81,6 +84,7 @@ def main(argv=None, setup=None) -> int:
         env.action_space,
         num_agents,
         env.device,
+        controller_cfg,
     )
 
     # transitions per agent: PPO holds one rollout, SAC holds what the config asks for
@@ -93,7 +97,11 @@ def main(argv=None, setup=None) -> int:
         capacity=capacity, num_envs=total_envs, num_agents=num_agents, device=env.device
     )
 
-    extra = {"model_cfg": cfg.model} if learner_name == "sac" else {}
+    extra = (
+        {"model_cfg": cfg.model, "controller_cfg": controller_cfg}
+        if learner_name == "sac"
+        else {}
+    )
     learner = learners[learner_name](
         models=models,
         memory=memory,

@@ -68,11 +68,16 @@ def native_torque(env, target_pos, target_quat):
 
 
 def ours(env, target_pos, target_quat, selection=None, interface=None):
-    """The unified controller, pose-only unless the caller says otherwise."""
+    """The unified controller, pose-only unless the caller says otherwise.
+
+    Pose-only is ``S = 0``: the selection selects FORCE, so an all-zero mask is pure
+    impedance control, which is the configuration this file compares against Isaac Lab's own
+    ``compute_dof_torque``.
+    """
     unwrapped = env.unwrapped
     rows = unwrapped.num_envs
     if selection is None:
-        selection = torch.ones((rows, 6), device=unwrapped.device)
+        selection = torch.zeros((rows, 6), device=unwrapped.device)
 
     delta_pose = control.pose_error(
         unwrapped.fingertip_midpoint_pos,
@@ -81,7 +86,7 @@ def ours(env, target_pos, target_quat, selection=None, interface=None):
         target_quat,
     )
     wrench = control.unified_wrench(
-        selection=selection,
+        force_selection=selection,
         delta_pose=delta_pose,
         linvel=unwrapped.fingertip_midpoint_linvel,
         angvel=unwrapped.fingertip_midpoint_angvel,
@@ -168,7 +173,7 @@ def test_the_dead_zone_and_nullspace_are_what_make_it_match(gpu_env):
 
 # ------------------------------------------------------------------ the force branch
 def test_the_force_branch_only_acts_where_the_selection_releases_an_axis(gpu_env):
-    """(I - S) K_f (f_d - f): an axis with S = 1 is untouched by any force target."""
+    """``S K_f (f_d - f)``: an axis with S = 0 is untouched by any force target."""
     unwrapped = gpu_env.unwrapped
     rows = unwrapped.num_envs
     target_pos, target_quat = a_target(gpu_env)
@@ -190,19 +195,21 @@ def test_the_force_branch_only_acts_where_the_selection_releases_an_axis(gpu_env
     big_target = torch.full((rows, 6), 25.0, device=unwrapped.device)
 
     all_position = control.unified_wrench(
-        selection=torch.ones((rows, 6), device=unwrapped.device),
+        force_selection=torch.zeros((rows, 6), device=unwrapped.device),
         force_target=big_target,
         **kwargs,
     )
     pose_only = control.unified_wrench(
-        selection=torch.ones((rows, 6), device=unwrapped.device), **kwargs
+        force_selection=torch.zeros((rows, 6), device=unwrapped.device), **kwargs
     )
-    assert torch.equal(all_position, pose_only)  # S = I ignores the force branch entirely
+    assert torch.equal(all_position, pose_only)  # S = 0 ignores the force branch entirely
 
-    # release z, keep the rest: only the z component may change
-    selection = torch.ones((rows, 6), device=unwrapped.device)
-    selection[:, 2] = 0.0
-    hybrid = control.unified_wrench(selection=selection, force_target=big_target, **kwargs)
+    # release z to the force law, keep the rest: only the z component may change
+    selection = torch.zeros((rows, 6), device=unwrapped.device)
+    selection[:, 2] = 1.0
+    hybrid = control.unified_wrench(
+        force_selection=selection, force_target=big_target, **kwargs
+    )
     assert torch.allclose(hybrid[:, [0, 1, 3, 4, 5]], pose_only[:, [0, 1, 3, 4, 5]])
     expected_z = 0.5 * (25.0 - unwrapped.force_sensor_smooth[:, 2])
     assert torch.allclose(hybrid[:, 2], expected_z, rtol=1e-5, atol=1e-5)
@@ -210,16 +217,20 @@ def test_the_force_branch_only_acts_where_the_selection_releases_an_axis(gpu_env
 
 # ------------------------------------------------------------------ the wrapper
 @pytest.mark.parametrize(
-    "use_pose, use_force, mapping",
+    "use_pose, use_force, mapping, force_axes",
     [
-        (True, False, "constant"),
-        (True, False, "variable_diagonal"),
-        (False, True, "constant"),
-        (True, True, "constant"),
-        (True, True, "variable_diagonal"),
+        (True, False, "constant", None),
+        (True, False, "variable_diagonal", None),
+        # force-only needs every axis force-eligible; the default mask is the 3-D hybrid
+        (False, True, "constant", [1, 1, 1, 1, 1, 1]),
+        (True, True, "constant", None),  # the default 3-D hybrid
+        (True, True, "variable_diagonal", None),
+        (True, True, "constant", [1, 1, 1, 1, 1, 1]),  # 6-D hybrid
     ],
 )
-def test_the_wrapper_runs_every_branch_combination(gpu_cfg, gpu_env, use_pose, use_force, mapping):
+def test_the_wrapper_runs_every_branch_combination(
+    gpu_cfg, gpu_env, use_pose, use_force, mapping, force_axes
+):
     """Attach, step, check the torques are finite — then put the env back as it was.
 
     The GPU suite shares one env (Isaac Lab hangs on a second), and this wrapper patches the
@@ -233,9 +244,12 @@ def test_the_wrapper_runs_every_branch_combination(gpu_cfg, gpu_env, use_pose, u
         unwrapped.generate_ctrl_signals,
         int(unwrapped.cfg.action_space),
     )
-    cfg = ControllerCfg(
+    fields = dict(
         enabled=True, use_pose=use_pose, use_force=use_force, gain_mapping=mapping
     )
+    if force_axes is not None:
+        fields["force_axes"] = force_axes
+    cfg = ControllerCfg(**fields)
     wrapper = ForgeControllerWrapper(gpu_env.unwrapped, cfg, gpu_cfg.task_name)
     try:
         expected = ActionInterface(cfg).action_dim
@@ -250,6 +264,11 @@ def test_the_wrapper_runs_every_branch_combination(gpu_cfg, gpu_env, use_pose, u
             assert torch.isfinite(unwrapped.joint_torque).all()
             assert torch.isfinite(unwrapped.applied_wrench).all()
             assert float(unwrapped.joint_torque.abs().max()) <= control.TORQUE_LIMIT
+            if wrapper.layout.selection_dim:
+                # the convention reaches the torque law: the bits the policy set as +1 are
+                # the axes the wrapper is force-controlling
+                chosen = (actions[:, wrapper.layout.selection_slice] > 0.0).float()
+                assert torch.equal(wrapper._selection[:, wrapper.layout.force_axes], chosen)
     finally:
         unwrapped._pre_physics_step, unwrapped.generate_ctrl_signals, action_space = before
         unwrapped.cfg.action_space = action_space

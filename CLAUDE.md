@@ -207,22 +207,75 @@ The LR schedule is `lr_at(update, total_updates, lr, lr_end, schedule)`: `consta
    (same outputs **and** same gradients), plus tests 1-3 of `tests/models/test_factory.py`
    (stacked-only parameters, independence on agent 1's rows, checkpoint slicing).
 
+### The hybrid selection: two distribution styles
+
+A policy with a controller selection block emits one Bernoulli bit per force-eligible axis
+alongside the continuous dims. `model.actor.selection_distribution` says how those form **one**
+distribution, and both styles live in the same `EnsembleActor`:
+
+* **`product`** (the default, and what every run before MATCH used) — independent:
+  `log p = Σ_i log p_cont(a_i) + Σ_k log p_bern(s_k)`, entropy per dim. Its expression is kept
+  exactly as it was, because re-ordering the float summation moves the result by ~2e-6 and
+  `tests/models/test_match.py`'s first test asserts it with `torch.equal`. Do not refactor the
+  two styles into one path.
+* **`match`** — conditional (MATCH): each bit `s_k` names a `(pose_k, force_k)` pair of
+  continuous dims and only the **selected** member is a random variable, because the other is a
+  controller input the env ignores on that axis:
+
+  `log p = Σ_{i free} log p_i + Σ_k [ s_k log p_{force_k} + (1 - s_k) log p_{pose_k} ] + Σ_k log p_bern(s_k)`
+
+  and, since a mixture is not a per-dim quantity, `get_entropy` returns one column:
+
+  `H = Σ_{i free} H_i + Σ_k [ (1 - p_k) H_{pose_k} + p_k H_{force_k} ] + Σ_k H_bern(s_k)`
+
+**A bit of 1 is `S = 1`, which is force control**, so the force member is the live one there —
+the same convention as the controller, which is why `p_k` is directly "how likely is this axis
+to be force-controlled" and `outputs["selection_prob"]` is what both the supervised loss and
+the logs read, with no complement anywhere
+(`models/simba.py`, `SELECTION_BIT_IS_FORCE`).
+`tests/models/test_match.py::test_the_gate_agrees_with_the_controller_s_selection_matrix` pins
+the actor against `ActionInterface.split` itself rather than a hand-written expectation, so an
+inverted sign anywhere in the chain fails there.
+
+`selection_init_bias` lands on the selection logit **as written**: `-2.2` is ~10% force, i.e.
+~90% position-dominant at init, which is what an experiment wants.
+
+**The pair indices are derived, never configured.** `ActionLayout.pos_component_indices` is
+`[pose_slice.start + axis for axis in force_axes]` (the pose block is the env's own action
+vector, so an axis index *is* its offset) and `force_component_indices` is the force block,
+which is packed in `force_axes` order. `models/factory.actor_kwargs` passes both, plus
+`selection_axis_names` for the logs, whenever the controller has a selection block; without one,
+`match` raises for want of pairs. An experiment that hand-wrote them could shift one index and
+gate the wrong axis in silence.
+
 ### Add a loss
 
 1. Subclass `AuxLoss` in the project, set `name` and `supported_targets`, implement
    `compute(ctx)`, and decorate it with `@register_loss`, at import time and before the config
-   is loaded. **The package ships no built-in loss**: a penalty on action magnitude belongs in
-   the env's reward, not in a policy-side term.
+   is loaded. The package ships **one** loss, `supervised_selection`, and the bar it had to
+   clear is the rule: a term that could be written as a reward (a penalty on action magnitude,
+   say) belongs in the env's reward, not in a policy-side term. That one cannot — it supervises
+   a head of the network against a per-transition fact.
 2. `compute` returns **one raw value per agent**, shape `(num_agents,)`. Reshape a flat
    `(num_agents * rows, ...)` tensor with `.view(ctx.learner.num_agents, -1)` first.
    **Never average across agents inside `compute`** — `build_aux_losses` applies the fixed
    `1/num_agents` weight, and an average inside the loss would make one agent's data scale
    another's gradient.
-3. Add a term to the experiment YAML (`losses.terms`), with `kwargs` for the constructor. No
+3. **Needs something stored per transition?** Override `required_memory_keys()` to return
+   `{name: width}`. `build_aux_losses` merges them onto the hook as `memory_keys`; the learner
+   creates each as a float tensor in `_create_memory_tensors`, fills it from the top-level
+   `infos[name]` in `record_transition` (`aux_memory_values` checks the shape and raises), and
+   it comes back in `ctx.sampled[name]`. The read is at `init()` time, so the hook must be in
+   `learner.aux_loss` **before** the trainer calls `init()` — `robonuke_rl_core/train.py`
+   appends it there; a hook added later gets no tensor and the loss raises by name through
+   `AuxLoss.sampled`.
+4. Add a term to the experiment YAML (`losses.terms`), with `kwargs` for the constructor. No
    new config fields are needed, so nothing to add to the README except a row in its built-in
    loss table for a package loss.
-4. Copy tests 7-8 of `tests/losses/test_losses.py`: the weighted total and the per-agent
-   values, and independence under a change to agent 1's data.
+5. Copy tests 7-8 of `tests/losses/test_losses.py`: the weighted total and the per-agent
+   values, and independence under a change to agent 1's data. A loss with memory keys also
+   needs the end-to-end pass of `tests/learners/test_match_integration.py`: the tensor is
+   created, filled, sampled, and the update moves the weights.
 
 ### Memory
 
@@ -265,6 +318,15 @@ renaming. A wrong shape or a non-dict raises, naming the key; a missing key forw
   step)`. The name is free. `episode/return` and `episode/length` ride the episode channel as
   the episodes end; `episode/count` comes once per write interval.
 
+The hybrid selection is logged from both ends, on purpose: `LearnerBase.emit_selection` (called
+from each learner's `act`) publishes `selection/p_force_<axis>`, the policy's own probability
+that the axis is force-controlled, averaged over the agent's envs; the controller wrapper
+publishes `selection/force_<axis>`, the fraction of envs whose axis was force-controlled that step.
+Both are "how much force control", because the selection bit is 1 for force everywhere; the
+probability is the smoother of the two and is what the supervised selection loss moves, so it
+is the one to watch when asking whether a policy is learning *when* to push. The axis names
+come from the model, which the factory names from the controller's force-eligible axes.
+
 The episode channel is the only host sync in the rollout path (compacting needs the count on
 the host), it happens once per step, and only while an `on_log` hook is attached.
 
@@ -299,6 +361,8 @@ the episodes that have it.
 | `fragile/force` | `ForgeFragileObjectWrapper` | per step |
 | `fragile/broke`, `/break_force`, `/break_normal`, `/break_shear`, `/break_contact_loss`, `/break_step` | `ForgeFragileObjectWrapper` | one rate per cause; `break_step` is NaN where nothing broke |
 | `contact/in_contact_{x,y,z,any}` | `ForgeContactSensorWrapper` | per step |
+| `selection/force_<axis>` | `ForgeControllerWrapper` | per step; the fraction of envs whose axis was force-controlled (1 = force) |
+| `selection/p_force_<axis>` | `LearnerBase.emit_selection` | the policy's probability of force control on that axis |
 
 **Each metric is emitted where it is decided.** A break rate comes from the wrapper that
 decides breaks; a KL early stop from the learner that applies it; the task's outcomes from the
@@ -359,12 +423,15 @@ weights, optimizer state, normalizer stats, learner extras, the step and the mea
 `robonuke_rl_core/envs/forge/control.py` has a single torque path:
 
 ```
-tau = J^T [ S (K e_pose - D v) + (I - S) K_f (f_d - f) ] + nullspace
+tau = J^T [ (I - S) (K e_pose - D v) + S K_f (f_d - f) ] + nullspace
 ```
 
-`S` multiplies the **pose** branch, so `S = 1` on an axis means that axis is
-position-controlled. The expression is linear in `S`, so the degenerate cases are exact, not
-approximations: `S = I` with `f_d = 0` *is* Factory's own controller. That is a tested claim,
+**`S` selects force: `S = 1` on an axis means that axis is force-controlled, `S = 0` means
+position-controlled.** That one convention holds from the policy's Bernoulli bit through the
+action vector and the `selection/*` metrics to this matrix — nothing anywhere takes a
+complement, and `tests/envs/test_interface.py` asserts the values rather than describing
+them. The expression is linear in `S`, so the degenerate cases are exact, not
+approximations: `S = 0` with `f_d = 0` *is* Factory's own controller. That is a tested claim,
 not a hopeful one — `tests/envs/GPU/test_controller.py` runs our math beside Isaac Lab's
 `compute_dof_torque` on live env state for 50 steps and requires agreement (measured: a
 worst-case difference of **0.0**, bit for bit). Which is why pose control needs no separate
@@ -374,14 +441,18 @@ path.
 
 | `use_pose` | `use_force` | layout | fixed |
 | --- | --- | --- | --- |
-| ✓ | — | `[pose \| gains?]` | `S = I`, `f_d = 0` |
-| — | ✓ | `[force \| gains?]` | `S = 0` |
+| ✓ | — | `[pose \| gains?]` | `S = 0`, `f_d = 0` |
+| — | ✓ | `[force \| gains?]` | `S = I` |
 | ✓ | ✓ | `[pose \| selection \| force \| gains?]` | — |
 
 The selection block exists exactly when both branches do, because that is the only case where
 the policy has a choice to make. `controller.force_axes` (a length-6 binary mask) sets how
-wide the force side is — `[1,1,1,0,0,0]` for the usual 3-D hybrid, `[1]*6` for 6-D — and the
-selection, force-target and K_f blocks are all that wide. `gain_mapping` is orthogonal:
+wide the force side is, and the selection, force-target and K_f blocks are all that wide.
+**It defaults to `[1,1,1,0,0,0]`, the 3-D hybrid**: force on the translation axes, orientation
+always position-controlled. That is the configuration this project runs — a wrist wrench's
+torque channels are its noisy ones and a regulated torque is rarely what a contact task
+wants — so `[1]*6` is opt-in, and force-only control (`use_pose: false`) has to ask for it
+explicitly because every axis then needs a controller. `gain_mapping` is orthogonal:
 `constant` costs no action dims, `variable_diagonal` adds one per axis of each live branch and
 maps it geometrically onto `[gain_min, gain_max]`. Adding a mapping is a new entry in
 `ActionLayout.gain_dims`, not a rewrite.
@@ -396,7 +467,7 @@ Two invariants worth keeping:
 * **Selection actions are Bernoulli by construction**, so `controller.validate` requires
   `model.actor.bernoulli_action_dims` to be exactly the selection block's indices. A shifted
   index would make a continuous action a 0/1 switch with no crash and no symptom, so it fails
-  when the config loads.
+  when the config loads. The actor emits them as ±1: **+1 is force**, -1 is position.
 
 **Forge's own control defaults are inherited at runtime, not by subclassing.** `ema_factor`,
 the dead zone, `pos_action_bounds`, `default_task_prop_gains`, `kp_null`/`kd_null` and

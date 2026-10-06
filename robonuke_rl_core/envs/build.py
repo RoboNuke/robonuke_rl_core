@@ -143,7 +143,9 @@ def build_env(cfg: Any, env: Any, task_name: str) -> Any:
         elif name == "contact" and wrappers.contact.enabled:
             from .forge.contact import ForgeContactSensorWrapper
 
-            env = ForgeContactSensorWrapper(env, wrappers.contact, task_name)
+            # the controller decides which axes the selection covers, and the flags are
+            # published in that order for the supervised selection loss
+            env = ForgeContactSensorWrapper(env, wrappers.contact, task_name, controller)
         elif name == "task_metrics" and wrappers.task_metrics.enabled:
             from .forge.compat import is_forge_task
             from .forge.metrics import ForgeTaskMetricsWrapper

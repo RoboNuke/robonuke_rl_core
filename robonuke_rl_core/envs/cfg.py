@@ -78,9 +78,12 @@ class ControllerCfg:
     #: which axes the force branch may take, as a length-6 binary mask
     #: ``[x, y, z, Rx, Ry, Rz]``. This is what makes hybrid control 3-D or 6-D (or z-only):
     #: the selection, force-target and K_f action blocks are as wide as this mask's sum, and
-    #: an axis outside it is position-controlled always (S = 1 there). Ignored, and refused,
+    #: an axis outside it is position-controlled always (S = 0 there). Ignored, and refused,
     #: when ``use_force`` is false.
-    force_axes: List[int] = field(default_factory=lambda: [1, 1, 1, 1, 1, 1])
+    #: The default is the **3-D hybrid**: force on the translation axes, orientation always
+    #: position-controlled. A wrist wrench's torque channels are the noisy ones and a
+    #: regulated torque is rarely what a contact task wants, so 6-D is opt-in.
+    force_axes: List[int] = field(default_factory=lambda: [1, 1, 1, 0, 0, 0])
 
     #: the env's OWN action width, handed through untouched as the first block. Forge is 7
     #: (3 position + 3 rotation + the success prediction its reward reads), Factory is 6.
@@ -151,7 +154,9 @@ class ControllerCfg:
             raise ValueError(
                 "force-only control (use_pose: false) needs every axis force-eligible, or the "
                 f"axes outside controller.force_axes would have no controller at all; got "
-                f"{self.force_axes!r}. Enable use_pose for a partial mask."
+                f"{self.force_axes!r} (the default is the 3-D hybrid mask). Set "
+                "controller.force_axes: [1, 1, 1, 1, 1, 1], or enable use_pose for a "
+                "partial mask."
             )
         _check_order("gain_min", self.gain_min, "gain_max", self.gain_max)
         _check_order("force_gain_min", self.force_gain_min, "force_gain_max", self.force_gain_max)

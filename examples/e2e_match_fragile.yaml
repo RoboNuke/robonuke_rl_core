@@ -1,0 +1,45 @@
+# End-to-end validation run, MATCH variant: everything identical to the hybrid e2e except
+# how the selection and the continuous dims form one distribution, plus the supervision
+# that tells the selection head what contact means.
+#
+# `selection_distribution: match` conditions the continuous density on the selection, so
+# only the live member of each (pose, force) pair is scored. The pairs are derived from the
+# controller's action layout — dims [0, 1, 2] against [10, 11, 12] for force_axes
+# [1, 1, 1, 0, 0, 0] — so nothing here names them.
+#
+# Three numbers differ from the product run and each has a reason:
+#
+#   * selection_init_bias: -2.2.  The bias lands on the selection logit as written, and a
+#     selection bit of 1 is S = 1, which is FORCE control (see models/simba.py,
+#     SELECTION_BIT_IS_FORCE).  sigmoid(-2.2) ~= 0.1, so the policy starts ~90%
+#     position-dominant and has to earn its way to pushing.
+#   * target_entropy: -3.5.  Following the -|scored continuous dims| / 2 convention: match
+#     scores 7 continuous dims (4 free pose dims + one member of each of the 3 pairs), not
+#     the 10 the product style scores, so the product run's -5.0 would be asking for an
+#     entropy the distribution cannot reach.
+#   * losses.terms: the supervised selection term, weight 1.0, matching the reference's
+#     supervised_selection_policy_weight.  It is a BCE between the actor's per-axis
+#     probability of force control and whether that axis is in contact, which the contact
+#     wrapper publishes per transition.  num_axes is the number of selection dims.
+#
+#   python scripts/train.py --config examples/e2e_match_fragile.yaml --headless
+base: e2e_hybrid_fragile.yaml
+
+wandb:
+  group: e2e_match_10N
+
+model:
+  actor:
+    selection_distribution: match
+    selection_init_bias: -2.2
+
+sac:
+  target_entropy: -3.5
+
+losses:
+  terms:
+    - name: supervised_selection
+      target: policy
+      weight: 1.0
+      kwargs:
+        num_axes: 3

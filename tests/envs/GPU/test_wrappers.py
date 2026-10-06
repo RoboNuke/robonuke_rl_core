@@ -135,6 +135,44 @@ def test_the_contact_wrapper_publishes_per_axis_flags(gpu_cfg, ready_env):
 
 
 # ------------------------------------------------------------------ fragile
+def test_the_contact_wrapper_publishes_the_selection_ordered_flags(gpu_cfg, ready_env):
+    """What the supervised selection loss learns against: one flag per selection dim."""
+    from robonuke_rl_core.envs.cfg import ControllerCfg
+    from robonuke_rl_core.envs.forge.contact import (
+        SELECTION_FLAGS_KEY,
+        ForgeContactSensorWrapper,
+    )
+
+    unwrapped = ready_env.unwrapped
+    original = unwrapped._get_observations
+    controller = ControllerCfg(
+        enabled=True, use_pose=True, use_force=True, force_axes=[1, 0, 1, 0, 0, 0]
+    )
+    wrapper = ForgeContactSensorWrapper(
+        unwrapped, ContactCfg(enabled=True), gpu_cfg.task_name, controller
+    )
+    try:
+        assert wrapper._selection_axes == [0, 2]  # x and z, in selection order
+        wrapper.refresh()
+        _, _, _, _, infos = wrapper.step(
+            torch.zeros(unwrapped.num_envs, *ready_env.action_space.shape, device=unwrapped.device)
+        )
+        flags = infos[SELECTION_FLAGS_KEY]
+        assert flags.shape == (unwrapped.num_envs, 2)
+        assert torch.equal(flags, unwrapped.in_contact[:, [0, 2]].to(flags.dtype))
+
+        # a force-eligible rotation axis has no contact flag, and that fails loudly
+        rotational = ControllerCfg(
+            enabled=True, use_pose=True, use_force=True, force_axes=[1, 1, 1, 0, 0, 1]
+        )
+        with pytest.raises(ValueError, match="Rz"):
+            ForgeContactSensorWrapper(
+                unwrapped, ContactCfg(enabled=True), gpu_cfg.task_name, rotational
+            )
+    finally:
+        unwrapped._get_observations = original
+
+
 def test_a_force_over_the_threshold_terminates_the_env(gpu_cfg, ready_env):
     from robonuke_rl_core.envs.forge.fragile import ForgeFragileObjectWrapper
 

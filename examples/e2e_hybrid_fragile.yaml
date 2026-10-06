@@ -4,7 +4,8 @@
 #
 # The force branch is enabled on the translation axes with the gains still fixed
 # (gain_mapping stays `constant`), so the action grows from the native 7 to 13:
-# [pose 0-6 | selection 7-9 | force targets 10-12]. The selection dims are Bernoulli by
+# [pose 0-6 | selection 7-9 | force targets 10-12]. A selection bit of 1 hands that axis to
+# the force law; 0 keeps it position-controlled. The selection dims are Bernoulli by
 # construction and the config refuses to load unless the model says so too.
 # target_entropy follows V's -|continuous|/2 convention: 13 - 3 Bernoulli = 10 -> -5.0.
 #
@@ -16,8 +17,8 @@ wandb:
 
 controller:
   use_force: true
-  # hybrid on the translation axes only; orientation stays position-controlled
-  force_axes: [1, 1, 1, 0, 0, 0]
+  # force_axes defaults to [1, 1, 1, 0, 0, 0]: hybrid on the translation axes only,
+  # orientation always position-controlled
 
 model:
   actor:

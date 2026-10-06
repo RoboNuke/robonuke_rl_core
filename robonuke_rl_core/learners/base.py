@@ -163,6 +163,73 @@ class LearnerBase(Agent):
     def _create_memory_tensors(self) -> None:
         raise NotImplementedError
 
+    # ------------------------------------------------------------------ aux-loss memory
+    def aux_memory_keys(self) -> Dict[str, int]:
+        """Per-transition tensors the ``aux_loss`` hooks need: name -> width, merged.
+
+        Read once, in ``_create_memory_tensors``, which the trainer triggers through
+        :meth:`init`. A hook appended after that contributes nothing and the loss raises by
+        name when it goes looking for its key — better than a silently absent supervision
+        signal.
+        """
+        keys: Dict[str, int] = {}
+        for hook in self.aux_loss:
+            for key, width in (getattr(hook, "memory_keys", None) or {}).items():
+                width = int(width)
+                if keys.get(key, width) != width:
+                    raise ValueError(
+                        f"two aux_loss hooks want memory key '{key}' at different widths: "
+                        f"{keys[key]} and {width}"
+                    )
+                keys[key] = width
+        return keys
+
+    def create_aux_memory_tensors(self) -> List[str]:
+        """Create those tensors in the memory; returns their names for ``_tensors_names``."""
+        keys = self.aux_memory_keys()
+        if keys and self.memory is None:
+            raise ValueError(
+                f"an aux loss needs the per-transition tensors {sorted(keys)} but this "
+                "learner has no memory"
+            )
+        self._aux_memory_keys = keys
+        for name, width in sorted(keys.items()):
+            self.memory.create_tensor(name=name, size=width, dtype=torch.float32)
+        return sorted(keys)
+
+    def aux_memory_values(self, infos: Any) -> Dict[str, torch.Tensor]:
+        """This step's values for those tensors, read from ``infos`` and shape-checked.
+
+        The env publishes each one under its own top-level ``infos`` key, as
+        ``(num_envs, width)`` (or ``(num_envs,)`` when the width is 1). Anything else is a
+        mismatch between the loss and the env, so it raises rather than training on a
+        broadcast.
+        """
+        keys = getattr(self, "_aux_memory_keys", None) or {}
+        if not keys:
+            return {}
+        out: Dict[str, torch.Tensor] = {}
+        for name, width in keys.items():
+            value = infos.get(name) if isinstance(infos, dict) else None
+            if value is None:
+                raise RuntimeError(
+                    f"an aux loss needs infos[{name!r}] every step, and this step did not "
+                    f"carry it (infos keys: {sorted(infos) if isinstance(infos, dict) else type(infos).__name__}). "
+                    "The wrapper that publishes it has to be enabled."
+                )
+            if not torch.is_tensor(value):
+                raise TypeError(
+                    f"infos[{name!r}] must be a tensor, got {type(value).__name__}"
+                )
+            shaped = value.reshape(self.num_envs, -1) if value.dim() > 1 else value.reshape(-1, 1)
+            if shaped.shape != (self.num_envs, width):
+                raise ValueError(
+                    f"infos[{name!r}] must be ({self.num_envs}, {width}), got "
+                    f"{tuple(value.shape)}"
+                )
+            out[name] = shaped.to(dtype=torch.float32, device=self.device)
+        return out
+
     def make_normalizer(self, space) -> BlockRunningNorm:
         """A per-agent input normalizer sized to ``space``."""
         from skrl.utils.spaces.torch import compute_space_size
@@ -194,6 +261,34 @@ class LearnerBase(Agent):
                 )
         for agent in range(self.num_agents):
             self.emit(agent, {name: value[agent] for name, value in metrics.items()}, step)
+
+    def emit_selection(self, outputs: Any, step: int) -> None:
+        """``selection/p_force_<axis>``: how likely each hybrid axis is to be force-controlled.
+
+        The selection bit is 1 for force (``models/simba.SELECTION_BIT_IS_FORCE``), so the
+        actor's ``selection_prob`` *is* this probability, with no complement to take.
+        The policy's own probability, averaged over the agent's envs — not the realized
+        choice, which the controller wrapper publishes as ``selection/force_<axis>``. The
+        probability is the smoother of the two and is what the supervised selection loss
+        moves, so it is the one to watch when asking whether a policy is learning *when* to
+        push. A policy without selection dims emits nothing.
+
+        The axis names come from the model, which the factory names from the controller's
+        force-eligible axes; a model built without one falls back to the bit's index.
+        """
+        if not self.on_log or not isinstance(outputs, dict):
+            return
+        probability = outputs.get("selection_prob")
+        if probability is None:
+            return
+        per_agent = probability.view(self.num_agents, self.envs_per_agent, -1).mean(dim=1)
+        names = getattr(self.policy, "selection_names", None) or [
+            str(index) for index in range(per_agent.shape[-1])
+        ]
+        self.emit_per_agent(
+            {f"selection/p_force_{name}": per_agent[:, index] for index, name in enumerate(names)},
+            step,
+        )
 
     def compute_aux_loss(self, ctx: LossContext) -> Optional[torch.Tensor]:
         """Sum of what the ``aux_loss`` hooks return for ``ctx.target``, or None.

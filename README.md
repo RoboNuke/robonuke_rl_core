@@ -228,6 +228,8 @@ Fields for `architecture: simba`:
 | `actor.bernoulli_action_dims` | list[int] or null | `null` | action dims drawn from a Bernoulli and mapped to {-1, +1} (e.g. a gripper) |
 | `actor.force_zero_action_dims` | list[int] or null | `null` | action dims the policy never produces; emitted as 0, with no parameters |
 | `actor.scale_down_action_dims` | list[int] or null | `null` | action dims that `last_layer_scale` applies to (default: all) |
+| `actor.selection_distribution` | str | `"product"` | how the selection dims and the continuous dims form one joint distribution: `product` (independent) or `match` (each selection dim picks which of its (pose, force) pair is live). `match` needs `bernoulli_action_dims` and a controller with a selection block; the pair indices are derived from the action layout, never configured |
+| `actor.selection_init_bias` | float | `0.0` | added to the selection logits' output bias at init, exactly as written. A bit of 1 is `S = 1`, i.e. force control, so `-2.2` (`sigmoid(-2.2) ≈ 0.1`) starts the policy ~90% position-dominant. Needs `bernoulli_action_dims` |
 | `critic.critic_n` | int | `2` | residual blocks in a critic backbone |
 | `critic.critic_latent` | int | `512` | critic hidden width |
 | `critic.critic_output_init_mean` | float | `0.0` | initial critic output bias |
@@ -260,10 +262,24 @@ losses:
       weight: 0.1
 ```
 
-**The package ships no built-in loss**, so every `name` comes from a project's own
-`@register_loss` (registered before the config is loaded). A penalty on action magnitude
-belongs in the env's reward, not in a policy-side term. See the "Add a loss" checklist in
-`CLAUDE.md`.
+The package ships **one** built-in loss; every other `name` comes from a project's own
+`@register_loss` (registered before the config is loaded). The bar for shipping one is that
+it cannot be written as a reward: a penalty on action magnitude belongs in the env's reward,
+not in a policy-side term. See the "Add a loss" checklist in `CLAUDE.md`.
+
+| name | target | kwargs | what it does |
+| --- | --- | --- | --- |
+| `supervised_selection` | `policy` | `num_axes` (int, required): the number of selection dims, i.e. `sum(controller.force_axes)` | binary cross entropy between the actor's per-axis probability of **force** control and whether that axis is in contact. Needs `wrappers.contact.enabled` (it publishes the per-transition flags) and a policy with selection dims |
+
+```yaml
+losses:
+  terms:
+    - name: supervised_selection
+      target: policy
+      weight: 1.0
+      kwargs:
+        num_axes: 3
+```
 
 ## eval
 
@@ -309,26 +325,31 @@ The unified operational-space controller, attached as an env wrapper when `enabl
 torque path serves every configuration:
 
 ```
-tau = J^T [ S (K e_pose - D v) + (I - S) K_f (f_d - f) ] + nullspace
+tau = J^T [ (I - S) (K e_pose - D v) + S K_f (f_d - f) ] + nullspace
 ```
 
-`S` multiplies the pose branch, so `S = 1` on an axis means that axis is position-controlled.
+**`S` selects force: `S = 1` on an axis means that axis is force-controlled, `S = 0` means
+position-controlled.** One convention, everywhere — the policy's selection bit, the action
+vector, the `selection/*` metrics and this matrix all read "1 is force".
 **The action layout is inferred from the capabilities, never configured** — there is no mode
 field. The selection block exists exactly when both branches are on, because that is the only
 case where the policy has a choice to make:
 
 | `use_pose` | `use_force` | action layout | fixed |
 | --- | --- | --- | --- |
-| ✓ | — | `[pose \| gains?]` | `S = I`, `f_d = 0` |
-| — | ✓ | `[force \| gains?]` | `S = 0` |
+| ✓ | — | `[pose \| gains?]` | `S = 0`, `f_d = 0` |
+| — | ✓ | `[force \| gains?]` | `S = I` |
 | ✓ | ✓ | `[pose \| selection \| force \| gains?]` | — |
 
 `gains?` is empty under `gain_mapping: constant`; under `variable_diagonal` it is one action
 per axis of each live branch (`[K \| K_f]`). How wide the force side is comes from
-`force_axes`: `[1,1,1,0,0,0]` is the usual 3-D hybrid (12 action dims with constant gains),
-`[1]*6` is 6-D (18), `[0,0,1,0,0,0]` is force on z alone (8). Selection actions are 0/1 by
-construction, so `model.actor.bernoulli_action_dims` must be exactly the selection block's
-indices — the config refuses to load otherwise.
+`force_axes`, which defaults to `[1,1,1,0,0,0]` — the 3-D hybrid, force on the translation
+axes with orientation always position-controlled (13 action dims with constant gains on
+Forge). `[1]*6` is 6-D (19) and `[0,0,1,0,0,0]` is force on z alone (9); force-only control
+(`use_pose: false`) must set the mask to all ones, since every axis then needs a controller.
+Selection actions are ±1 by construction (**+1 is force**), so
+`model.actor.bernoulli_action_dims` must be exactly the selection block's indices — the config
+refuses to load otherwise.
 
 Everything Forge's own control config already defines — `ema_factor`, the dead zone,
 `pos_action_bounds`, `default_task_prop_gains`, `kp_null`/`kd_null` — is **not** repeated
@@ -341,7 +362,7 @@ experiment tunes them under `task.cfg.ctrl.*`.
 | `use_pose` | bool | `True` | pose branch on, and pose-target actions in the layout |
 | `use_force` | bool | `False` | force branch on, and force-target actions in the layout |
 | `gain_mapping` | str | `"constant"` | `constant` (gains from config, 0 action dims) or `variable_diagonal` (one gain action per axis of each live branch, geometric per-axis scaling) |
-| `force_axes` | list[int] | `[1, 1, 1, 1, 1, 1]` | length-6 binary mask of the axes the force branch may take — this is what makes hybrid control 3-D (`[1,1,1,0,0,0]`), 6-D, or z-only. The selection, force-target and K_f blocks are each as wide as its sum; an axis outside it is always position-controlled |
+| `force_axes` | list[int] | `[1, 1, 1, 0, 0, 0]` | length-6 binary mask `[x, y, z, Rx, Ry, Rz]` of the axes the force branch may take — this is what makes hybrid control 3-D (the default: force on translation, orientation always position-controlled), 6-D (`[1]*6`), or z-only (`[0,0,1,0,0,0]`). The selection, force-target and K_f blocks are each as wide as its sum; an axis outside it is always position-controlled. Force-only control (`use_pose: false`) requires all ones |
 | `native_action_dim` | int | `7` | the env's **own** action width, handed through untouched as the first block: Forge is 7 (3 position + 3 rotation + the success prediction its reward reads), Factory is 6. Re-checked against the live env, which names the right value |
 | `gain_min` | list[float] | `[100, 100, 100, 5, 5, 5]` | per-axis lower bound of the pose stiffness K, `[x, y, z, Rx, Ry, Rz]` |
 | `gain_max` | list[float] | `[2000, 2000, 2000, 100, 100, 100]` | per-axis upper bound of K; also the constant K when the env supplies none |
@@ -367,7 +388,7 @@ reset → fragile → contact); see `CLAUDE.md` for why.
 | `fragile.require_contact_grace_steps` | int | `5` | steps at the start of an episode where loss of contact cannot fail it |
 | `fragile.require_contact_debounce_steps` | int | `3` | consecutive out-of-contact steps before loss of contact counts as a break (1 = any single step) |
 | `efficient_reset.enabled` | bool | `False` | reset a finished env by teleporting it onto another env's fresh state. **Training only** — `scripts/eval.py` refuses it, because the accounting needs independently sampled conditions |
-| `contact.enabled` | bool | `False` | mount a contact sensor on the held asset and publish per-axis in-contact flags. Needs `task.cfg.scene.clone_in_fabric: false` (a contact reporter needs real per-env prims) |
+| `contact.enabled` | bool | `False` | mount a contact sensor on the held asset and publish per-axis in-contact flags. With a controller that has a selection block it also publishes `infos["in_contact"]`, the flags in selection order, which is what the `supervised_selection` loss trains against — and it then refuses a force-eligible rotation axis, since a contact force says nothing about a torque. Needs `task.cfg.scene.clone_in_fabric: false` (a contact reporter needs real per-env prims) |
 | `contact.force_threshold` | float | `1.0` | \|f\| above this on an end-effector axis counts as contact, in N |
 | `contact.append_to_policy_obs` | bool | `False` | append the 3 flags to the policy observation (grows the observation space) |
 | `contact.append_to_critic_state` | bool | `False` | append the 3 flags to the critic state (asymmetric tasks only) |

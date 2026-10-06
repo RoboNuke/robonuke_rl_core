@@ -4,6 +4,10 @@ Pure math, no env. This is the gold of the controller area — if the layout her
 controller's reading of it ever disagree, a policy's gains become its force targets and
 nothing crashes, so the table below is written out by hand rather than derived from the code
 under test.
+
+**The selection convention is asserted here, by value: 1 is force, 0 is position.** It is
+the diagonal of ``S`` in ``tau = J^T [ (I - S) (K e - D v) + S K_f (f_d - f) ]``, and the
+same number reaches the actor's Bernoulli bit and the ``selection/*`` metrics.
 """
 
 from __future__ import annotations
@@ -26,24 +30,35 @@ def controller(**overrides) -> ControllerCfg:
 
 
 # ------------------------------------------------------------------ 1. the layout table
-#  (use_pose, use_force, gain_mapping) -> (action_dim, pose, selection, force, gains)
-#  the pose block is the env's own action vector: 7 on Forge (the default), 6 on Factory
+#  (use_pose, use_force, gain_mapping, force_axes) -> (action_dim, pose, selection, force, gains)
+#  the pose block is the env's own action vector: 7 on Forge (the default), 6 on Factory.
+#  force_axes defaults to the 3-D hybrid mask, so a 6-D row has to ask for it, and a
+#  force-only row must (validate refuses a partial mask without a pose branch).
+THREE_D = (1, 1, 1, 0, 0, 0)
+SIX_D = (1, 1, 1, 1, 1, 1)
 LAYOUTS = {
-    (True, False, "constant"): (7, (0, 7), None, None, None),
-    (True, False, "variable_diagonal"): (13, (0, 7), None, None, (7, 13)),
-    (False, True, "constant"): (6, None, None, (0, 6), None),
-    (False, True, "variable_diagonal"): (12, None, None, (0, 6), (6, 12)),
-    (True, True, "constant"): (19, (0, 7), (7, 13), (13, 19), None),
-    (True, True, "variable_diagonal"): (31, (0, 7), (7, 13), (13, 19), (19, 31)),
+    (True, False, "constant", THREE_D): (7, (0, 7), None, None, None),
+    (True, False, "variable_diagonal", THREE_D): (13, (0, 7), None, None, (7, 13)),
+    (False, True, "constant", SIX_D): (6, None, None, (0, 6), None),
+    (False, True, "variable_diagonal", SIX_D): (12, None, None, (0, 6), (6, 12)),
+    (True, True, "constant", THREE_D): (13, (0, 7), (7, 10), (10, 13), None),
+    (True, True, "variable_diagonal", THREE_D): (22, (0, 7), (7, 10), (10, 13), (13, 22)),
+    (True, True, "constant", SIX_D): (19, (0, 7), (7, 13), (13, 19), None),
+    (True, True, "variable_diagonal", SIX_D): (31, (0, 7), (7, 13), (13, 19), (19, 31)),
 }
 
 
 @pytest.mark.parametrize("key, expected", sorted(LAYOUTS.items(), key=lambda kv: str(kv[0])))
 def test_the_layout_matches_the_hand_written_table(key, expected):
-    use_pose, use_force, mapping = key
+    use_pose, use_force, mapping, mask = key
     dim, pose, selection, force, gains = expected
     layout = ActionLayout(
-        controller(use_pose=use_pose, use_force=use_force, gain_mapping=mapping)
+        controller(
+            use_pose=use_pose,
+            use_force=use_force,
+            gain_mapping=mapping,
+            force_axes=list(mask),
+        )
     )
 
     assert layout.action_dim == dim
@@ -73,7 +88,8 @@ def test_the_selection_block_exists_exactly_when_both_branches_do():
     for use_pose, use_force in ((True, False), (False, True)):
         layout = ActionLayout(controller(use_pose=use_pose, use_force=use_force))
         assert layout.selection_indices == []
-    assert ActionLayout(controller(use_force=True)).selection_indices == [7, 8, 9, 10, 11, 12]
+    # the default mask is the 3-D hybrid, so the block is three wide
+    assert ActionLayout(controller(use_force=True)).selection_indices == [7, 8, 9]
 
 
 def test_an_unknown_gain_mapping_raises():
@@ -86,13 +102,13 @@ def test_an_unknown_gain_mapping_raises():
 @pytest.mark.parametrize("mapping", ["constant", "variable_diagonal"])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_pose_only_is_exactly_impedance_for_any_action(mapping, seed):
-    """S = I and f_d = 0, whatever the policy emits — that is what makes pose-only exact."""
+    """S = 0 and f_d = 0, whatever the policy emits — that is what makes pose-only exact."""
     interface = ActionInterface(controller(gain_mapping=mapping))
     torch.manual_seed(seed)
     actions = torch.randn(ROWS, interface.action_dim) * 3.0  # well outside [-1, 1]
 
     _, selection, force_target, _, _ = interface.split(actions)
-    assert torch.equal(selection, torch.ones(ROWS, 6))
+    assert torch.equal(selection, torch.zeros(ROWS, 6))  # nothing is force-controlled
     assert torch.equal(force_target, torch.zeros(ROWS, 6))
 
 
@@ -100,20 +116,22 @@ def test_pose_only_is_exactly_impedance_for_any_action(mapping, seed):
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_force_only_hands_every_axis_to_the_force_law(mapping, seed):
     interface = ActionInterface(
-        controller(use_pose=False, use_force=True, gain_mapping=mapping)
+        controller(
+            use_pose=False, use_force=True, gain_mapping=mapping, force_axes=[1] * 6
+        )
     )
     torch.manual_seed(seed)
     actions = torch.randn(ROWS, interface.action_dim) * 3.0
 
     pose_target, selection, _, _, _ = interface.split(actions)
-    assert torch.equal(selection, torch.zeros(ROWS, 6))
+    assert torch.equal(selection, torch.ones(ROWS, 6))  # S = I: force everywhere
     # nothing commands a pose: the env still gets an action of its own width, all zeros
     assert torch.equal(pose_target, torch.zeros(ROWS, interface.cfg.native_action_dim))
 
 
 def test_selection_actions_are_read_as_the_bernoulli_sign():
-    """+1 keeps an axis on position (S=1), -1 hands it to the force law (S=0)."""
-    interface = ActionInterface(controller(use_force=True))
+    """+1 hands an axis to the force law (S=1), -1 keeps it on position (S=0)."""
+    interface = ActionInterface(controller(use_force=True, force_axes=[1] * 6))
     actions = torch.zeros(1, interface.action_dim)
     actions[0, interface.selection_indices] = torch.tensor([1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
 
@@ -124,7 +142,9 @@ def test_selection_actions_are_read_as_the_bernoulli_sign():
 def test_the_force_target_scales_by_its_bounds():
     bounds = [50.0, 40.0, 30.0, 5.0, 4.0, 3.0]
     interface = ActionInterface(
-        controller(use_pose=False, use_force=True, force_target_bounds=bounds)
+        controller(
+            use_pose=False, use_force=True, force_axes=[1] * 6, force_target_bounds=bounds
+        )
     )
     actions = torch.tensor([[1.0, -1.0, 0.0, 0.5, -2.0, 1.0]])  # -2 clamps to -1
 
@@ -137,7 +157,12 @@ def test_the_force_target_scales_by_its_bounds():
 def test_constant_gains_ignore_the_actions(seed):
     forces = [0.5, 0.4, 0.3, 0.02, 0.01, 0.03]
     interface = ActionInterface(
-        controller(use_force=True, gain_mapping="constant", default_force_gains=forces)
+        controller(
+            use_force=True,
+            force_axes=[1] * 6,
+            gain_mapping="constant",
+            default_force_gains=forces,
+        )
     )
     torch.manual_seed(seed)
     first = interface.split(torch.randn(ROWS, interface.action_dim))
@@ -175,6 +200,7 @@ def test_variable_diagonal_scales_the_force_gains_from_their_own_bounds():
         controller(
             use_pose=False,
             use_force=True,
+            force_axes=[1] * 6,
             gain_mapping="variable_diagonal",
             force_gain_min=[1.0] * 6,
             force_gain_max=[100.0] * 6,
@@ -200,6 +226,7 @@ def test_both_branches_give_each_branch_its_own_gain_block():
     interface = ActionInterface(
         controller(
             use_force=True,
+            force_axes=[1] * 6,
             gain_mapping="variable_diagonal",
             gain_min=[100.0] * 6,
             gain_max=[1000.0] * 6,
@@ -232,7 +259,9 @@ def test_damping_follows_the_configured_relation(ratio):
 
 
 def test_a_wrong_action_width_raises_with_the_layout():
-    interface = ActionInterface(controller(use_force=True, gain_mapping="variable_diagonal"))
+    interface = ActionInterface(
+        controller(use_force=True, force_axes=[1] * 6, gain_mapping="variable_diagonal")
+    )
     with pytest.raises(ValueError) as err:
         interface.split(torch.zeros(ROWS, interface.action_dim - 1))
     assert "action_dim=31" in str(err.value)
@@ -272,11 +301,12 @@ def test_axes_outside_the_mask_stay_position_controlled():
     mask = [1, 1, 1, 0, 0, 0]
     interface = ActionInterface(controller(use_force=True, force_axes=mask))
     actions = torch.zeros(1, interface.action_dim)
-    actions[0, interface.selection_indices] = -1.0  # hand every eligible axis to the force law
+    actions[0, interface.selection_indices] = 1.0  # hand every eligible axis to the force law
     actions[0, interface.layout.force_slice] = 1.0
 
     _, selection, force_target, _, _ = interface.split(actions)
-    assert selection[0].tolist() == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    # the eligible axes went to force; the rest cannot, whatever the policy asks
+    assert selection[0].tolist() == [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
     # the force target lands on the eligible axes and nowhere else
     assert force_target[0, 3:].tolist() == [0.0, 0.0, 0.0]
     assert force_target[0, :3].tolist() == pytest.approx([50.0, 50.0, 50.0])
@@ -310,3 +340,58 @@ def test_the_mask_does_not_change_the_single_branch_layouts():
     plain = ActionLayout(controller())
     masked = ActionLayout(controller(force_axes=[1, 1, 1, 0, 0, 0]))
     assert (plain.action_dim, plain.selection_indices) == (masked.action_dim, masked.selection_indices)
+
+
+# ------------------------------------------------------------------ 9. the gated pairs
+#  mask -> (selection indices, pose-component indices, force-component indices)
+#  the pose block is the env's own 7-wide action vector, so a pose component sits at its own
+#  axis index; the force block is packed in mask order, so its components are consecutive
+PAIRS = {
+    (1, 1, 1, 0, 0, 0): ([7, 8, 9], [0, 1, 2], [10, 11, 12]),
+    (0, 0, 1, 0, 0, 0): ([7], [2], [8]),
+    (1, 0, 0, 0, 0, 1): ([7, 8], [0, 5], [9, 10]),
+    (1, 1, 1, 1, 1, 1): ([7, 8, 9, 10, 11, 12], [0, 1, 2, 3, 4, 5], [13, 14, 15, 16, 17, 18]),
+}
+
+
+@pytest.mark.parametrize("mask, expected", sorted(PAIRS.items()))
+def test_the_gated_pairs_are_written_out_by_hand(mask, expected):
+    """What MATCH conditions on. Written out, for the same reason the layout table is."""
+    selection, pose, force = expected
+    layout = ActionLayout(controller(use_force=True, force_axes=list(mask)))
+    assert layout.selection_indices == selection
+    assert layout.pos_component_indices == pose
+    assert layout.force_component_indices == force
+    assert layout.selection_axis_names == [
+        ("x", "y", "z", "Rx", "Ry", "Rz")[axis] for axis, flag in enumerate(mask) if flag
+    ]
+
+
+def test_a_pair_s_two_members_are_the_action_dims_that_control_one_axis():
+    """Derived, not asserted: the pose member must be the slot ``split`` reads for that axis
+    and the force member the slot whose target lands on it."""
+    mask = [1, 0, 1, 0, 0, 0]
+    interface = ActionInterface(controller(use_force=True, force_axes=mask))
+    layout = interface.layout
+    for pair, axis in enumerate(layout.force_axes):
+        pose_dim = interface.pos_component_indices[pair]
+        force_dim = interface.force_component_indices[pair]
+
+        actions = torch.zeros(1, interface.action_dim)
+        actions[0, pose_dim] = 0.5
+        actions[0, force_dim] = 1.0
+        pose_target, _, force_target, _, _ = interface.split(actions)
+        # the pose member is that axis's entry in the env's own action vector
+        assert pose_target[0, axis] == pytest.approx(0.5)
+        assert float(pose_target[0].abs().sum()) == pytest.approx(0.5)
+        # the force member is the target on that axis, and only that axis
+        assert force_target[0, axis] == pytest.approx(50.0)
+        assert float(force_target[0].abs().sum()) == pytest.approx(50.0)
+
+
+def test_there_are_no_pairs_without_a_selection_block():
+    for kwargs in ({"use_force": False}, {"use_pose": False, "use_force": True}):
+        layout = ActionLayout(controller(**kwargs))
+        assert layout.pos_component_indices == []
+        assert layout.force_component_indices == []
+        assert layout.selection_axis_names == []

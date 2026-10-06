@@ -29,10 +29,13 @@ __all__ = ["SAC"]
 
 
 class SAC(LearnerBase):
-    def __init__(self, *, model_cfg=None, **kwargs) -> None:
-        """``model_cfg`` is only needed when ``sac.periodic_reset_enabled`` rebuilds models."""
+    def __init__(self, *, model_cfg=None, controller_cfg=None, **kwargs) -> None:
+        """``model_cfg`` and ``controller_cfg`` are only needed when
+        ``sac.periodic_reset_enabled`` rebuilds models — a rebuild has to reproduce the same
+        actor, including the derived MATCH pairs."""
         super().__init__(**kwargs)
         self._model_cfg = model_cfg
+        self._controller_cfg = controller_cfg
 
         required = ("policy", "critic_1", "critic_2", "target_critic_1", "target_critic_2")
         missing = [k for k in required if self.models.get(k) is None]
@@ -140,6 +143,8 @@ class SAC(LearnerBase):
             self.memory.create_tensor(name="states", size=self.state_space, dtype=torch.float32)
             self.memory.create_tensor(name="next_states", size=self.state_space, dtype=torch.float32)
             self._tensors_names += ["states", "next_states"]
+        # whatever the configured aux losses need per transition (e.g. contact flags)
+        self._tensors_names += self.create_aux_memory_tensors()
 
     # ------------------------------------------------------------------ normalization
     def normalize_observations(self, observations: torch.Tensor, train: bool = False) -> torch.Tensor:
@@ -160,7 +165,9 @@ class SAC(LearnerBase):
         # no_grad: these actions only drive the env; the update re-runs the policy on replay
         # batches. A live graph here would be spliced into the env's action buffers and grow.
         with torch.no_grad():
-            return self.policy.act(inputs, role="policy")
+            actions, outputs = self.policy.act(inputs, role="policy")
+        self.emit_selection(outputs, timestep)
+        return actions, outputs
 
     def record_transition(
         self,
@@ -196,6 +203,7 @@ class SAC(LearnerBase):
                 )
             extra["states"] = states
             extra["next_states"] = next_states
+        extra.update(self.aux_memory_values(infos))
         self.memory.add_samples(
             observations=observations,
             actions=actions,
@@ -478,6 +486,7 @@ class SAC(LearnerBase):
             self.action_space,
             self.num_agents,
             self.device,
+            self._controller_cfg,
         )
         for key in ("policy", "critic_1", "critic_2", "target_critic_1", "target_critic_2"):
             self.models[key] = fresh[key]

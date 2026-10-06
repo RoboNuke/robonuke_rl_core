@@ -95,26 +95,30 @@ def test_force_settings_without_the_force_branch_raise():
 
     # the same values with the branch on are fine
     controller(use_force=True, force_gain_max=[500.0] * 6).validate(
-        FakeCfg(FakeActor([7, 8, 9, 10, 11, 12]))
+        FakeCfg(FakeActor([7, 8, 9]))
     )
 
 
 # ------------------------------------------------------------------ the Bernoulli cross-check
 def test_both_branches_need_the_selection_block_as_the_bernoulli_dims():
-    cfg = FakeCfg(FakeActor(bernoulli=[7, 8, 9, 10, 11, 12]))
-    controller(use_force=True).validate(cfg)  # the selection block is [6..11]
+    # force_axes defaults to the 3-D hybrid mask, so the selection block is [7, 8, 9]
+    controller(use_force=True).validate(FakeCfg(FakeActor(bernoulli=[7, 8, 9])))
+    # and 6-D hybrid, which an experiment has to ask for, moves it to [7..12]
+    controller(use_force=True, force_axes=[1] * 6).validate(
+        FakeCfg(FakeActor(bernoulli=[7, 8, 9, 10, 11, 12]))
+    )
 
 
 @pytest.mark.parametrize(
     "declared",
-    [None, [], [7, 8, 9, 10, 11], [7, 8, 9, 10, 11, 12, 13], [8, 9, 10, 11, 12, 13], [0, 1, 2, 3, 4, 5]],
+    [None, [], [7, 8], [7, 8, 9, 10], [8, 9, 10], [0, 1, 2], [7, 8, 9, 10, 11, 12]],
 )
 def test_missing_extra_or_shifted_bernoulli_dims_raise(declared):
     with pytest.raises(ValueError) as err:
         controller(use_force=True).validate(FakeCfg(FakeActor(bernoulli=declared)))
     message = str(err.value)
     assert "bernoulli_action_dims" in message
-    assert "[7, 8, 9, 10, 11, 12]" in message  # it names the indices it expects
+    assert "[7, 8, 9]" in message  # it names the indices it expects
 
 
 def test_a_single_branch_must_declare_no_bernoulli_dims():
@@ -127,7 +131,7 @@ def test_a_single_branch_must_declare_no_bernoulli_dims():
 def test_force_zero_dims_may_not_collide_with_controller_blocks():
     with pytest.raises(ValueError) as err:
         controller(use_force=True).validate(
-            FakeCfg(FakeActor(bernoulli=[7, 8, 9, 10, 11, 12], force_zero=[3, 4]))
+            FakeCfg(FakeActor(bernoulli=[7, 8, 9], force_zero=[3, 4]))
         )
     assert "force_zero_action_dims" in str(err.value) and "[3, 4]" in str(err.value)
 
@@ -222,7 +226,8 @@ def test_the_mask_sets_how_many_axes_are_hybrid():
             {"use_pose": False, "use_force": True, "force_axes": [1, 1, 1, 0, 0, 0]},
             "no controller at all",
         ),
-        ({"force_axes": [1, 1, 1, 0, 0, 0]}, "use_force"),  # set while the branch is off
+        # set while the branch is off: anything other than the default is a mistake
+        ({"force_axes": [1, 1, 1, 1, 1, 1]}, "use_force"),
     ],
 )
 def test_the_mask_rules_fail_on_a_bad_value(overrides, needle):

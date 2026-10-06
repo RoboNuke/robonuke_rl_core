@@ -6,16 +6,17 @@ controller's capabilities rather than configured:
 ===========  ==========  ======================================  ==========================
 ``use_pose`` ``use_force``  layout                                fixed blocks
 ===========  ==========  ======================================  ==========================
-yes          no          ``[pose | gains?]``                     ``S = I``, ``f_d = 0``
-no           yes         ``[force | gains?]``                    ``S = 0``
+yes          no          ``[pose | gains?]``                     ``S = 0``, ``f_d = 0``
+no           yes         ``[force | gains?]``                    ``S = I``
 yes          yes         ``[pose | selection | force | gains?]``  —
 ===========  ==========  ======================================  ==========================
 
 The selection block exists exactly when both branches are on, because that is the only case
-where the policy has a choice to make. ``S`` multiplies the pose branch (``S = 1`` on an axis
-means that axis is position-controlled), so pose-only with ``S = I`` and ``f_d = 0`` *is* pure
-impedance control — the degenerate modes are exact, not
-approximations, which is why one torque path serves every configuration.
+where the policy has a choice to make. **A selection of 1 means that axis is
+force-controlled**, 0 means position-controlled — the one convention this package uses, from
+the policy's Bernoulli bit through the action vector and the metrics to ``S`` in the torque
+law. So pose-only with ``S = 0`` and ``f_d = 0`` *is* pure impedance control: the degenerate
+modes are exact, not approximations, which is why one torque path serves every configuration.
 
 ``gains?`` is empty under ``gain_mapping: constant``; under ``variable_diagonal`` it is one
 action per axis of each live branch (``[K | K_f]``), so a new mapping is a new entry in
@@ -30,7 +31,8 @@ its position bounds and its upright constraint to it; only the torque law is our
 axes the force branch may take, so the selection, force-target and K_f blocks are all as wide
 as its sum: ``[1, 1, 1, 0, 0, 0]`` is the usual 3-D hybrid (force on translation, orientation
 always position-controlled), ``[1]*6`` is 6-D, ``[0, 0, 1, 0, 0, 0]`` is force on z alone. An
-axis outside the mask is never offered to the policy and keeps ``S = 1``.
+axis outside the mask is never offered to the policy and keeps ``S = 0``, i.e. stays
+position-controlled.
 """
 
 from __future__ import annotations
@@ -120,6 +122,33 @@ class ActionLayout:
         """Action indices of the selection block — the actor's Bernoulli dims."""
         return list(range(self.selection_slice.start, self.selection_slice.stop))
 
+    @property
+    def pos_component_indices(self) -> List[int]:
+        """Action index of the **pose** half of each gated pair, in selection order.
+
+        Selection bit ``k`` governs force-eligible axis ``force_axes[k]``, whose two
+        candidates are the pose target for that axis (inside the pose block, which is the
+        env's own action vector, so the axis index *is* the offset) and force target ``k``
+        (inside the force block, which is packed in ``force_axes`` order). MATCH needs both
+        lists; they are derived here so no experiment ever hand-writes them, and they are
+        empty when there is no selection to condition on.
+        """
+        if not self.selection_dim:
+            return []
+        return [self.pose_slice.start + axis for axis in self.force_axes]
+
+    @property
+    def force_component_indices(self) -> List[int]:
+        """Action index of the **force** half of each gated pair, in selection order."""
+        if not self.selection_dim:
+            return []
+        return list(range(self.force_slice.start, self.force_slice.stop))
+
+    @property
+    def selection_axis_names(self) -> List[str]:
+        """Axis name per selection bit (``x``, ``z``, ``Rx``, ...), for logging."""
+        return [AXES[axis] for axis in self.force_axes] if self.selection_dim else []
+
     def describe(self) -> str:
         """One line per block, for the wrapper to print when it attaches."""
         blocks = [
@@ -139,8 +168,8 @@ class ActionLayout:
 class ActionInterface:
     """Splits a policy action into what the controller needs, with the degenerate fills.
 
-    :meth:`split` returns ``(pose_target, selection, force_target, K, K_f)`` for every
-    configuration: pose-only fills ``S = I`` and ``f_d = 0``, force-only fills ``S = 0``, and
+    :meth:`split` returns ``(pose_target, force_selection, force_target, K, K_f)`` for every
+    configuration: pose-only fills ``S = 0`` and ``f_d = 0``, force-only fills ``S = I``, and
     ``constant`` gains ignore the actions entirely. Everything is ``(num_envs, ...)`` torch,
     built on the device the actions arrive on.
     """
@@ -159,6 +188,18 @@ class ActionInterface:
     @property
     def selection_indices(self) -> List[int]:
         return self.layout.selection_indices
+
+    @property
+    def pos_component_indices(self) -> List[int]:
+        return self.layout.pos_component_indices
+
+    @property
+    def force_component_indices(self) -> List[int]:
+        return self.layout.force_component_indices
+
+    @property
+    def selection_axis_names(self) -> List[str]:
+        return self.layout.selection_axis_names
 
     def _axis_index(self, like: torch.Tensor) -> torch.Tensor:
         """Indices of the force-eligible axes, as a tensor on the action's device."""
@@ -182,10 +223,10 @@ class ActionInterface:
     def split(
         self, actions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``(pose_target, selection, force_target, K, K_f)`` from one batch of actions.
+        """``(pose_target, force_selection, force_target, K, K_f)`` from one batch of actions.
 
-        ``selection`` is ``(num_envs, 6)`` of 0/1 — **1 means position-controlled**, matching
-        ``S`` in ``tau = J^T [ S (K e - D v) + (I - S) K_f (f_d - f) ]``.
+        ``force_selection`` is ``(num_envs, 6)`` of 0/1 — **1 means force-controlled** —
+        matching ``S`` in ``tau = J^T [ (I - S) (K e - D v) + S K_f (f_d - f) ]``.
         ``K`` and ``K_f`` are ``(num_envs, 6)`` diagonals; the damping ``D`` is derived from
         ``K`` by :meth:`damping`, never commanded.
         """
@@ -207,17 +248,17 @@ class ActionInterface:
         )
 
         if layout.selection_dim:
-            # S multiplies the POSE branch, so S = 1 is "this axis is position-controlled".
-            # The actor emits selection actions as +/-1 (its Bernoulli convention): positive
-            # keeps the axis on position, negative hands it to the force law. Axes outside
-            # force_axes are not offered to the policy and stay position-controlled.
-            selection = torch.ones_like(zeros)
+            # S = 1 is "this axis is force-controlled". The actor emits selection actions as
+            # +/-1 (its Bernoulli convention), so a positive action hands the axis to the
+            # force law and a negative one keeps it on position. Axes outside force_axes are
+            # not offered to the policy and stay position-controlled (S = 0).
+            selection = zeros.clone()
             chosen = (actions[:, layout.selection_slice] > 0.0).to(actions.dtype)
             selection[:, self._axis_index(actions)] = chosen
         elif layout.use_pose:
-            selection = torch.ones_like(zeros)  # pose-only: S = I, pure impedance everywhere
+            selection = zeros.clone()  # pose-only: S = 0, pure impedance everywhere
         else:
-            selection = zeros.clone()  # force-only: S = 0, the force law owns every axis
+            selection = torch.ones_like(zeros)  # force-only: S = I, the force law owns every axis
 
         if layout.use_force:
             index = self._axis_index(actions)
@@ -253,7 +294,7 @@ class ActionInterface:
             if layout.force_gain_slice.stop > layout.force_gain_slice.start:
                 index = self._axis_index(actions)
                 # off-mask axes keep the constant K_f; they are position-controlled anyway
-                # (S = 1 there), so (I - S) zeroes their force term whatever K_f says
+                # (S = 0 there), so the force term is zeroed whatever K_f says
                 force_gains = self._vector("default_force_gains", actions).expand(
                     rows, AXIS_DIM
                 ).clone()

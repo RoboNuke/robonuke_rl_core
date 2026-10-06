@@ -9,6 +9,11 @@ Two pieces, like the recorder camera:
   end-effector frame, thresholds each axis, publishes the flags on the step metric channel
   and — when asked — appends them to the observation.
 
+When a controller with a selection block is configured, the wrapper also publishes
+``infos["in_contact"]``: the same flags, restricted to the force-eligible axes **in
+selection order**, which is the per-transition target the supervised selection loss learns
+against. That alignment is why the controller config reaches this wrapper at all.
+
 Reads from the env: ``scene.sensors``, ``fingertip_midpoint_quat``, ``cfg.observation_space``
 / ``cfg.state_space``, and ``_get_observations``, which it wraps.
 
@@ -27,7 +32,16 @@ import torch
 
 from .compat import require_forge_env
 
-__all__ = ["install_contact_sensor", "ForgeContactSensorWrapper", "SENSOR_KEY", "ENV_READS"]
+__all__ = [
+    "install_contact_sensor",
+    "ForgeContactSensorWrapper",
+    "SENSOR_KEY",
+    "SELECTION_FLAGS_KEY",
+    "ENV_READS",
+]
+
+#: top-level ``infos`` key the selection-ordered contact flags are published under
+SELECTION_FLAGS_KEY = "in_contact"
 
 #: scene-sensor name the contact sensor is registered under
 SENSOR_KEY = "peg_contact_sensor"
@@ -137,13 +151,14 @@ class ForgeContactSensorWrapper(gym.Wrapper):
     #: one flag per task-space translation axis
     FLAGS = 3
 
-    def __init__(self, env: Any, cfg: Any, task_name: str) -> None:
+    def __init__(self, env: Any, cfg: Any, task_name: str, controller_cfg: Any = None) -> None:
         require_forge_env(task_name, type(self).__name__, ENV_READS)
         super().__init__(env)
         unwrapped = env.unwrapped
         self.cfg = cfg
         self.device = unwrapped.device
         self.num_envs = int(unwrapped.num_envs)
+        self._selection_axes = self._resolve_selection_axes(controller_cfg)
 
         sensors = getattr(getattr(unwrapped, "scene", None), "sensors", {}) or {}
         if SENSOR_KEY not in sensors:
@@ -171,6 +186,33 @@ class ForgeContactSensorWrapper(gym.Wrapper):
 
         self._original_get_observations = unwrapped._get_observations
         unwrapped._get_observations = self._get_observations
+
+    # ------------------------------------------------------------------ the selection order
+    def _resolve_selection_axes(self, controller_cfg: Any):
+        """The force-eligible axes, in selection order, or None without a selection block.
+
+        A rotation axis is not negotiable: the sensor gives a contact *force*, so there is
+        one flag per translation axis and none for a torque. Publishing a tensor whose
+        columns did not line up with the selection dims would mis-supervise the axis
+        silently, so a force-eligible rotation axis raises here instead.
+        """
+        if controller_cfg is None or not getattr(controller_cfg, "enabled", False):
+            return None
+        from ..interface import AXES, ActionLayout
+
+        layout = ActionLayout(controller_cfg)
+        if not layout.selection_dim:
+            return None
+        beyond = [AXES[axis] for axis in layout.force_axes if axis >= self.FLAGS]
+        if beyond:
+            raise ValueError(
+                f"wrappers.contact has one in-contact flag per translation axis "
+                f"{AXES[: self.FLAGS]}, but controller.force_axes makes {beyond} "
+                "force-eligible too, and a contact force says nothing about a torque axis. "
+                f"Narrow controller.force_axes to the first {self.FLAGS} axes, or disable "
+                "wrappers.contact."
+            )
+        return list(layout.force_axes)
 
     # ------------------------------------------------------------------ the flags
     def refresh(self) -> torch.Tensor:
@@ -212,4 +254,8 @@ class ForgeContactSensorWrapper(gym.Wrapper):
             for index, axis in enumerate("xyz"):
                 metrics[f"contact/in_contact_{axis}"] = flags[:, index]
             metrics["contact/in_contact_any"] = flags.amax(dim=1)
+            if self._selection_axes is not None:
+                # a top-level key, not a metric: the learner stores it per transition for
+                # the supervised selection loss, which needs it aligned with the selection
+                infos[SELECTION_FLAGS_KEY] = flags[:, self._selection_axes]
         return observations, rewards, terminated, truncated, infos

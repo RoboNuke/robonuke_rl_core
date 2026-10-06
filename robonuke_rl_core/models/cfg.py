@@ -53,6 +53,15 @@ class SimbaActorCfg:
     force_zero_action_dims: Optional[List[int]] = None
     #: action dims whose output weights are scaled by ``last_layer_scale`` (default: all)
     scale_down_action_dims: Optional[List[int]] = None
+    #: how the selection dims and the continuous dims form one joint distribution:
+    #: "product" (independent: one density times the Bernoullis) or "match" (conditional:
+    #: each selection dim picks which of its two continuous components is live). Checked in
+    #: SimbaModelCfg.validate; "match" needs the controller's (pose, force) pairs, which the
+    #: model factory derives from the action layout.
+    selection_distribution: str = "product"
+    #: added to the selection logits' output bias at init, so training starts biased toward
+    #: one branch: sigmoid(-2.2) ~= 0.1, i.e. ~90% position at the first step
+    selection_init_bias: float = 0.0
 
 
 @dataclass
@@ -85,6 +94,50 @@ class SimbaModelCfg:
             raise ValueError(
                 f"model.actor.min_log_std ({self.actor.min_log_std}) must be below "
                 f"max_log_std ({self.actor.max_log_std})"
+            )
+
+        from .simba import SELECTION_DISTRIBUTIONS
+
+        if self.actor.selection_distribution not in SELECTION_DISTRIBUTIONS:
+            raise ValueError(
+                "model.actor.selection_distribution must be one of "
+                f"{SELECTION_DISTRIBUTIONS}, got {self.actor.selection_distribution!r}"
+            )
+        selection = self.actor.bernoulli_action_dims or []
+        if self.actor.selection_distribution == "match" and not selection:
+            raise ValueError(
+                "model.actor.selection_distribution: 'match' conditions the continuous "
+                "density on the selection dims, so model.actor.bernoulli_action_dims must "
+                "name them; got none"
+            )
+        if self.actor.selection_distribution == "match":
+            self._check_match_has_a_controller(cfg)
+        if self.actor.selection_init_bias and not selection:
+            raise ValueError(
+                "model.actor.selection_init_bias "
+                f"({self.actor.selection_init_bias}) biases the selection logits, but "
+                "model.actor.bernoulli_action_dims names no selection dims"
+            )
+
+    def _check_match_has_a_controller(self, cfg: Any) -> None:
+        """``match`` gates (pose, force) pairs, and only the controller can say which.
+
+        The pairs are derived from ``controller.force_axes`` and the action layout (see
+        ``models/factory.actor_kwargs``), so ``match`` without a controller that has a
+        selection block has nothing to condition on. The actor would raise when it is built;
+        this says the same thing at config load, naming the field to change.
+        """
+        controller = getattr(cfg, "controller", None) if cfg is not None else None
+        if controller is None:
+            return  # no controller section registered: nothing to check against
+        from ..envs.interface import ActionLayout
+
+        if not getattr(controller, "enabled", False) or not ActionLayout(controller).selection_dim:
+            raise ValueError(
+                "model.actor.selection_distribution: 'match' gates each selection dim's "
+                "(pose, force) pair, which is derived from the controller's action layout. "
+                "It needs controller.enabled, controller.use_pose and controller.use_force "
+                "all true (that is the only case with a selection block)."
             )
 
 

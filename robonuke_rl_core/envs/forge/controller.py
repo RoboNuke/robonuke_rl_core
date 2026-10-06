@@ -24,7 +24,7 @@ from typing import Any, Optional
 import gymnasium as gym
 import torch
 
-from ..interface import ActionInterface
+from ..interface import AXES, ActionInterface
 from . import control
 from .compat import require_forge_env
 
@@ -75,8 +75,10 @@ class ForgeControllerWrapper(gym.Wrapper):
                 "sensor (env.force_sensor_smooth), which this env does not expose"
             )
 
-        # per-step buffers the control step reads
-        self._selection = torch.ones((self.num_envs, 6), device=self.device)
+        # per-step buffers the control step reads. The selection starts at 0 — every axis
+        # position-controlled — because that is the pose-only fill and the safe default
+        # before the first action arrives.
+        self._selection = torch.zeros((self.num_envs, 6), device=self.device)
         self._force_target = torch.zeros((self.num_envs, 6), device=self.device)
         self._force_gains = torch.zeros((self.num_envs, 6), device=self.device)
         self._stiffness: Optional[torch.Tensor] = None
@@ -126,8 +128,8 @@ class ForgeControllerWrapper(gym.Wrapper):
         their geometric map.
         """
         action = action.to(self.device)
-        pose, selection, force_target, stiffness, force_gains = self.interface.split(action)
-        self._selection = selection
+        pose, force_selection, force_target, stiffness, force_gains = self.interface.split(action)
+        self._selection = force_selection
         self._force_target = force_target
         self._force_gains = force_gains
         self._stiffness = stiffness if self.cfg.gain_mapping != "constant" else None
@@ -158,7 +160,7 @@ class ForgeControllerWrapper(gym.Wrapper):
         stiffness, damping = self._gains()
 
         wrench = control.unified_wrench(
-            selection=self._selection,
+            force_selection=self._selection,
             delta_pose=delta_pose,
             linvel=unwrapped.fingertip_midpoint_linvel,
             angvel=unwrapped.fingertip_midpoint_angvel,
@@ -201,6 +203,17 @@ class ForgeControllerWrapper(gym.Wrapper):
         if self._stiffness is None:
             return unwrapped.task_prop_gains, unwrapped.task_deriv_gains
         return self._stiffness, self.interface.damping(self._stiffness)
+
+    def step(self, action):
+        observations, rewards, terminated, truncated, infos = self.env.step(action)
+        if isinstance(infos, dict) and self.layout.selection_dim:
+            metrics = infos.setdefault("metrics_to_log", {})
+            # the choice the policy actually made this step, per axis: 1 is force-controlled,
+            # so the mask IS the force fraction. This is the realized counterpart of the
+            # learner's selection/p_force_<axis>, which logs the probability behind it.
+            for axis in self.layout.force_axes:
+                metrics[f"selection/force_{AXES[axis]}"] = self._selection[:, axis]
+        return observations, rewards, terminated, truncated, infos
 
     def measured_wrench(self) -> torch.Tensor:
         """The wrist force/torque the force loop closes on, in the fingertip frame."""

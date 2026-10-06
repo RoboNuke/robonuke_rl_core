@@ -128,6 +128,8 @@ class PPO(LearnerBase):
         if self._asymmetric:
             self.memory.create_tensor(name="states", size=self.state_space, dtype=torch.float32)
             self._tensors_names.insert(1, "states")
+        # whatever the configured aux losses need per transition (e.g. contact flags)
+        self._tensors_names += self.create_aux_memory_tensors()
 
     def _set_learning_rates(self, timesteps: int) -> None:
         """The LR for this update, from the update count alone (never from the data)."""
@@ -189,6 +191,7 @@ class PPO(LearnerBase):
             if self.training:
                 values, _ = self.value.act(self._value_inputs(observations, states), role="value")
                 self._current_values = self.normalize_values(values, inverse=True)
+        self.emit_selection(outputs, timestep)
         return actions, outputs
 
     def record_transition(
@@ -241,6 +244,7 @@ class PPO(LearnerBase):
             if states is None:
                 raise RuntimeError("asymmetric PPO needs states from the trainer (env.state())")
             samples["states"] = states
+        samples.update(self.aux_memory_values(infos))
         self.memory.add_samples(**samples)
 
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
