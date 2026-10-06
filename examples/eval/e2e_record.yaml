@@ -1,0 +1,16 @@
+# The e2e run's recorded eval: 8 episodes on 4 envs, one mp4 per (round, env).
+#
+#   python scripts/eval.py --run <entity>/forge_pih/<run> \
+#       --eval_config examples/eval/e2e_record.yaml --record
+eval:
+  num_rollouts: 8
+  record: true
+
+task:
+  cfg:
+    scene:
+      num_envs: 4
+
+wrappers:
+  efficient_reset:
+    enabled: false

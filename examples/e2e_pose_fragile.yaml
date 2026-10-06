@@ -1,0 +1,65 @@
+# End-to-end validation run: pose-only SAC on Forge peg insert with a fragile peg.
+#
+# The first real training run of the full stack (vmap models, BlockAdamW, flat memory,
+# wandb logging, unified controller, fragile + efficient reset + contact sensing).
+# Hyperparameters are the fixed-gain SAC baseline from
+# RoboNuke/generalized_hybrid_vic_action_space (fixed_angle_peg_FORGE/1_fixed.yaml);
+# the 10 N break force is the middle of Continuous_Force_RL's breakable conditions
+# (5/10/15/20 N). gain_mapping stays the default `constant`, so the action space is the
+# native 7 dims and the gains come from the env's own Forge defaults (task.cfg.ctrl.*).
+#
+#   python scripts/train.py --config examples/e2e_pose_fragile.yaml --headless
+base: forge_base.yaml
+
+experiment:
+  num_agents: 3
+  seed: 42
+
+wandb:
+  group: e2e_pose_10N
+
+trainer:
+  total_timesteps: 10000
+  write_interval: 150
+  checkpoint_interval: 2500
+
+task:
+  cfg:
+    scene:
+      num_envs: 768
+      # the contact sensor needs real per-env prims, not Fabric-cloned ones
+      clone_in_fabric: false
+
+sac:
+  gradient_steps: 8
+  batch_size: 1024
+  actor_lr: 1.0e-4
+  critic_lr: 1.0e-4
+  entropy_lr: 1.0e-4
+  weight_decay: 1.0e-2
+  learning_starts: 300
+  initial_entropy_value: 1.0e-2
+  target_entropy: -3.5
+
+model:
+  actor:
+    act_init_std: 1.0
+    last_layer_scale: 0.1
+    # shrink only the pose deltas at init; V's convention
+    scale_down_action_dims: [0, 1, 2, 3, 4, 5]
+  critic:
+    critic_n: 4
+    critic_latent: 1024
+
+controller:
+  enabled: true
+
+wrappers:
+  fragile:
+    enabled: true
+    break_force: [10.0]
+  efficient_reset:
+    enabled: true
+  contact:
+    enabled: true
+    append_to_critic_state: true

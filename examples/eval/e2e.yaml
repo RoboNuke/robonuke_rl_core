@@ -1,0 +1,16 @@
+# The e2e run's eval: 256 fresh-condition episodes over 64 envs (4 rounds).
+# Efficient reset must be off in eval (eval raises otherwise): every round needs
+# independently sampled initial conditions.
+#
+#   python scripts/eval.py --run <entity>/forge_pih/<run> --eval_config examples/eval/e2e.yaml
+eval:
+  num_rollouts: 256
+
+task:
+  cfg:
+    scene:
+      num_envs: 64
+
+wrappers:
+  efficient_reset:
+    enabled: false
