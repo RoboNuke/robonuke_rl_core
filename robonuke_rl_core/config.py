@@ -24,11 +24,19 @@ from typing import Any, Dict, List
 from omegaconf import MISSING, DictConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
+from .configfile import (
+    OVERRIDE_RE,
+    chain,
+    cli_layer,
+    file_layer,
+    load_file_chain,
+    reject_interpolation,
+)
+
 #: keys that may never be a section name: ``base`` steers the file chain, ``task`` is built
 #: separately from the env cfg, ``meta`` and ``derived`` are written by the pipeline
 RESERVED = ("base", "task", "meta", "derived")
 RESOLVED_NAME = "resolved_config.yaml"
-OVERRIDE_RE = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*=.*$", re.DOTALL)
 
 
 # ----------------------------------------------------------------------------- sections
@@ -171,59 +179,21 @@ class Config:
 
 
 # ----------------------------------------------------------------------------- the chain
-def _chain(path: str | Path) -> List[Path]:
-    """Follow ``base`` from ``path``; return the files most-base first."""
-    start = Path(path).expanduser()
-    if not start.is_file():
-        raise FileNotFoundError(f"config file not found: {start}")
-    chain: List[Path] = []
-    current = start.resolve()
-    while True:
-        if current in chain:
-            shown = " -> ".join(str(p) for p in chain + [current])
-            raise ValueError(f"'base' chain is a cycle: {shown}")
-        chain.append(current)
-        base = OmegaConf.load(current).get("base")
-        if base is None:
-            break
-        nxt = Path(str(base)).expanduser()
-        nxt = (nxt if nxt.is_absolute() else current.parent / nxt).resolve()
-        if not nxt.is_file():
-            shown = " -> ".join(str(p) for p in chain)
-            raise FileNotFoundError(
-                f"base config file not found: {nxt}\n  named by 'base: {base}' in {current}\n"
-                f"  'base' is relative to the file that names it\n  chain so far: {shown}"
-            )
-        current = nxt
-    return list(reversed(chain))
-
-
-def _file_layer(path: Path) -> DictConfig:
-    """One config file as a layer, without its ``base`` key."""
-    layer = OmegaConf.load(path)
-    if not isinstance(layer, DictConfig):
-        raise ValueError(f"{path}: the top level of a config file must be a mapping")
-    layer.pop("base", None)
-    return layer
-
-
-def _cli_layer(overrides: Any) -> DictConfig:
-    """Leftover CLI args as the last layer."""
-    overrides = list(overrides or [])
-    for arg in overrides:
-        if not isinstance(arg, str) or not OVERRIDE_RE.match(arg):
-            raise ValueError(
-                f"unrecognized argument {arg!r}: a config override must look like "
-                "'section.field=value' (e.g. task.cfg.scene.num_envs=128); declare every other "
-                "argument on the parser"
-            )
-    return OmegaConf.from_dotlist(overrides)
+# Reading files -- the `base` chain, one layer per file, the CLI layer -- lives in
+# `configfile.py`, which imports nothing heavier than OmegaConf. The HPC submitters run on a
+# login node with no torch and need the same chain reader; this module cannot be imported
+# there (registering the `eval` section pulls evaluation.py, which imports torch). These
+# aliases keep the private names this module has always used.
+_chain = chain
+_file_layer = file_layer
+_cli_layer = cli_layer
+_reject_interpolation = reject_interpolation
 
 
 # ---------------------------------------------------------------------------- the pipeline
 def load_config(path: str | Path, overrides: Any = None) -> Config:
     """Resolve a config file (plus its ``base`` chain and CLI overrides) into one config."""
-    layers = [(str(p), _file_layer(p)) for p in _chain(path)]
+    layers = load_file_chain(path)
     layers.append(("CLI", _cli_layer(overrides)))
     return _build(layers)
 
@@ -252,7 +222,7 @@ def load_from_run(
 
     layers = [(str(path), layer)]
     for extra in list(extra_files or []):
-        layers += [(str(p), _file_layer(p)) for p in _chain(extra)]
+        layers += load_file_chain(extra)
     layers.append(("CLI", _cli_layer(overrides)))
     return _build(layers)
 
@@ -352,18 +322,6 @@ def _build(layers: List[tuple]) -> Config:
         if callable(hook):
             hook(cfg)
     return cfg
-
-
-def _reject_interpolation(data: Any, where: str, path: str = "") -> None:
-    """Configs never use OmegaConf interpolation; ``to_object`` would resolve it silently."""
-    if isinstance(data, dict):
-        for key, sub in data.items():
-            _reject_interpolation(sub, where, f"{path}.{key}" if path else str(key))
-    elif isinstance(data, list):
-        for i, sub in enumerate(data):
-            _reject_interpolation(sub, where, f"{path}[{i}]")
-    elif isinstance(data, str) and "${" in data:
-        raise ValueError(f"{where}: {path} = {data!r} uses '${{...}}' interpolation, which configs never use")
 
 
 def _leaf_paths(data: Any, path: str = "") -> List[str]:
@@ -515,6 +473,7 @@ from .envs.cfg import ControllerCfg, WrappersCfg  # noqa: E402
 from .evaluation import EvalCfg  # noqa: E402
 from .memory.cfg import MemoryCfg  # noqa: E402
 from .models.cfg import SimbaModelCfg, model_cfg_class  # noqa: E402
+from .hpc.cfg import HpcCfg  # noqa: E402
 
 register_section("experiment", ExperimentCfg)
 register_section("wandb", WandbCfg)
@@ -527,3 +486,4 @@ register_section("losses", LossesCfg)
 register_section("eval", EvalCfg)
 register_section("controller", ControllerCfg)
 register_section("wrappers", WrappersCfg)
+register_section("hpc", HpcCfg)

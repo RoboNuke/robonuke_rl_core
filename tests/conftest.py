@@ -28,6 +28,11 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "gpu: needs Isaac Sim and a GPU; run with `pytest -m gpu`"
     )
+    config.addinivalue_line(
+        "markers",
+        "hpc: needs a real SLURM + Apptainer cluster; run with `pytest -m hpc` on a login "
+        "node. Everything else about the launchers is covered on CPU through --dry_run.",
+    )
 
 
 

@@ -679,6 +679,97 @@ launched with `enable_cameras=True`. One mp4 per (round, env) is written as the 
 so memory is one frame per env. The GPU test suite therefore carries the camera on its shared
 env, which is why `pytest -m gpu` takes about three minutes rather than ninety seconds.
 
+## HPC launch
+
+`robonuke_rl_core/hpc/` submits package runs to SLURM + Apptainer. Three verbs, thin callers
+in the project's `launchers/`:
+
+```bash
+python launchers/launch_train.py <folder | config.yaml ...> --project P --group_prefix G
+python launchers/launch_sweep.py <configs> --project P --group_prefix G \
+    --sweep_param sac.actor_lr --label lr --value 1.0e-4 --value 3.0e-4
+python launchers/launch_eval.py --eval_config F --project P [--group G ...]
+```
+
+### Naming
+
+wandb is the interface, so every name derives from how runs appear there. `--project` and
+`--group_prefix` are **required**; `--tag` is repeatable.
+
+| thing | value |
+| --- | --- |
+| wandb project | `--project` |
+| wandb group | `{group_prefix}_{config_stem}`, sweeps append `_{LABEL}-{value}` |
+| run names | `{group}_a{i}` (the existing `derived.run_names` rule) |
+| SLURM job name | the group, exactly |
+| SLURM logs | `{hpc.exp_log_dir}/{project}/{group}_%j.out` / `.err` |
+| wandb tags | chain's `wandb.tags` + every `--tag` + (sweeps) `{LABEL}-{value}` |
+
+A hyphen joins a `{LABEL}-{value}` pair because the two belong together; joins between parts
+of a name stay underscores. The launcher passes the three wandb keys in as ordinary CLI
+overrides, **last**, so they are the final layer — and therefore it **rejects** a user
+override of `wandb.project`, `wandb.group` or `wandb.tags`, naming the flag instead. Two
+sources of truth for a run's name is how runs get lost. Every computed group is checked
+against the same rule `WandbCfg.validate` applies, before anything is queued.
+
+### Three rules that shape the code
+
+* **Import discipline.** Nothing in `robonuke_rl_core.hpc` may import torch, wandb or Isaac
+  Lab at module level: the submitters run on a login node with none of it. wandb is imported
+  inside `launch_eval.find_runs` only. This is why `configfile.py` exists — the `base`-chain
+  reader had to come out of `config.py`, which pulls torch through the `eval` section, so both
+  `load_config` and the submitter call the *same* chain functions.
+  `tests/hpc/test_import_discipline.py` enforces it in a subprocess.
+* **Fail before queue.** Every config in a batch is read, resolved and named before the first
+  job is submitted; a bad config aborts the whole submit naming the file, the field and the
+  value. After that gate a *submission* failure is reported and the batch continues.
+* **Bake the stack, bind the code.** The image bakes Isaac Sim, Isaac Lab and the package's
+  *dependencies* — the package itself is installed **editable** from a build-time clone at
+  `/opt/robonuke_rl_core`, and the job binds the cluster's live clone over that path. So
+  updating the package is `git pull`, and the image is rebuilt **only when `pyproject.toml`
+  dependencies change**, the same rule as a local editable install. The project repo is bound
+  and used as cwd; it is never installed.
+
+### The job
+
+`hpc/hpc_job.bash` ships as package data and is submitted **by path**. sbatch spools it, so
+it has no siblings at runtime and can source nothing: every input arrives as an exported
+`RNK_*` variable or as argv. It validates its inputs, picks a wandb mode (no key, or a key
+under 40 characters, means offline — logging must never kill an unattended job), builds the
+binds, and `exec`s apptainer so `--signal=TERM@300` reaches python rather than bash.
+
+`--eval_config` on `launch_train` makes it a train-then-eval job, which cannot be one exec'd
+python: the job runs `hpc_job_chain.bash` in-container instead, which runs training and then
+one eval per agent, **only if training exited 0**, each **non-fatal**. Training that finished
+is the expensive thing; a wandb hiccup in eval must not turn a completed run into a failed
+job. The wrapper forwards TERM to the live child.
+
+### Tests
+
+`tests/hpc/` is CPU and runs by default: the section's rules, the chain reader, every name,
+the three launchers end to end through `--dry_run` (which prints the exact `sbatch` line and
+submits nothing), and `hpc_job_chain.bash` driven against a stub interpreter — so "does it
+start the right processes" for a train-then-eval job is answered on CPU, with no cluster and
+no container.
+
+`tests/hpc/HPC/` carries `@pytest.mark.hpc` and needs a real cluster — run it on a login node
+with `RNK_TEST_CONFIG=<a config with an hpc section> pytest -m hpc tests/hpc/HPC`. Like the
+GPU marker, **nothing there skips silently**: a cluster test that cannot find its cluster
+fails. It is about the **SLURM path**, not the container: whether the image can import the
+stack is the build script's own `verify` step, run once at build time, so apptainer appears
+there only where it does in real use — on a compute node, inside a job SLURM started. It
+checks the tools and the paths, that `sbatch --test-only` accepts a submission without
+queueing it, that the resource flags are the config's, and then submits **one trivial job**
+and reads its log to prove our command ran, with the project root as cwd and the package
+resolving to the bound clone. That last one is the only check that the bake-the-stack /
+bind-the-code design actually holds; it costs a few seconds of one GPU. Nothing there records
+video — the recorder camera is a separate path with its own problems, and a launcher test has
+no business depending on it.
+
+Not built, deliberately: **resume** (the package has no true mid-training resume — optimizer
+state loads only at `num_agents == 1` — so a resume launcher would be a lie) and a **local
+sequential runner** (`--dry_run` prints runnable commands, which covers it).
+
 ## Add a config class (package or project)
 
 1. Write a `@dataclass` next to the code it configures. Type every field with an

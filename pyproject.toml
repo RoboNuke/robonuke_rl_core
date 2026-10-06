@@ -28,9 +28,17 @@ test = ["pytest"]
 [tool.setuptools.packages.find]
 include = ["robonuke_rl_core*"]
 
+# the job scripts are submitted by path, so they ship with the package
+[tool.setuptools.package-data]
+robonuke_rl_core = ["hpc/*.bash"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = [".", "tests/learners"]
-# plain `pytest` runs the CPU tests; `pytest -m gpu` runs the ones that need Isaac Sim.
+# the test-helper modules are plain modules (two conftest.py on the path shadow each other),
+# so their directories go on the path. Test file basenames must stay unique across tests/:
+# there is no __init__.py, so pytest names modules by basename alone.
+pythonpath = [".", "tests/learners", "tests/hpc"]
+# plain `pytest` runs the CPU tests; `pytest -m gpu` runs the ones that need Isaac Sim and
+# `pytest -m hpc` the ones that need a real cluster.
 # the ROS 2 pytest plugins are on sys.path in a sourced ROS shell and fail to import there.
-addopts = "-m 'not gpu' -p no:launch_testing -p no:launch_ros"
+addopts = "-m 'not gpu and not hpc' -p no:launch_testing -p no:launch_ros"

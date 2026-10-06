@@ -76,7 +76,7 @@ def test_every_section_loads_with_its_defaults(tmp_path):
     cfg = load_config(write(tmp_path))
     assert set(cfg.sections) == {
         "experiment", "wandb", "trainer", "sac", "ppo", "model", "memory", "losses", "eval",
-        "controller", "wrappers",
+        "controller", "wrappers", "hpc",
     }
     assert cfg.trainer.learner == "sac"
     assert cfg.sac.batch_size == 64  # a class default, not set by the file

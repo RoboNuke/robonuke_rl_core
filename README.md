@@ -397,6 +397,41 @@ reset → fragile → contact); see `CLAUDE.md` for why.
 | `task_metrics.enabled` | bool | `True` | publish the task's own outcomes **per agent** (success, termination cause, reward terms, `Success_Prediction/*`). The env logs the same things already, but averaged over every env, which mixes the agents. Skipped on a non-Forge task |
 | `orientation.mode` | str | `"quat"` | `quat` (the env's own `(w, x, y, z)`) or `6d_rot_mat` (first two columns of R, Zhou et al. 2019 — continuous, no double cover) |
 
+## hpc
+
+SLURM resources and container details for the launchers (`launch_train`, `launch_sweep`,
+`launch_eval`). **Resources are config, not a shell file**: cluster-wide values live in a base
+YAML in the project, an experiment overrides what differs, and a one-off goes on the CLI
+(`hpc.time=2-00:00:00`). The section rides the normal chain, so `resolved_config.yaml` records
+the resources each run actually had.
+
+**Every field defaults**, empty where there is no sane default — a required field here would
+break every local training run that never touches SLURM. `validate` checks *formats only*, and
+only on values that are set; the four fields a job cannot be built without (`account`,
+`partitions`, `sif_image`, `cache_home`) are enforced by the submitter, just before it queues
+anything, with an error naming each one.
+
+**`WANDB_API_KEY` is an environment variable, never a config field.** The launcher passes
+`sbatch --export=ALL`, which carries it from your login shell into the job. With no key (or a
+key shorter than 40 characters, i.e. a bad paste) the job logs offline rather than dying —
+an unattended run must not be killed by its logging.
+
+| field | type | default | what it does |
+| --- | --- | --- | --- |
+| `account` | str | `""` | `-A`, the allocation to charge. **Required at submit** |
+| `partitions` | str | `""` | `-p`, comma-separated and tried in order. **Required at submit** |
+| `time` | str | `"0-09:00:00"` | `--time`, as SLURM's `[D-]HH:MM:SS` |
+| `gpus` | int | `1` | `--gres=gpu:{gpus}`. The package trains every agent in one process on one GPU, so everything is written and tested for 1 |
+| `mem` | str | `"32G"` | `--mem` |
+| `cpus` | int | `12` | `-c`, CPUs per task |
+| `signal` | str | `"TERM@300"` | `--signal`; SLURM warns the job this far ahead of the walltime kill. The job `exec`s python, so the signal reaches the training process and not bash |
+| `exp_log_dir` | str | `"exp_logs"` | where `.out` / `.err` land, relative to the project root; logs go to `{exp_log_dir}/{project}/{name}_%j.out` |
+| `sif_image` | str | `""` | absolute path to the `.sif` on the cluster. **Required at submit** |
+| `apptainer_bin` | str | `"apptainer"` | or `"singularity"` |
+| `container_python` | str | `"python"` | the python inside the image |
+| `cache_home` | str | `""` | bound as the container `HOME`. Kit and shader caches land here and run to GBs, so it must be scratch, **never an NFS home with a quota**. **Required at submit** |
+| `binds` | list[str] | `[]` | extra `host:container` mounts |
+
 ## derived and meta
 
 Written by the pipeline into `resolved_config.yaml`; never set them in a config.
