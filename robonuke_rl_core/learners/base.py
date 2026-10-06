@@ -14,6 +14,7 @@ import dataclasses
 import glob
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -46,6 +47,21 @@ class _SkrlCfg(AgentCfg):
     """Minimal cfg for skrl's ``Agent``. Our own section cfg lives in ``self.cfg``."""
 
     experiment: SkrlExperimentCfg = field(default_factory=SkrlExperimentCfg)
+
+
+class _UpdateTimer:
+    """Times the block it wraps and records it on the learner."""
+
+    def __init__(self, learner: "LearnerBase") -> None:
+        self.learner = learner
+
+    def __enter__(self) -> "_UpdateTimer":
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.learner.update_ms = (time.perf_counter() - self._start) * 1.0e3
+        return None
 
 
 def run_dirs(cfg: Any) -> List[Path]:
@@ -128,6 +144,8 @@ class LearnerBase(Agent):
         self._mean_return: List[float] = [float("nan")] * num_agents
 
         self._rewards_shaper = self._resolve_rewards_shaper()
+        #: wall-clock ms of the last update, filled by :meth:`update_timer`
+        self.update_ms = 0.0
 
     # ------------------------------------------------------------------ setup
     def _resolve_rewards_shaper(self) -> Optional[Callable]:
@@ -211,6 +229,13 @@ class LearnerBase(Agent):
         ``record_transition``, before they touch the memory.
         """
         self._forward_env_metrics(infos, step)
+        if self.on_log:
+            # the instantaneous reward, per env: its spread across envs is published beside
+            # the mean (see logging.DISTRIBUTIONS), which an episode return cannot show
+            flat = rewards.reshape(-1)
+            for agent in range(self.num_agents):
+                lo = agent * self.envs_per_agent
+                self.emit(agent, {"reward/step": flat[lo : lo + self.envs_per_agent]}, step)
 
         done = torch.logical_or(terminated.reshape(-1), truncated.reshape(-1))
         self._episode_return += rewards.reshape(-1)
@@ -371,6 +396,15 @@ class LearnerBase(Agent):
 
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
         raise NotImplementedError
+
+    def update_timer(self):
+        """Context manager timing one update; the elapsed ms land in ``self.update_ms``.
+
+        Wall time around the update, the way skrl's own "algorithm update time" is measured.
+        No explicit CUDA sync: the next rollout step depends on these weights, so the queue
+        drains anyway, and a sync here would cost more than it measures.
+        """
+        return _UpdateTimer(self)
 
     def random_actions(self, rows: int) -> torch.Tensor:
         """Uniform actions on [-1, 1], the squashed policy's support.

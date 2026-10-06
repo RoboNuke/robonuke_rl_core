@@ -31,6 +31,7 @@ __all__ = [
     "EfficientResetCfg",
     "ContactCfg",
     "OrientationCfg",
+    "TaskMetricsCfg",
     "WrappersCfg",
 ]
 
@@ -323,6 +324,21 @@ class OrientationCfg:
 
 
 @dataclass
+class TaskMetricsCfg:
+    """Per-agent task outcomes: success, termination cause, reward terms, prediction quality.
+
+    On by default. The env logs the same quantities itself, but as scalars already averaged
+    over every env, which mixes the agents training side by side; this publishes them per
+    agent. Skipped for a task that is not Forge-family.
+    """
+
+    enabled: bool = True
+
+    def validate(self, cfg: Any) -> None:
+        return
+
+
+@dataclass
 class WrappersCfg:
     """The env wrappers, each off by default."""
 
@@ -330,9 +346,11 @@ class WrappersCfg:
     efficient_reset: EfficientResetCfg = field(default_factory=EfficientResetCfg)
     contact: ContactCfg = field(default_factory=ContactCfg)
     orientation: OrientationCfg = field(default_factory=OrientationCfg)
+    task_metrics: TaskMetricsCfg = field(default_factory=TaskMetricsCfg)
 
     def validate(self, cfg: Any) -> None:
-        for group in (self.fragile, self.efficient_reset, self.contact, self.orientation):
+        for group in (self.fragile, self.efficient_reset, self.contact, self.orientation,
+                      self.task_metrics):
             group.validate(cfg)
         if self.fragile.enabled and self.fragile.require_contact and not self.contact.enabled:
             raise ValueError(

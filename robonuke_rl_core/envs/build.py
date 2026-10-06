@@ -25,7 +25,9 @@ __all__ = ["WRAPPER_ORDER", "prepare_task", "build_env", "describe", "rewrite_or
 #:    wrapper whose partial path its terminations trigger.
 #: 4. ``contact`` is outermost because it is the one that appends to the observation: it must
 #:    wrap after anything else that edits obs, or its flags would not be last.
-WRAPPER_ORDER = ("controller", "efficient_reset", "fragile", "contact")
+#: 5. ``task_metrics`` reads what the env did and publishes it per agent; it changes no
+#:    behaviour at all, so it goes outermost where it sees the finished step.
+WRAPPER_ORDER = ("controller", "efficient_reset", "fragile", "contact", "task_metrics")
 
 
 def prepare_task(cfg: Any, task_name: str, task_cfg: Any) -> None:
@@ -142,6 +144,19 @@ def build_env(cfg: Any, env: Any, task_name: str) -> Any:
             from .forge.contact import ForgeContactSensorWrapper
 
             env = ForgeContactSensorWrapper(env, wrappers.contact, task_name)
+        elif name == "task_metrics" and wrappers.task_metrics.enabled:
+            from .forge.compat import is_forge_task
+            from .forge.metrics import ForgeTaskMetricsWrapper
+
+            # on by default, so a non-Forge task skips it rather than failing the run; it
+            # reads Forge's own metric hooks and has nothing to read elsewhere
+            if is_forge_task(task_name):
+                env = ForgeTaskMetricsWrapper(env, wrappers.task_metrics, task_name)
+            else:
+                print(
+                    f"[envs] task metrics skipped: {task_name} is not a Forge-family task",
+                    flush=True,
+                )
     return env
 
 

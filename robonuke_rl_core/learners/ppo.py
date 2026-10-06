@@ -252,6 +252,10 @@ class PPO(LearnerBase):
 
     # ------------------------------------------------------------------ update
     def update(self, *, timestep: int, timesteps: int) -> None:
+        with self.update_timer():  # publishes stats/update_time_ms with the rest
+            self._update(timestep=timestep, timesteps=timesteps)
+
+    def _update(self, *, timestep: int, timesteps: int) -> None:
         num_agents = self.num_agents
         self._set_learning_rates(timesteps)
 
@@ -337,6 +341,11 @@ class PPO(LearnerBase):
                 entropy_per_agent = (
                     self.policy.get_entropy(role="policy").view(num_agents, rows, -1).mean(dim=(1, 2))
                 )
+                std_per_agent = (
+                    outputs["log_std"].exp().view(num_agents, rows, -1).mean(dim=(1, 2))
+                    if "log_std" in outputs
+                    else None
+                )
                 if self.cfg.entropy_loss_scale:
                     total_loss = total_loss - (
                         self.cfg.entropy_loss_scale * (keep_f * entropy_per_agent).sum() / num_agents
@@ -398,6 +407,13 @@ class PPO(LearnerBase):
                 if self.on_log:
                     accumulate("loss/policy", policy_per_agent)
                     accumulate("policy/entropy", entropy_per_agent)
+                    # what the entropy bonus actually contributed to the loss, not just the
+                    # entropy itself: this is the term that competes with the surrogate
+                    accumulate(
+                        "loss/entropy", -self.cfg.entropy_loss_scale * entropy_per_agent
+                    )
+                    if std_per_agent is not None:
+                        accumulate("policy/std", std_per_agent)
                     accumulate("ppo/clip_fraction", (
                         ((ratio - 1.0).abs() > self.cfg.ratio_clip).to(ratio.dtype)
                     ).view(num_agents, rows, -1).mean(dim=(1, 2)))
@@ -412,6 +428,9 @@ class PPO(LearnerBase):
             metrics = {name: torch.stack(values).mean(dim=0) for name, values in accumulated.items()}
             metrics["lr/policy"] = self.policy_optimizer.lr.to(torch.float32)
             metrics["lr/value"] = self.value_optimizer.lr.to(torch.float32)
+            metrics["stats/update_time_ms"] = torch.full(
+                (num_agents,), float(self.update_ms), device=self.device
+            )
             self.emit_per_agent(metrics, timestep)
 
     def _value_loss(self, sampled: dict, value_inputs: dict, rows: int):

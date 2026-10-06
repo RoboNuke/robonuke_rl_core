@@ -174,3 +174,58 @@ def test_the_directional_mode_uses_the_live_peg_axis(gpu_cfg, ready_env):
         assert not bool(wrapper.force_violations().any())  # 1e6 N thresholds
     finally:
         unwrapped._get_dones = original_dones
+
+
+# ------------------------------------------------------------------ task metrics
+def test_the_task_metrics_wrapper_publishes_per_agent_outcomes(gpu_cfg, ready_env):
+    """Success, cause, reward terms and prediction quality — per env, not pre-averaged."""
+    from robonuke_rl_core.envs.cfg import TaskMetricsCfg
+    from robonuke_rl_core.envs.forge.metrics import SUCCESS_PREDICTION, ForgeTaskMetricsWrapper
+
+    unwrapped = ready_env.unwrapped
+    originals = (unwrapped._log_factory_metrics, getattr(unwrapped, "_log_forge_metrics", None))
+    wrapper = ForgeTaskMetricsWrapper(unwrapped, TaskMetricsCfg(), gpu_cfg.task_name)
+    try:
+        zero = torch.zeros(ready_env.num_envs, *ready_env.action_space.shape, device=ready_env.device)
+        ready_env.step(zero)  # a step fills the taps
+
+        dtype = torch.float32
+        step_metrics = wrapper.step_metrics(dtype)
+        assert step_metrics, "no reward terms were captured from the env"
+        for name, value in step_metrics.items():
+            assert name.startswith("reward/")
+            assert value.shape == (unwrapped.num_envs,)  # per env, not a scalar
+            assert torch.isfinite(value).all()
+
+        episode = wrapper.episode_metrics(
+            torch.zeros(unwrapped.num_envs, 1, dtype=torch.bool, device=unwrapped.device),
+            torch.ones(unwrapped.num_envs, 1, dtype=torch.bool, device=unwrapped.device),
+            dtype,
+        )
+        assert "episode/success" in episode and "termination/timeout" in episode
+        assert episode["episode/success"].shape == (unwrapped.num_envs,)
+        # a success that never happened reports NaN, not a zero that would drag the mean down
+        assert torch.isnan(episode["episode/success_step"]).any()
+        # Forge's success-prediction action is scored under its own prefix
+        prediction = [name for name in episode if name.startswith(SUCCESS_PREDICTION)]
+        assert prediction, "the Forge success-prediction metrics are missing"
+        assert f"{SUCCESS_PREDICTION}/error" in episode
+    finally:
+        unwrapped._log_factory_metrics = originals[0]
+        if originals[1] is not None:
+            unwrapped._log_forge_metrics = originals[1]
+
+
+def test_the_fragile_wrapper_reports_which_break_happened(gpu_cfg, ready_env):
+    from robonuke_rl_core.envs.forge.fragile import ForgeFragileObjectWrapper
+
+    unwrapped = ready_env.unwrapped
+    original_dones = unwrapped._get_dones
+    cfg = FragileCfg(enabled=True, direction_break_force=True, break_force=[1.0e-6, 1.0e-6])
+    wrapper = ForgeFragileObjectWrapper(unwrapped, cfg, gpu_cfg.task_name)
+    try:
+        unwrapped._get_dones()  # thresholds at ~0: everything breaks, on both causes
+        assert set(wrapper._cause) == {"normal", "shear"}
+        assert bool(wrapper._cause["normal"].any()) or bool(wrapper._cause["shear"].any())
+    finally:
+        unwrapped._get_dones = original_dones

@@ -18,10 +18,20 @@ def _policy_head_bias(policy):
     return getattr(policy.net, "trunk__fc_out__bias")
 
 
-def collector():
-    """An on_log hook plus the list it fills."""
+def collector(skip=("reward/step",)):
+    """An on_log hook plus the list it fills.
+
+    The learner emits ``reward/step`` every step for every agent, which would drown out the
+    channel each test is actually about, so it is filtered out by default.
+    """
     seen: list[tuple[int, dict, int]] = []
-    return seen, lambda agent, metrics, step: seen.append((agent, dict(metrics), step))
+
+    def hook(agent, metrics, step):
+        kept = {name: value for name, value in metrics.items() if name not in skip}
+        if kept:
+            seen.append((agent, kept, step))
+
+    return seen, hook
 
 
 def step_once(
@@ -57,6 +67,21 @@ def step_once(
 
 
 # ------------------------------------------------------------------ 5. env metrics
+def test_the_instantaneous_reward_is_emitted_per_env_every_step():
+    """Its spread across envs is published beside the mean; an episode return cannot show it."""
+    learner = build_learner("sac", num_agents=3, envs_per_agent=2)
+    seen, hook = collector(skip=())
+    learner.on_log.append(hook)
+
+    rewards = torch.arange(6, dtype=torch.float32).unsqueeze(-1)
+    step_once(learner, rewards=rewards, step=2)
+
+    per_agent = {agent: metrics["reward/step"] for agent, metrics, _ in seen}
+    assert sorted(per_agent) == [0, 1, 2]
+    assert per_agent[0].tolist() == [0.0, 1.0]
+    assert per_agent[2].tolist() == [4.0, 5.0]
+
+
 def test_env_metrics_reach_each_hook_sliced_to_its_envs():
     learner = build_learner("sac", num_agents=3, envs_per_agent=2)
     seen, hook = collector()

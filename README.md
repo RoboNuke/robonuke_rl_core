@@ -351,6 +351,7 @@ reset → fragile → contact); see `CLAUDE.md` for why.
 | `contact.append_to_critic_state` | bool | `False` | append the 3 flags to the critic state (asymmetric tasks only) |
 | `contact.held_prim_expr` | str | `"/World/envs/env_.*/HeldAsset"` | prim path of the sensor's asset root |
 | `contact.fixed_prim_expr` | str | `"/World/envs/env_.*/FixedAsset"` | prim path the contact is filtered against |
+| `task_metrics.enabled` | bool | `True` | publish the task's own outcomes **per agent** (success, termination cause, reward terms, `Success_Prediction/*`). The env logs the same things already, but averaged over every env, which mixes the agents. Skipped on a non-Forge task |
 | `orientation.mode` | str | `"quat"` | `quat` (the env's own `(w, x, y, z)`) or `6d_rot_mat` (first two columns of R, Zhou et al. 2019 — continuous, no double cover) |
 
 ## derived and meta

@@ -88,6 +88,8 @@ class ForgeFragileObjectWrapper(gym.Wrapper):
         self._contacted = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._out_of_contact = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._broke = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        #: per-cause masks for the step that just ran, so a break is reported as *why*
+        self._cause: dict = {}
 
         self._original_get_dones = unwrapped._get_dones
         unwrapped._get_dones = self._get_dones
@@ -106,11 +108,18 @@ class ForgeFragileObjectWrapper(gym.Wrapper):
         )
 
     def force_violations(self) -> torch.Tensor:
+        """Which envs broke, and on which cause — the causes are what the metrics report."""
         force = self.measured_force()
         if self.break_force is not None:
-            return torch.linalg.norm(force, dim=1) >= self.break_force
+            broke = torch.linalg.norm(force, dim=1) >= self.break_force
+            self._cause["force"] = broke
+            return broke
         axial, shear = split_axial_shear(force, self.peg_axis())
-        return (axial >= self.normal_force) | (shear >= self.shear_force)
+        normal = axial >= self.normal_force
+        shear_broke = shear >= self.shear_force
+        self._cause["normal"] = normal
+        self._cause["shear"] = shear_broke
+        return normal | shear_broke
 
     def contact_violations(self) -> torch.Tensor:
         """Loss of contact, once contact has been made and the grace period is over."""
@@ -124,10 +133,13 @@ class ForgeFragileObjectWrapper(gym.Wrapper):
         )
         past_grace = unwrapped.episode_length_buf > self.cfg.require_contact_grace_steps
         debounced = self._out_of_contact >= self.cfg.require_contact_debounce_steps
-        return self._contacted & past_grace & debounced
+        lost = self._contacted & past_grace & debounced
+        self._cause["contact_loss"] = lost
+        return lost
 
     def _get_dones(self):
         terminated, time_out = self._original_get_dones()
+        self._cause = {}
         broke = self.force_violations()
         if self.require_contact:
             broke = broke | self.contact_violations()
@@ -139,10 +151,22 @@ class ForgeFragileObjectWrapper(gym.Wrapper):
         observations, rewards, terminated, truncated, infos = self.env.step(action)
         if isinstance(infos, dict):
             force = self.measured_force()
+            dtype = force.dtype
             metrics = infos.setdefault("metrics_to_log", {})
             metrics["fragile/force"] = torch.linalg.norm(force, dim=1)
             episode = infos.setdefault("episode_metrics_to_log", {})
-            episode["fragile/broke"] = self._broke.to(force.dtype)
+            # one rate per cause over the episodes that ended, plus the step it happened on:
+            # "breaks are falling" is only actionable if you know WHICH break
+            episode["fragile/broke"] = self._broke.to(dtype)
+            for cause in ("force", "normal", "shear", "contact_loss"):
+                mask = self._cause.get(cause)
+                if mask is not None:
+                    episode[f"fragile/break_{cause}"] = mask.to(dtype)
+            if bool(self._broke.any()):
+                step = self.env.unwrapped.episode_length_buf.to(dtype)
+                episode["fragile/break_step"] = torch.where(
+                    self._broke, step, torch.full_like(step, float("nan"))
+                )
         # a reset clears the contact latch, so the next episode has to earn contact again
         done = torch.logical_or(terminated.reshape(-1), truncated.reshape(-1))
         self._contacted &= ~done

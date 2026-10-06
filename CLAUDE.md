@@ -268,6 +268,42 @@ renaming. A wrong shape or a non-dict raises, naming the key; a missing key forw
 The episode channel is the only host sync in the rollout path (compacting needs the count on
 the host), it happens once per step, and only while an `on_log` hook is attached.
 
+### What gets logged
+
+Every metric below is **per agent** and reaches wandb through the two env channels or
+`emit_per_agent`. Names in `DISTRIBUTIONS` (`robonuke_rl_core/logging.py`) also publish
+`<name>/min` and `<name>/max`, because the spread across envs is often the finding.
+
+**A NaN means "not applicable", never zero.** An episode that did not break has no break
+step; one that never succeeded has no time-to-success. The accumulator skips NaN entries in
+the sum, the count and the extremes, so a metric only some episodes have still averages over
+the episodes that have it.
+
+| metric | emitted by | notes |
+| --- | --- | --- |
+| `episode/return`, `episode/length` | `LearnerBase` | + `/min`, `/max`; one value per finished episode |
+| `episode/count` | `LearnerBase` | episodes finished in the interval |
+| `reward/step` | `LearnerBase` | the instantaneous reward, per env, every step; + `/min`, `/max` |
+| `loss/policy`, `loss/critic`, `loss/value`, `loss/entropy` | the learner | SAC's `loss/entropy` is the temperature's loss, PPO's is the entropy bonus's contribution |
+| `policy/std`, `policy/entropy`, `policy/log_prob` | the learner | `policy/std` is the mean commanded sigma |
+| `entropy/coefficient` | SAC | alpha |
+| `q/q1_mean`, `q/q2_mean`, `q/target_mean` | SAC | + `/min`, `/max` |
+| `ppo/kl`, `ppo/clip_fraction`, `ppo/kept` | PPO | `ppo/kept` is the per-agent KL early stop |
+| `grad_norm/*`, `lr/*` | the learner | per optimizer |
+| `stats/update_time_ms` | the learner | wall time of one update, the number to compare against another implementation |
+| `loss/<name>_<target>` | `losses.build_aux_losses` | one per configured aux loss |
+| `episode/success`, `episode/success_step`, `episode/engaged` | `ForgeTaskMetricsWrapper` | `success_step` is NaN unless the episode succeeded |
+| `termination/success`, `termination/timeout` | `ForgeTaskMetricsWrapper` | one 0/1 per cause, so each averages into a rate |
+| `reward/<term>` | `ForgeTaskMetricsWrapper` | the per-term reward decomposition, per step |
+| `Success_Prediction/error`, `/<thr>_precision`, `/<thr>_recall`, `/<thr>_delay_all`, `/<thr>_delay_correct` | `ForgeTaskMetricsWrapper` | how good Forge's 7th action is |
+| `fragile/force` | `ForgeFragileObjectWrapper` | per step |
+| `fragile/broke`, `/break_force`, `/break_normal`, `/break_shear`, `/break_contact_loss`, `/break_step` | `ForgeFragileObjectWrapper` | one rate per cause; `break_step` is NaN where nothing broke |
+| `contact/in_contact_{x,y,z,any}` | `ForgeContactSensorWrapper` | per step |
+
+**Each metric is emitted where it is decided.** A break rate comes from the wrapper that
+decides breaks; a KL early stop from the learner that applies it; the task's outcomes from the
+wrapper that taps the env's own hooks. Nothing re-derives another component's number.
+
 ### Logging
 
 `logging.py` holds the whole logging layer; the learners only route.

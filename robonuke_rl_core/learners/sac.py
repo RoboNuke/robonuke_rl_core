@@ -261,6 +261,10 @@ class SAC(LearnerBase):
 
     # ------------------------------------------------------------------ update
     def update(self, *, timestep: int, timesteps: int) -> None:
+        with self.update_timer():  # publishes stats/update_time_ms with the rest
+            self._update(timestep=timestep, timesteps=timesteps)
+
+    def _update(self, *, timestep: int, timesteps: int) -> None:
         rows = self.cfg.batch_size  # per agent; the memory returns N * batch_size rows
 
         for gradient_step in range(self.cfg.gradient_steps):
@@ -363,6 +367,12 @@ class SAC(LearnerBase):
                     critic_grad_norms=critic_grad_norms,
                     policy_grad_norms=policy_grad_norms,
                     log_prob=log_prob,
+                    policy_loss=self.per_agent_mean(
+                        self.expand_per_agent(self._entropy_coefficient, rows) * log_prob
+                        - torch.min(critic_1_pi, critic_2_pi),
+                        rows,
+                    ),
+                    policy_outputs=outputs,
                 )
 
     def _update_entropy(self, log_prob: torch.Tensor, rows: int) -> None:
@@ -382,6 +392,7 @@ class SAC(LearnerBase):
         entropy_loss.sum().backward()  # a sum of per-agent terms: no cross-agent gradient
         self.entropy_optimizer.step()
         self._entropy_coefficient = torch.exp(self.log_entropy_coefficient.detach())
+        self._entropy_loss = entropy_loss.detach().reshape(-1)
 
     def _emit_update_metrics(
         self,
@@ -394,6 +405,8 @@ class SAC(LearnerBase):
         critic_grad_norms,
         policy_grad_norms,
         log_prob,
+        policy_loss=None,
+        policy_outputs=None,
     ) -> None:
         with torch.no_grad():
             metrics = {
@@ -420,6 +433,19 @@ class SAC(LearnerBase):
             }
             metrics["grad_norm/policy"] = policy_grad_norms
             metrics["policy/log_prob"] = self.per_agent_mean(log_prob, rows)
+            if policy_loss is not None:
+                # the actor's own objective: alpha * log_pi - min(Q1, Q2), per agent
+                metrics["loss/policy"] = policy_loss
+            if getattr(self, "_entropy_loss", None) is not None:
+                # the temperature's loss, i.e. how hard alpha is being pushed
+                metrics["loss/entropy"] = self._entropy_loss
+            if policy_outputs is not None and "log_std" in policy_outputs:
+                metrics["policy/std"] = (
+                    policy_outputs["log_std"].exp().view(self.num_agents, rows, -1).mean(dim=(1, 2))
+                )
+            metrics["stats/update_time_ms"] = torch.full(
+                (self.num_agents,), float(self.update_ms), device=self.device
+            )
             self.emit_per_agent(metrics, timestep)
 
     # ------------------------------------------------------------------ SimBa periodic reset

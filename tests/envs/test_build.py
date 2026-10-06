@@ -28,26 +28,44 @@ class FakeCfg:
 def test_nothing_enabled_returns_the_env_untouched():
     env = object()
     cfg = FakeCfg()
+    cfg.wrappers.task_metrics.enabled = False  # the one group that defaults to on
     assert build_env(cfg, env, "Isaac-Forge-PegInsert-Direct-v0") is env
     assert describe(cfg) == []
 
 
+def test_task_metrics_are_on_by_default_and_skipped_off_forge():
+    """They change no behaviour, so they ride along — but only where there is something to read."""
+    cfg = FakeCfg()
+    assert cfg.wrappers.task_metrics.enabled is True
+    assert describe(cfg) == ["task_metrics"]
+
+    env = object()  # a non-Forge task skips the wrapper instead of failing the run
+    assert build_env(cfg, env, "Isaac-Lift-Cube-Franka-v0") is env
+
+
 def test_the_wrapper_order_is_fixed_and_contact_is_last():
     """Contact appends to the observation, so nothing that edits obs may wrap after it."""
-    assert WRAPPER_ORDER == ("controller", "efficient_reset", "fragile", "contact")
-    assert WRAPPER_ORDER[-1] == "contact"
+    assert WRAPPER_ORDER == (
+        "controller", "efficient_reset", "fragile", "contact", "task_metrics",
+    )
+    assert WRAPPER_ORDER.index("contact") > WRAPPER_ORDER.index("fragile")
     assert WRAPPER_ORDER[0] == "controller"  # innermost: it owns the action space
+    assert WRAPPER_ORDER[-1] == "task_metrics"  # outermost: it only observes
 
 
 def test_describe_lists_only_what_is_enabled_in_order():
     wrappers = WrappersCfg()
     wrappers.contact.enabled = True
     wrappers.fragile.enabled = True
+    wrappers.task_metrics.enabled = False
     cfg = FakeCfg(ControllerCfg(enabled=True), wrappers)
     assert describe(cfg) == ["controller", "fragile", "contact"]
 
     wrappers.efficient_reset.enabled = True
-    assert describe(cfg) == ["controller", "efficient_reset", "fragile", "contact"]
+    wrappers.task_metrics.enabled = True
+    assert describe(cfg) == [
+        "controller", "efficient_reset", "fragile", "contact", "task_metrics",
+    ]
 
 
 def test_a_config_without_the_sections_is_a_no_op():
