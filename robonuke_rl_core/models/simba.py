@@ -115,6 +115,16 @@ class SimbaActorNet(nn.Module):
         std_out_dim = num_continuous if use_state_dependent_std else 0
         self.trunk = SimbaTrunk(obs_dim, hidden_dim, policy_out_dim + std_out_dim, num_blocks)
 
+        # The init tensors come from the ensemble wrapper, which may have built them on the
+        # target device, while this plain module is built on the CPU and moved afterwards
+        # (VmapEnsemble: build N copies, then .to(device)). So put them where the weights are
+        # — otherwise an option that actually touches them (a last_layer_scale != 1, a state
+        # dependent std) only fails on CUDA, and only when that option is set.
+        weight_device = self.trunk.fc_out.weight.device
+        log_std_init = log_std_init.to(weight_device)
+        if scale_rows is not None:
+            scale_rows = scale_rows.to(weight_device)
+
         with torch.no_grad():
             if use_state_dependent_std:
                 # the std rows start at the configured sigma and learn slowly

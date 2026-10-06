@@ -20,6 +20,7 @@ Rules for the module being stacked:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import warnings
 from typing import Any, Callable, Dict, List
@@ -38,8 +39,15 @@ class VmapEnsemble(nn.Module):
         super().__init__()
         if num_agents < 1:
             raise ValueError(f"num_agents must be >= 1, got {num_agents}")
-        # sequential RNG: every agent gets its own init, as the block models did
-        models = [build_fn() for _ in range(num_agents)]
+        # Sequential RNG: every agent gets its own init, as the block models did. The build
+        # runs under the target device, so every parameter is ALLOCATED there rather than
+        # created on the CPU and copied — which also means a module's own init math (an
+        # output scale, a log-std bias) meets tensors on its own device. The .to() after it
+        # is a no-op for a well-behaved build_fn and a safety net for one that hardcodes a
+        # device.
+        context = torch.device(device) if device is not None else contextlib.nullcontext()
+        with context:
+            models = [build_fn() for _ in range(num_agents)]
         if device is not None:
             models = [model.to(device) for model in models]
         for model in models[1:]:
