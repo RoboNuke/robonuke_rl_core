@@ -41,8 +41,12 @@ pytestmark = pytest.mark.hpc
 JOB_TIMEOUT = float(os.environ.get("RNK_TEST_JOB_TIMEOUT", 900))
 #: how long any one command may take
 CMD_TIMEOUT = 120
-#: printed by the probe job, so finding it in the .out proves the job ran OUR command
+#: printed by the probe job, so finding it in the .out proves the job ran OUR command.
+#: The probe BUILDS it by concatenation, so the string only ever appears in the log if python
+#: really evaluated the expression -- `hpc_job.bash` echoes the command it was given, and a
+#: literal marker in that echo would make these assertions pass without python running at all.
 MARKER = "RNK_SLURM_SELFTEST_OK"
+MARKER_EXPR = "'RNK_SLURM' + '_SELFTEST' + '_OK'"
 
 
 @pytest.fixture(scope="module")
@@ -188,12 +192,17 @@ def test_a_real_job_runs_the_process_we_asked_for(config, tmp_path):
     configs resolve the way train.py expects), and the package resolving to the bound clone
     (so the job runs current code rather than whatever the image baked).
     """
+    # every line is prefixed, and the import is LAST, so a failure still shows us the
+    # environment that caused it instead of producing an empty log
     code = (
-        "import os, pathlib, robonuke_rl_core as r\n"
-        f"print({MARKER!r})\n"
-        "print('CWD', os.getcwd())\n"
-        "print('PKG', pathlib.Path(r.__file__).resolve())\n"
-        "print('HOME', os.environ.get('HOME'))\n"
+        "import os, pathlib, sys\n"
+        f"print('PROBE MARK', {MARKER_EXPR})\n"
+        "print('PROBE CWD', os.getcwd())\n"
+        "print('PROBE HOME', os.environ.get('HOME'))\n"
+        "print('PROBE PYTHONPATH', os.environ.get('PYTHONPATH', '<unset>'))\n"
+        "print('PROBE SYSPATH', [p for p in sys.path if 'robonuke' in p] or '<no robonuke entry>')\n"
+        "import robonuke_rl_core as r\n"
+        "print('PROBE PKG', pathlib.Path(r.__file__).resolve())\n"
     )
     command = probe_sbatch(config, tmp_path, argv=[config.hpc.container_python, "-c", code])
     submitted = run(command)
@@ -211,16 +220,19 @@ def test_a_real_job_runs_the_process_we_asked_for(config, tmp_path):
         "from the compute node."
     )
     text = log.read_text()
-    tail = errors.read_text()[-2000:] if errors.is_file() else "<no .err>"
+    tail = errors.read_text()[-4000:] if errors.is_file() else "<no .err>"
+    # EVERY assertion below shows both streams: a job that failed inside the container writes
+    # its traceback to .err, and hiding that is how a green-looking failure wastes an hour
+    where = f"\n--- {log} ---\n{text}\n--- {errors} ---\n{tail}"
 
-    assert MARKER in text, f"the job did not run our command.\n--- out ---\n{text}\n--- err ---\n{tail}"
-    assert str(launch_train.project_root()) in text, (
+    assert f"PROBE MARK {MARKER}" in text, f"python never ran, or died before its first print.{where}"
+    assert f"PROBE CWD {launch_train.project_root()}" in text, (
         f"the job did not cd to the project root, so project-relative configs would not "
-        f"resolve.\n--- out ---\n{text}"
+        f"resolve.{where}"
     )
-    assert f"PKG {launch_train.package_root()}/" in text, (
-        "the package did not resolve to the bound clone on PYTHONPATH, so jobs would not be "
-        f"running the cluster's checkout.\n--- out ---\n{text}"
+    assert f"PROBE PKG {launch_train.package_root()}/" in text, (
+        "the package did not resolve to the bound clone, so jobs would not be running the "
+        f"cluster's checkout. The PROBE PYTHONPATH and PROBE SYSPATH lines say why.{where}"
     )
 
 
