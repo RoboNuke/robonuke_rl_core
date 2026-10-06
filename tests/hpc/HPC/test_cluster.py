@@ -109,7 +109,11 @@ def test_the_cache_home_is_writable(config):
 def test_every_extra_bind_exists(config):
     for bind in config.hpc.binds:
         host = bind.split(":", 1)[0]
-        assert Path(host).expanduser().exists(), f"hpc.binds host path {host!r} does not exist"
+        assert Path(host).expanduser().exists(), (
+            f"hpc.binds host path {host!r} does not exist. Note this checks the LOGIN node: a "
+            "bind source must be on shared storage, because /tmp and other node-local paths "
+            "are not the same filesystem on the compute node."
+        )
 
 
 # ------------------------------------------------------------------ 2. SLURM accepts the job
@@ -131,19 +135,27 @@ def probe_sbatch(config: S.SubmitConfig, tmp_path: Path, *, argv, binds=()) -> l
     )
 
 
-def write_probe(tmp_path: Path) -> Path:
-    """The probe as a FILE, not a `python -c` string.
+def write_probe() -> Path:
+    """The probe as a FILE on SHARED storage, inside the already-bound project root.
 
-    sbatch word-splits the arguments it passes to a job script, so a multi-line snippet
-    arrives as `-c import` and dies with a SyntaxError inside the container. A path is one
-    word, and it is also how production invokes the job: `python scripts/train.py ...`.
+    Two traps, both learned the hard way:
 
-    The import of the package is LAST, so a failure still leaves us the environment that
-    caused it instead of an empty log. MARKER is assembled from pieces, so the string can only
-    appear in the log if python really evaluated it -- `hpc_job.bash` echoes the command it was
-    given, and a literal marker there would make the assertion pass without python running.
+    * sbatch word-splits the arguments it passes to a job script, so a multi-line
+      ``python -c`` snippet arrives as ``-c import`` and dies with a SyntaxError inside the
+      container. A path is one word -- and it is how production invokes a job anyway
+      (``python scripts/train.py ...``).
+    * **/tmp is node-local.** pytest's ``tmp_path`` exists on the login node and not on the
+      compute node, so binding it fails with "mount source doesn't exist". The project root is
+      on shared storage and already bound, so the probe goes there and needs no extra bind.
+      The same caveat applies to any ``hpc.binds`` entry: existing on the login node is
+      necessary but not sufficient.
+
+    The package import is LAST, so a failure still leaves the environment that caused it in
+    the log. MARKER is assembled from pieces, so the string can only appear if python really
+    evaluated it -- ``hpc_job.bash`` echoes the command it was given, and a literal marker
+    there would make the assertion pass without python running at all.
     """
-    probe = tmp_path / "rnk_probe.py"
+    probe = launch_train.project_root() / ".rnk_selftest_probe.py"
     probe.write_text(
         "import os, pathlib, sys\n"
         f"print('PROBE MARK', {MARKER_EXPR})\n"
@@ -220,19 +232,18 @@ def test_a_real_job_runs_the_process_we_asked_for(config, tmp_path):
     configs resolve the way train.py expects), and the package resolving to the bound clone
     (so the job runs current code rather than whatever the image baked).
     """
-    probe = write_probe(tmp_path)
-    command = probe_sbatch(
-        config,
-        tmp_path,
-        argv=[config.hpc.container_python, str(probe)],
-        binds=[f"{tmp_path}:{tmp_path}"],  # so the probe file exists inside the container
-    )
-    submitted = run(command)
-    assert submitted.returncode == 0, f"sbatch failed:\n{submitted.stderr}"
-    job = job_id(submitted.stdout)
-    print(f"[selftest] submitted job {job}", flush=True)
-
-    wait_for(job, JOB_TIMEOUT)
+    probe = write_probe()
+    try:
+        command = probe_sbatch(
+            config, tmp_path, argv=[config.hpc.container_python, str(probe)]
+        )
+        submitted = run(command)
+        assert submitted.returncode == 0, f"sbatch failed:\n{submitted.stderr}"
+        job = job_id(submitted.stdout)
+        print(f"[selftest] submitted job {job}", flush=True)
+        wait_for(job, JOB_TIMEOUT)
+    finally:
+        probe.unlink(missing_ok=True)
 
     out_path, err_path = S.log_paths(config.hpc, "hpc_selftest", "selftest", create=False)
     log = Path(str(out_path).replace("%j", job))

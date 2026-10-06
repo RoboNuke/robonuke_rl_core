@@ -224,3 +224,6 @@ wandb/
 
 # trainer.output_dir defaults to runs/
 runs/
+
+# the cluster self-test probe, written into the bound project root and removed after
+.rnk_selftest_probe.py
