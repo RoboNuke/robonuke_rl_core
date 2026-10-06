@@ -357,3 +357,46 @@ def test_a_missing_eval_config_aborts_before_any_wandb_query(tmp_path, capsys):
         ["--eval_config", str(tmp_path / "nope.yaml"), "--project", "P", "--dry_run"]
     )
     assert code == 2 and "is not a file" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ what sbatch can carry
+def test_an_argument_with_whitespace_is_refused(tmp_path):
+    """sbatch word-splits the arguments it passes to a job script.
+
+    A multi-word argument therefore reaches the job as several, and a quoted python snippet
+    arrives as `-c import`, dying with a SyntaxError inside a container for no visible reason.
+    Caught at composition time instead, where the message can say what to do.
+    """
+    with pytest.raises(S.SubmitError) as err:
+        S.sbatch_command(
+            hpc=S.HpcCfg(),
+            job_name="j",
+            out_path=tmp_path / "o",
+            err_path=tmp_path / "e",
+            env={},
+            argv=["python", "-c", "import os\nprint(1)"],
+        )
+    message = str(err.value)
+    assert "whitespace" in message and "sbatch does not preserve" in message
+    assert "put the code in a file" in message
+
+
+def test_a_tag_list_with_a_space_is_refused_too(tmp_path):
+    """The realistic version: `wandb.tags=[a, b]` would silently become two arguments."""
+    with pytest.raises(S.SubmitError) as err:
+        S.sbatch_command(
+            hpc=S.HpcCfg(),
+            job_name="j",
+            out_path=tmp_path / "o",
+            err_path=tmp_path / "e",
+            env={},
+            argv=["python", "scripts/train.py", "wandb.tags=[a, b]"],
+        )
+    assert "wandb.tags=[a,b]" in str(err.value)  # it shows the right shape
+
+
+def test_the_launchers_never_produce_a_whitespace_argument(tmp_path, capsys):
+    """Every real command the launchers build must already satisfy the rule."""
+    paths = tree(tmp_path, names=("alpha",))
+    code, lines, _ = train(paths, "--tag", "one", "--tag", "two", capsys=capsys)
+    assert code == 0 and lines

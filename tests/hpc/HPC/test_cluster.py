@@ -23,6 +23,7 @@ a launcher test has no business depending on it.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import shutil
@@ -112,21 +113,48 @@ def test_every_extra_bind_exists(config):
 
 
 # ------------------------------------------------------------------ 2. SLURM accepts the job
-def probe_sbatch(config: S.SubmitConfig, tmp_path: Path, *, argv) -> list:
+def probe_sbatch(config: S.SubmitConfig, tmp_path: Path, *, argv, binds=()) -> list:
     """The sbatch command for a trivial probe job, built exactly as a launcher builds one."""
     out_path, err_path = S.log_paths(config.hpc, "hpc_selftest", "selftest", create=True)
+    hpc = dataclasses.replace(config.hpc, binds=list(config.hpc.binds) + list(binds))
     return S.sbatch_command(
-        hpc=config.hpc,
+        hpc=hpc,
         job_name="rnk_hpc_selftest",
         out_path=out_path,
         err_path=err_path,
         env=S.job_env(
-            config.hpc,
+            hpc,
             package_root=launch_train.package_root(),
             project_root=launch_train.project_root(),
         ),
         argv=argv,
     )
+
+
+def write_probe(tmp_path: Path) -> Path:
+    """The probe as a FILE, not a `python -c` string.
+
+    sbatch word-splits the arguments it passes to a job script, so a multi-line snippet
+    arrives as `-c import` and dies with a SyntaxError inside the container. A path is one
+    word, and it is also how production invokes the job: `python scripts/train.py ...`.
+
+    The import of the package is LAST, so a failure still leaves us the environment that
+    caused it instead of an empty log. MARKER is assembled from pieces, so the string can only
+    appear in the log if python really evaluated it -- `hpc_job.bash` echoes the command it was
+    given, and a literal marker there would make the assertion pass without python running.
+    """
+    probe = tmp_path / "rnk_probe.py"
+    probe.write_text(
+        "import os, pathlib, sys\n"
+        f"print('PROBE MARK', {MARKER_EXPR})\n"
+        "print('PROBE CWD', os.getcwd())\n"
+        "print('PROBE HOME', os.environ.get('HOME'))\n"
+        "print('PROBE PYTHONPATH', os.environ.get('PYTHONPATH', '<unset>'))\n"
+        "print('PROBE SYSPATH', [p for p in sys.path if 'robonuke' in p] or '<no robonuke entry>')\n"
+        "import robonuke_rl_core as r\n"
+        "print('PROBE PKG', pathlib.Path(r.__file__).resolve())\n"
+    )
+    return probe
 
 
 def test_slurm_accepts_a_submission_without_queueing_it(config, tmp_path):
@@ -192,19 +220,13 @@ def test_a_real_job_runs_the_process_we_asked_for(config, tmp_path):
     configs resolve the way train.py expects), and the package resolving to the bound clone
     (so the job runs current code rather than whatever the image baked).
     """
-    # every line is prefixed, and the import is LAST, so a failure still shows us the
-    # environment that caused it instead of producing an empty log
-    code = (
-        "import os, pathlib, sys\n"
-        f"print('PROBE MARK', {MARKER_EXPR})\n"
-        "print('PROBE CWD', os.getcwd())\n"
-        "print('PROBE HOME', os.environ.get('HOME'))\n"
-        "print('PROBE PYTHONPATH', os.environ.get('PYTHONPATH', '<unset>'))\n"
-        "print('PROBE SYSPATH', [p for p in sys.path if 'robonuke' in p] or '<no robonuke entry>')\n"
-        "import robonuke_rl_core as r\n"
-        "print('PROBE PKG', pathlib.Path(r.__file__).resolve())\n"
+    probe = write_probe(tmp_path)
+    command = probe_sbatch(
+        config,
+        tmp_path,
+        argv=[config.hpc.container_python, str(probe)],
+        binds=[f"{tmp_path}:{tmp_path}"],  # so the probe file exists inside the container
     )
-    command = probe_sbatch(config, tmp_path, argv=[config.hpc.container_python, "-c", code])
     submitted = run(command)
     assert submitted.returncode == 0, f"sbatch failed:\n{submitted.stderr}"
     job = job_id(submitted.stdout)

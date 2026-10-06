@@ -739,6 +739,13 @@ it has no siblings at runtime and can source nothing: every input arrives as an 
 under 40 characters, means offline — logging must never kill an unattended job), builds the
 binds, and `exec`s apptainer so `--signal=TERM@300` reaches python rather than bash.
 
+**No job argument may contain whitespace.** sbatch word-splits the arguments it passes to a
+job script, so a multi-word argument arrives as several and a quoted python snippet arrives as
+`-c import` — a `SyntaxError` inside a container with no visible cause. `sbatch_command`
+refuses one, naming the fix: write the value without spaces (`wandb.tags=[a,b]`, never
+`wandb.tags=[a, b]`) or put the code in a file and pass its path, which is what the cluster
+test's probe does.
+
 `--eval_config` on `launch_train` makes it a train-then-eval job, which cannot be one exec'd
 python: the job runs `hpc_job_chain.bash` in-container instead, which runs training and then
 one eval per agent, **only if training exited 0**, each **non-fatal**. Training that finished

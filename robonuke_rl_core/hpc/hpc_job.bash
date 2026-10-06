@@ -93,8 +93,17 @@ if [[ -n "${RNK_CHAIN_SCRIPT}" ]]; then
     binds+=("${RNK_CHAIN_SCRIPT}:/opt/hpc_job_chain.bash")
 fi
 
+# Deduplicate by destination: when the package and project clones are the same directory
+# (running a launcher from the package repo) apptainer warns "destination is already in the
+# mount point list", and a warning nobody needs is a warning that hides a real one.
 bind_args=()
+seen_destinations=":"
 for mount in "${binds[@]}"; do
+    destination="${mount##*:}"
+    case "${seen_destinations}" in
+        *":${destination}:"*) continue ;;
+    esac
+    seen_destinations="${seen_destinations}${destination}:"
     bind_args+=(--bind "${mount}")
 done
 

@@ -309,6 +309,18 @@ def sbatch_command(
     the section: a recording eval can ask for more walltime than the training run did
     without anyone editing a shell file.
     """
+    # An argument containing whitespace does NOT survive `sbatch <script> <args...>`: SLURM
+    # word-splits them, so a multi-word argument reaches the job as several, and a quoted
+    # python snippet arrives as `-c import`. Caught here, loudly, because the symptom at the
+    # far end is a SyntaxError inside a container with no obvious cause.
+    for part in argv:
+        if any(character.isspace() for character in str(part)):
+            raise SubmitError(
+                f"job argument {part!r} contains whitespace, which sbatch does not preserve "
+                "when it passes arguments to the job script. Write the value without spaces "
+                "(a tag list is 'wandb.tags=[a,b]', never 'wandb.tags=[a, b]'), or put the "
+                "code in a file and pass the file's path."
+            )
     exports = ",".join(["ALL"] + [f"{key}={value}" for key, value in env.items()])
     return [
         "sbatch",
