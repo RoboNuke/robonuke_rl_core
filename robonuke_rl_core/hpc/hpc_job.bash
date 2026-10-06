@@ -22,13 +22,11 @@
 #   RNK_CACHE_HOME      bound as the container HOME: Kit and shader caches, GBs, scratch
 #   RNK_BINDS           extra "host:container" mounts, comma-separated (may be empty)
 #   RNK_PYTHON          the python inside the image
-#   RNK_IMAGE_PKG_PATH  where the image installed the package editable (default /opt/...)
 #   RNK_CHAIN_SCRIPT    optional: run this in-container wrapper instead of exec'ing argv
 
 set -Eeuo pipefail
 trap 'echo "[hpc_job] FAILED at ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
-: "${RNK_IMAGE_PKG_PATH:=/opt/robonuke_rl_core}"
 : "${RNK_PYTHON:=python}"
 : "${RNK_APPTAINER_BIN:=apptainer}"
 : "${RNK_BINDS:=}"
@@ -77,11 +75,10 @@ else
 fi
 
 # ------------------------------------------------------------------ 3. binds
-# The package clone goes ON TOP of the image's editable install path, so `import
-# robonuke_rl_core` resolves to the cluster's current code: updating the package is a git
-# pull, and the image is rebuilt only when pyproject dependencies change. The project repo
-# is bound at its own path and used as cwd -- it is never installed.
-binds=("${RNK_PKG_ROOT}:${RNK_IMAGE_PKG_PATH}" "${RNK_PROJECT_ROOT}:${RNK_PROJECT_ROOT}")
+# Both repos are bound at their own paths and reached through PYTHONPATH -- the pattern the
+# existing image already uses for its project repo. Nothing is installed into the image, so
+# any image carrying the stack works, and updating either repo on the cluster is a git pull.
+binds=("${RNK_PKG_ROOT}:${RNK_PKG_ROOT}" "${RNK_PROJECT_ROOT}:${RNK_PROJECT_ROOT}")
 if [[ -n "${RNK_BINDS}" ]]; then
     IFS=',' read -r -a extra <<< "${RNK_BINDS}"
     for mount in "${extra[@]}"; do
@@ -102,7 +99,7 @@ for mount in "${binds[@]}"; do
 done
 
 say "image      : ${RNK_SIF}"
-say "package    : ${RNK_PKG_ROOT} -> ${RNK_IMAGE_PKG_PATH}"
+say "package    : ${RNK_PKG_ROOT} (on PYTHONPATH)"
 say "project    : ${RNK_PROJECT_ROOT} (cwd)"
 say "cache home : ${RNK_CACHE_HOME}"
 say "command    : $*"
@@ -116,6 +113,7 @@ if [[ -n "${RNK_CHAIN_SCRIPT}" ]]; then
     exec "${RNK_APPTAINER_BIN}" exec --nv --writable-tmpfs \
         --home "${RNK_CACHE_HOME}:/root" \
         "${bind_args[@]}" \
+        --env PYTHONPATH="${RNK_PKG_ROOT}:${RNK_PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
         --env OMNI_KIT_ACCEPT_EULA=YES \
         --env TORCHDYNAMO_DISABLE=1 \
         --env PYTHONUNBUFFERED=1 \
@@ -125,6 +123,7 @@ fi
 exec "${RNK_APPTAINER_BIN}" exec --nv --writable-tmpfs \
     --home "${RNK_CACHE_HOME}:/root" \
     "${bind_args[@]}" \
+    --env PYTHONPATH="${RNK_PKG_ROOT}:${RNK_PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
     --env OMNI_KIT_ACCEPT_EULA=YES \
     --env TORCHDYNAMO_DISABLE=1 \
     --env PYTHONUNBUFFERED=1 \

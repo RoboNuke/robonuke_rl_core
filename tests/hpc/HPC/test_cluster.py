@@ -81,7 +81,7 @@ def test_squeue_is_available():
 
 def test_the_image_the_jobs_will_use_exists(config):
     """A path check, not a container run: the job cannot start without this file."""
-    path = Path(config.hpc.sif_image)
+    path = Path(config.hpc.sif_image).expanduser()
     assert path.is_file(), (
         f"hpc.sif_image={path} is not a file. Build it once with hpc/build_image.sh; these "
         "tests do not build or inspect it."
@@ -91,7 +91,7 @@ def test_the_image_the_jobs_will_use_exists(config):
 def test_the_cache_home_is_writable(config):
     """Kit and shader caches land here and run to GBs, so a quota'd NFS home fails a job
     partway through, which is the worst time to find out."""
-    path = Path(config.hpc.cache_home)
+    path = Path(config.hpc.cache_home).expanduser()
     assert path.is_dir(), f"hpc.cache_home={path} is not a directory"
     probe = path / ".rnk_write_probe"
     probe.write_text("ok")
@@ -102,7 +102,7 @@ def test_the_cache_home_is_writable(config):
 def test_every_extra_bind_exists(config):
     for bind in config.hpc.binds:
         host = bind.split(":", 1)[0]
-        assert Path(host).exists(), f"hpc.binds host path {host!r} does not exist"
+        assert Path(host).expanduser().exists(), f"hpc.binds host path {host!r} does not exist"
 
 
 # ------------------------------------------------------------------ 2. SLURM accepts the job
@@ -216,9 +216,9 @@ def test_a_real_job_runs_the_process_we_asked_for(config, tmp_path):
         f"the job did not cd to the project root, so project-relative configs would not "
         f"resolve.\n--- out ---\n{text}"
     )
-    assert "PKG /opt/robonuke_rl_core/" in text, (
-        "the package did not resolve to the bound clone, so jobs would run whatever code the "
-        f"image baked instead of the cluster's checkout.\n--- out ---\n{text}"
+    assert f"PKG {launch_train.package_root()}/" in text, (
+        "the package did not resolve to the bound clone on PYTHONPATH, so jobs would not be "
+        f"running the cluster's checkout.\n--- out ---\n{text}"
     )
 
 
@@ -260,5 +260,5 @@ def test_the_launcher_composes_a_job_for_this_config(config, capsys):
     assert code == 0, out
     line = next(l for l in out.splitlines() if l.startswith("sbatch "))
     assert f"-A {config.hpc.account}" in line
-    assert config.hpc.sif_image in line
+    assert str(Path(config.hpc.sif_image).expanduser()) in line
     assert "scripts/train.py" in line

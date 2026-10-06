@@ -66,13 +66,16 @@ def test_the_job_script_validates_its_inputs_before_launching_a_container():
     assert "command -v" in text  # the apptainer binary is checked too
 
 
-def test_the_job_script_binds_the_clone_over_the_image_install_path():
-    """The whole image design: bake the stack, bind the code. Updating the package on the
-    cluster must be a git pull, not an image rebuild."""
+def test_the_job_script_binds_both_repos_and_puts_them_on_pythonpath():
+    """Bind the code, install nothing. Both repos are bound at their own paths and reached
+    through PYTHONPATH, so any image carrying the stack works and updating either repo on the
+    cluster is a git pull."""
     text = S.job_script().read_text()
-    assert "RNK_IMAGE_PKG_PATH" in text
-    assert "/opt/robonuke_rl_core" in text
-    assert '"${RNK_PKG_ROOT}:${RNK_IMAGE_PKG_PATH}"' in text
+    assert '"${RNK_PKG_ROOT}:${RNK_PKG_ROOT}"' in text
+    assert '"${RNK_PROJECT_ROOT}:${RNK_PROJECT_ROOT}"' in text
+    assert '--env PYTHONPATH="${RNK_PKG_ROOT}:${RNK_PROJECT_ROOT}' in text
+    # the package must come first, so the bound clone wins over anything baked in
+    assert text.index("RNK_PKG_ROOT}:${RNK_PROJECT_ROOT}") > 0
 
 
 def test_the_job_script_execs_so_slurms_signal_reaches_python():

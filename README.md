@@ -426,10 +426,10 @@ an unattended run must not be killed by its logging.
 | `cpus` | int | `12` | `-c`, CPUs per task |
 | `signal` | str | `"TERM@300"` | `--signal`; SLURM warns the job this far ahead of the walltime kill. The job `exec`s python, so the signal reaches the training process and not bash |
 | `exp_log_dir` | str | `"exp_logs"` | where `.out` / `.err` land, relative to the project root; logs go to `{exp_log_dir}/{project}/{name}_%j.out` |
-| `sif_image` | str | `""` | absolute path to the `.sif` on the cluster. **Required at submit** |
+| `sif_image` | str | `""` | path to the `.sif` on the cluster (`~` is expanded). Nothing is installed into it — the job binds both repos and puts them on `PYTHONPATH` — so the existing `ghvic.sif` is used as-is; see `examples/hpc.yaml`. **Required at submit** |
 | `apptainer_bin` | str | `"apptainer"` | or `"singularity"` |
 | `container_python` | str | `"python"` | the python inside the image |
-| `cache_home` | str | `""` | bound as the container `HOME`. Kit and shader caches land here and run to GBs, so it must be scratch, **never an NFS home with a quota**. **Required at submit** |
+| `cache_home` | str | `""` | bound as the container `HOME` (`~` is expanded). Kit and shader caches land here and run to GBs, so it must be scratch, **never an NFS home with a quota**. **Required at submit** |
 | `binds` | list[str] | `[]` | extra `host:container` mounts |
 
 ## derived and meta

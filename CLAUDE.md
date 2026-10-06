@@ -723,12 +723,13 @@ against the same rule `WandbCfg.validate` applies, before anything is queued.
 * **Fail before queue.** Every config in a batch is read, resolved and named before the first
   job is submitted; a bad config aborts the whole submit naming the file, the field and the
   value. After that gate a *submission* failure is reported and the batch continues.
-* **Bake the stack, bind the code.** The image bakes Isaac Sim, Isaac Lab and the package's
-  *dependencies* — the package itself is installed **editable** from a build-time clone at
-  `/opt/robonuke_rl_core`, and the job binds the cluster's live clone over that path. So
-  updating the package is `git pull`, and the image is rebuilt **only when `pyproject.toml`
-  dependencies change**, the same rule as a local editable install. The project repo is bound
-  and used as cwd; it is never installed.
+* **Bind the code, install nothing.** The image supplies the stack (Isaac Sim, Isaac Lab,
+  torch and the package's dependencies) and nothing else: the job binds **both** repos at
+  their own paths and puts them on `PYTHONPATH`, the package first, then `cd`s to the project
+  root. So updating either repo on the cluster is a `git pull`, and any image carrying the
+  stack works as-is — today that is the existing `ghvic.sif` built for
+  `generalized_hybrid_vic_action_space`, which this reuses unmodified. `hpc/build_image.sh`
+  exists to make a fresh one if that ever stops being true, not as a prerequisite.
 
 ### The job
 

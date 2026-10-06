@@ -1,0 +1,22 @@
+# Cluster settings for the launchers. Copy this into the project as configs/base/hpc.yaml and
+# chain your experiments onto it; every experiment then inherits these and overrides only what
+# differs (hpc.time, hpc.mem), with a one-off on the CLI (hpc.time=2-00:00:00).
+#
+#   python launchers/launch_train.py <configs> --project P --group_prefix G
+#
+# WANDB_API_KEY is an environment variable, never a field here. The launcher passes
+# `sbatch --export=ALL`, which carries it from your login shell into the job.
+hpc:
+  account: virl-grp
+  # the V-verified list: no `gpu` (AllowAccounts excludes virl-grp) and no `dgx2` (sm_70, no
+  # cu128 kernels)
+  partitions: dgxh,tiamat,eecs2
+
+  # The existing Isaac image -- the one built for
+  # RoboNuke/generalized_hybrid_vic_action_space. Nothing is installed into it: the job binds
+  # both repos at their own paths and puts them on PYTHONPATH, so this image is used as-is.
+  sif_image: ~/hpc-share/isaac/ghvic.sif
+
+  # bound as the container HOME. Kit and shader caches land here and run to GBs, so this must
+  # be scratch, never a quota'd NFS home.
+  cache_home: ~/hpc-share/isaac/cache

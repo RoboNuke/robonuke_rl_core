@@ -2,17 +2,21 @@
 #
 # Build the Apptainer image the HPC jobs run in.
 #
+# YOU PROBABLY DO NOT NEED THIS. The jobs install nothing into the image -- they bind both
+# repos and put them on PYTHONPATH -- so any image carrying the stack works, and today that is
+# the existing ghvic.sif built for generalized_hybrid_vic_action_space. Point
+# hpc.sif_image at it (see examples/hpc.yaml) and skip this script.
+#
+# This exists for the day that image is no longer enough: a new Isaac Lab, or a dependency the
+# package needs that it does not have.
+#
 # THE RULE: the image bakes the STACK, never the research code.
 #
 #   baked   Ubuntu 22.04 + CUDA 12.8, Python 3.11, torch 2.7.0+cu128, Isaac Sim 5.1.0
-#           wheels, Isaac Lab editable at a pinned commit, and robonuke_rl_core installed
-#           EDITABLE from a build-time clone at ${IMAGE_PKG_PATH} -- which is what pulls in
-#           the package's own dependencies (wandb, pandas, pyarrow, imageio, skrl...).
-#   bound   at runtime the job binds the cluster's live package clone OVER
-#           ${IMAGE_PKG_PATH}, so the editable install resolves to current code. Updating
-#           the package on the cluster is `git pull`. The image is rebuilt ONLY when
-#           pyproject.toml dependencies change -- the same rule as a local editable install.
-#           The project repo is bound at its own path and used as cwd; never installed.
+#           wheels, Isaac Lab at a pinned commit, and the package's DEPENDENCIES (wandb,
+#           pandas, pyarrow, imageio, skrl, omegaconf...) via a throwaway clone.
+#   bound   at runtime the job binds both repos at their own paths and puts them on
+#           PYTHONPATH. Nothing here is what makes `import robonuke_rl_core` work.
 #
 # This is a compute-node script, not package code: login nodes OOM running mksquashfs.
 #
@@ -38,7 +42,7 @@ trap 'echo "[build] FAILED at ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2'
 : "${ISAACLAB_REPO:=https://github.com/isaac-sim/IsaacLab.git}"
 # pin the commit: an Isaac Lab bump is a deliberate act, never a side effect of rebuilding
 : "${ISAACLAB_COMMIT:=v2.3.0}"
-: "${IMAGE_PKG_PATH:=/opt/robonuke_rl_core}"
+: "${IMAGE_PKG_PATH:=/opt/robonuke_rl_core_deps}"  # throwaway clone: deps only
 : "${PKG_REPO:=https://github.com/RoboNuke/robonuke_rl_core.git}"
 : "${PKG_COMMIT:=main}"
 
@@ -53,7 +57,7 @@ export APPTAINER_TMPDIR
 say "image      : ${IMG}"
 say "tmpdir     : ${APPTAINER_TMPDIR} (must be local disk, not Lustre)"
 say "isaac lab  : ${ISAACLAB_COMMIT}"
-say "pkg path   : ${IMAGE_PKG_PATH} (bound over at runtime)"
+say "pkg path   : ${IMAGE_PKG_PATH} (dependencies only; jobs use PYTHONPATH)"
 
 cat > "${DEF}" <<DEFEOF
 Bootstrap: docker
@@ -85,9 +89,9 @@ From: ${BASE_IMAGE##docker://}
     git checkout ${ISAACLAB_COMMIT}
     ./isaaclab.sh --install none
 
-    # the package, editable from a build-time clone. The clone is a placeholder: the job
-    # binds the cluster's live checkout over this path, and the editable install then
-    # resolves to whatever is there. What this step is really for is the DEPENDENCIES.
+    # a throwaway clone, purely to make pip resolve and install the package's DEPENDENCIES.
+    # Jobs never import from here -- they bind the cluster's checkout and put it on
+    # PYTHONPATH -- so this copy going stale does not matter.
     git clone ${PKG_REPO} ${IMAGE_PKG_PATH}
     cd ${IMAGE_PKG_PATH}
     git checkout ${PKG_COMMIT}

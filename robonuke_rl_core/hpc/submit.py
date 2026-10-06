@@ -279,13 +279,15 @@ def job_env(
     hpc: HpcCfg, *, package_root: Path, project_root: Path, extra: Optional[Dict[str, str]] = None
 ) -> Dict[str, str]:
     """The ``RNK_*`` variables the job script reads. ``ALL`` carries WANDB_API_KEY too."""
+    # ~ is expanded here, not in the container: apptainer would take a literal tilde, and
+    # the login shell never sees these values as a word to expand
     env = {
         "RNK_PKG_ROOT": str(package_root),
         "RNK_PROJECT_ROOT": str(project_root),
-        "RNK_SIF": hpc.sif_image,
+        "RNK_SIF": str(Path(hpc.sif_image).expanduser()),
         "RNK_APPTAINER_BIN": hpc.apptainer_bin,
-        "RNK_CACHE_HOME": hpc.cache_home,
-        "RNK_BINDS": ",".join(hpc.binds),
+        "RNK_CACHE_HOME": str(Path(hpc.cache_home).expanduser()),
+        "RNK_BINDS": ",".join(str(Path(b).expanduser()) if b.startswith("~") else b for b in hpc.binds),
         "RNK_PYTHON": hpc.container_python,
     }
     env.update(extra or {})
@@ -363,7 +365,7 @@ def preflight(submits: Sequence[SubmitConfig], *, dry_run: bool) -> None:
         )
     for submit in submits:
         require_submit_fields(submit)
-        if not dry_run and not Path(submit.hpc.sif_image).is_file():
+        if not dry_run and not Path(submit.hpc.sif_image).expanduser().is_file():
             raise SubmitError(
                 f"{submit.path}: hpc.sif_image {submit.hpc.sif_image!r} is not a file. Build "
                 "it with hpc/build_image.sh, or point the field at the built image."
