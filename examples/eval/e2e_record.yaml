@@ -10,7 +10,3 @@ task:
   cfg:
     scene:
       num_envs: 4
-
-wrappers:
-  efficient_reset:
-    enabled: false

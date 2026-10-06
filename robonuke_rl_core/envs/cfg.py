@@ -362,3 +362,13 @@ class WrappersCfg:
                 "wrappers.fragile.require_contact needs wrappers.contact.enabled: true — the "
                 "loss-of-contact failure reads the contact sensor's flags"
             )
+        if self.fragile.enabled and not self.efficient_reset.enabled:
+            raise ValueError(
+                "wrappers.fragile.enabled needs wrappers.efficient_reset.enabled: true. A peg "
+                "breaks in one env at a time, so the env resets a SUBSET of envs mid-episode, "
+                "and Factory/Forge's reset path is written assuming every env resets together "
+                "(randomize_initial_state samples len(env_ids) rows and then assigns them to "
+                "the full buffer, which raises, and builds the rest at num_envs). The "
+                "efficient-reset wrapper is what makes a partial reset safe, which is the "
+                "whole reason it exists — it is not an optimization."
+            )

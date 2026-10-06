@@ -30,11 +30,25 @@ from ..memory.multi_random import MultiRandomMemory
 from ..models.normalizer import BlockRunningNorm
 from .cfg import TrainerCfg
 
-__all__ = ["LearnerBase", "run_dirs", "CHECKPOINT_EXTENSION", "CHECKPOINT_BEST", "checkpoint_name"]
+__all__ = [
+    "LearnerBase",
+    "run_dirs",
+    "CHECKPOINT_EXTENSION",
+    "CHECKPOINT_BEST",
+    "checkpoint_name",
+    "SUCCESS_METRIC",
+    "BEST_SUCCESS_METRIC",
+]
 
 #: one place for the checkpoint file naming, so eval, wandb and the loader cannot disagree
 CHECKPOINT_EXTENSION = "ckpt"
 CHECKPOINT_BEST = f"ckpt_best.{CHECKPOINT_EXTENSION}"
+
+#: the env episode channel the best-checkpoint success rate is measured from
+SUCCESS_METRIC = "episode/success"
+#: the success rate of the interval that produced the current best checkpoint. Training only:
+#: it is published from the write-interval flush, which eval never runs.
+BEST_SUCCESS_METRIC = "episode/best_success_rate"
 
 
 def checkpoint_name(step: int) -> str:
@@ -62,6 +76,23 @@ class _UpdateTimer:
     def __exit__(self, *exc) -> None:
         self.learner.update_ms = (time.perf_counter() - self._start) * 1.0e3
         return None
+
+
+#: bytes per memory page, for reading /proc
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+
+def process_rss_mb() -> float:
+    """This process's resident set size in MiB, from ``/proc/self/statm``.
+
+    Read from /proc rather than through psutil so the package keeps no dependency for one
+    number; Isaac Sim is Linux-only, so /proc is always there. RSS is the figure that
+    answers "is this run going to be OOM-killed" — it counts what is actually resident,
+    including everything Kit and PhysX hold, which a torch-side number cannot see.
+    """
+    with open("/proc/self/statm", "r") as handle:
+        resident_pages = int(handle.read().split()[1])
+    return resident_pages * _PAGE_SIZE / float(1 << 20)
 
 
 def run_dirs(cfg: Any) -> List[Path]:
@@ -142,6 +173,13 @@ class LearnerBase(Agent):
         self._finished_count = torch.zeros(num_agents, device=self.device)
         self._best_return: List[float] = [float("-inf")] * num_agents
         self._mean_return: List[float] = [float("nan")] * num_agents
+        #: per-agent success rate over the interval, from the env's episode/success channel
+        self._success_total = torch.zeros(num_agents, device=self.device)
+        self._success_count = torch.zeros(num_agents, device=self.device)
+        #: the success rate of the interval that produced the current best checkpoint, and
+        #: which agents produced a new best in the interval just flushed
+        self._best_success: List[float] = [float("nan")] * num_agents
+        self._new_best: List[bool] = [False] * num_agents
 
         self._rewards_shaper = self._resolve_rewards_shaper()
         #: wall-clock ms of the last update, filled by :meth:`update_timer`
@@ -366,11 +404,17 @@ class LearnerBase(Agent):
         metrics = self._env_metrics(infos, "episode_metrics_to_log")
         if metrics is None or slots is None:
             return
+        success = metrics.get(SUCCESS_METRIC)
         for agent, index in enumerate(slots):
             if index.numel() == 0:
                 continue
             lo = agent * self.envs_per_agent
             hi = lo + self.envs_per_agent
+            if success is not None:
+                # kept on device: the interval's single sync is in _flush_episode_stats
+                mine = success[lo:hi].index_select(0, index)
+                self._success_total[agent] += mine.sum()
+                self._success_count[agent] += mine.numel()
             self.emit(
                 agent,
                 {
@@ -451,6 +495,8 @@ class LearnerBase(Agent):
         """
         counts = self._finished_count.tolist()  # the interval's single sync
         returns = self._finished_returns.tolist()
+        success_total = self._success_total.tolist()
+        success_count = self._success_count.tolist()
         for agent, count in enumerate(counts):
             if count > 0:
                 self._mean_return[agent] = returns[agent] / count
@@ -459,9 +505,44 @@ class LearnerBase(Agent):
                     {"episode/count": torch.tensor(count, device=self.device)},
                     step,
                 )
+        self._update_best(step, success_total, success_count)
         self._finished_count.zero_()
         self._finished_returns.zero_()
         self._finished_lengths.zero_()
+        self._success_total.zero_()
+        self._success_count.zero_()
+
+    def _update_best(self, step: int, success_total: List[float], success_count: List[float]) -> None:
+        """Advance the best-return record, and publish the best checkpoint's success rate.
+
+        ``episode/best_success_rate`` is the success rate measured over the interval that
+        produced the current ``ckpt_best``, republished every interval so the line is flat
+        between improvements. It answers "how good is the policy I would actually ship",
+        which the live success rate does not: that one wanders with exploration.
+
+        **It can go down.** The best checkpoint is chosen by mean episode return, so a new
+        best-by-return may have had a worse success rate than the one it replaced. Making it
+        monotonic would mean reporting a number that no checkpoint on disk ever achieved.
+
+        The decision lives here, not in :meth:`_write_best_checkpoints`, because the flush
+        hooks publish before checkpoints are written; deciding later would delay the metric
+        by a whole interval.
+        """
+        for agent in range(self.num_agents):
+            mean_return = self._mean_return[agent]
+            improved = mean_return == mean_return and mean_return > self._best_return[agent]
+            self._new_best[agent] = improved
+            if improved:
+                self._best_return[agent] = mean_return
+                if success_count[agent] > 0:
+                    self._best_success[agent] = success_total[agent] / success_count[agent]
+            rate = self._best_success[agent]
+            if rate == rate:  # not NaN: an interval with episodes has been seen
+                self.emit(
+                    agent,
+                    {BEST_SUCCESS_METRIC: torch.tensor(rate, device=self.device)},
+                    step,
+                )
 
     @property
     def mean_returns(self) -> List[float]:
@@ -491,6 +572,30 @@ class LearnerBase(Agent):
 
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
         raise NotImplementedError
+
+    def stats_metrics(self) -> Dict[str, torch.Tensor]:
+        """``stats/*``: what the last update cost, in wall time and in memory.
+
+        Every value is **process-wide**, so each agent gets the same number — they share one
+        process, one GPU and one Isaac Sim. They are still emitted per agent so that one
+        agent's wandb run is self-contained.
+
+        ``gpu_used_mb`` is the whole device (``mem_get_info``: total minus free), which is
+        the number that answers "will this fit", because it counts what Kit and PhysX hold as
+        well as us. ``gpu_torch_reserved_mb`` is our allocator's share of it, so a growing
+        gap between the two says the leak is not in the learner.
+        """
+        values = {"update_time_ms": self.update_ms, "ram_mb": process_rss_mb()}
+        if self.device.type == "cuda":
+            free, total = torch.cuda.mem_get_info(self.device)
+            values["gpu_used_mb"] = (total - free) / float(1 << 20)
+            values["gpu_torch_reserved_mb"] = torch.cuda.memory_reserved(self.device) / float(
+                1 << 20
+            )
+        return {
+            f"stats/{name}": torch.full((self.num_agents,), float(value), device=self.device)
+            for name, value in values.items()
+        }
 
     def update_timer(self):
         """Context manager timing one update; the elapsed ms land in ``self.update_ms``.
@@ -589,10 +694,8 @@ class LearnerBase(Agent):
         if self.trainer_cfg.checkpoint_interval <= 0 or self.run_dirs is None:
             return
         for agent in range(self.num_agents):
-            mean_return = self._mean_return[agent]
-            if mean_return != mean_return or mean_return <= self._best_return[agent]:
-                continue  # no finished episode yet, or no improvement
-            self._best_return[agent] = mean_return
+            if not self._new_best[agent]:
+                continue  # no finished episode yet, or no improvement (decided in the flush)
             directory = self.checkpoint_dir(agent)
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / CHECKPOINT_BEST

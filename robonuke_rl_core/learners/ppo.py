@@ -432,9 +432,7 @@ class PPO(LearnerBase):
             metrics = {name: torch.stack(values).mean(dim=0) for name, values in accumulated.items()}
             metrics["lr/policy"] = self.policy_optimizer.lr.to(torch.float32)
             metrics["lr/value"] = self.value_optimizer.lr.to(torch.float32)
-            metrics["stats/update_time_ms"] = torch.full(
-                (num_agents,), float(self.update_ms), device=self.device
-            )
+            metrics.update(self.stats_metrics())
             self.emit_per_agent(metrics, timestep)
 
     def _value_loss(self, sampled: dict, value_inputs: dict, rows: int):

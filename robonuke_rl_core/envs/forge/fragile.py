@@ -88,6 +88,9 @@ class ForgeFragileObjectWrapper(gym.Wrapper):
         self._contacted = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._out_of_contact = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._broke = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        #: the episode step each env broke on, NaN where it did not. Captured in _get_dones
+        #: because that is the last moment it is readable -- see step().
+        self._break_step = torch.full((self.num_envs,), float("nan"), device=self.device)
         #: per-cause masks for the step that just ran, so a break is reported as *why*
         self._cause: dict = {}
 
@@ -144,6 +147,12 @@ class ForgeFragileObjectWrapper(gym.Wrapper):
         if self.require_contact:
             broke = broke | self.contact_violations()
         self._broke = broke
+        # episode_length_buf is read HERE, not in step(): DirectRLEnv.step calls _get_dones,
+        # then _reset_idx, which zeroes episode_length_buf for exactly the envs that are
+        # done. By the time step() sees the env again, every broken env reads 0. It has
+        # already been incremented for this step, so this is the step the break happened on.
+        length = self.env.unwrapped.episode_length_buf.to(self._break_step.dtype)
+        self._break_step = torch.where(broke, length, torch.full_like(length, float("nan")))
         return terminated | broke, time_out
 
     # ------------------------------------------------------------------ the step
@@ -158,15 +167,20 @@ class ForgeFragileObjectWrapper(gym.Wrapper):
             # one rate per cause over the episodes that ended, plus the step it happened on:
             # "breaks are falling" is only actionable if you know WHICH break
             episode["fragile/broke"] = self._broke.to(dtype)
+            # `rate_cause_`, so a value under 1 reads as what it is: the fraction of the
+            # episodes that ended whose break had this cause. The old `fragile/break_force`
+            # sat one character from `wrappers.fragile.break_force`, a threshold in newtons.
             for cause in ("force", "normal", "shear", "contact_loss"):
                 mask = self._cause.get(cause)
                 if mask is not None:
-                    episode[f"fragile/break_{cause}"] = mask.to(dtype)
-            if bool(self._broke.any()):
-                step = self.env.unwrapped.episode_length_buf.to(dtype)
-                episode["fragile/break_step"] = torch.where(
-                    self._broke, step, torch.full_like(step, float("nan"))
-                )
+                    episode[f"fragile/rate_cause_{cause}"] = mask.to(dtype)
+            # published every step, NaN where nothing broke -- never behind an
+            # `if broke.any()`. A metric channel has to be present on every step or on none
+            # (the eval trace is rectangular, and EvalStateWriter.end_round raises on a
+            # channel that comes and goes), and NaN is already this package's "not
+            # applicable", so the mean is over the episodes that did break. Dropping the
+            # guard also drops a host sync from the rollout.
+            episode["fragile/break_step"] = self._break_step.to(dtype)
         # a reset clears the contact latch, so the next episode has to earn contact again
         done = torch.logical_or(terminated.reshape(-1), truncated.reshape(-1))
         self._contacted &= ~done

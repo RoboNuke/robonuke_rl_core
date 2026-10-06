@@ -345,6 +345,7 @@ the episodes that have it.
 | --- | --- | --- |
 | `episode/return`, `episode/length` | `LearnerBase` | + `/min`, `/max`; one value per finished episode |
 | `episode/count` | `LearnerBase` | episodes finished in the interval |
+| `episode/best_success_rate` | `LearnerBase` | **training only**: the success rate measured over the interval that produced the current `ckpt_best`, republished every interval so the line is flat between improvements — "how good is the policy I would actually ship". It **can go down**: best is chosen by mean episode return, so a new best-by-return may have had a worse success rate, and forcing it upward would report a number no checkpoint on disk ever achieved. Nothing is published until an interval with episodes has been seen |
 | `reward/step` | `LearnerBase` | the instantaneous reward, per env, every step; + `/min`, `/max` |
 | `loss/policy`, `loss/critic`, `loss/value`, `loss/entropy` | the learner | SAC's `loss/entropy` is the temperature's loss, PPO's is the entropy bonus's contribution |
 | `policy/std`, `policy/entropy`, `policy/log_prob` | the learner | `policy/std` is the mean commanded sigma |
@@ -352,14 +353,19 @@ the episodes that have it.
 | `q/q1_mean`, `q/q2_mean`, `q/target_mean` | SAC | + `/min`, `/max` |
 | `ppo/kl`, `ppo/clip_fraction`, `ppo/kept` | PPO | `ppo/kept` is the per-agent KL early stop |
 | `grad_norm/*`, `lr/*` | the learner | per optimizer |
-| `stats/update_time_ms` | the learner | wall time of one update, the number to compare against another implementation |
+| `stats/update_time_ms` | the learner | wall time of one update, the number to compare against another implementation. Emitted from inside the timed block, so it **lags one update** and the first point is 0 |
+| `stats/ram_mb` | the learner | this process's resident set size, from `/proc/self/statm` — it counts what Kit and PhysX hold too, so it is the number that predicts an OOM kill. + `/min`, `/max` |
+| `stats/gpu_used_mb` | the learner | whole-device memory in use (`mem_get_info`: total - free), so it includes Isaac Sim. CUDA only. + `/min`, `/max` |
+| `stats/gpu_torch_reserved_mb` | the learner | our allocator's share of the above; a growing gap between the two says the leak is not in the learner. CUDA only |
 | `loss/<name>_<target>` | `losses.build_aux_losses` | one per configured aux loss |
-| `episode/success`, `episode/success_step`, `episode/engaged` | `ForgeTaskMetricsWrapper` | `success_step` is NaN unless the episode succeeded |
-| `termination/success`, `termination/timeout` | `ForgeTaskMetricsWrapper` | one 0/1 per cause, so each averages into a rate |
+| `episode/success`, `episode/success_step`, `episode/engaged` | `ForgeTaskMetricsWrapper` | `success_step` is NaN unless the episode succeeded. `engaged` is **latched** over the episode, like the env's own `ep_succeeded`: it is the only quantity here read from live scene state, and `_reset_idx` has already restored the initial condition by the time the wrapper's `step` runs, so a live reading was 0 for every episode that ended. Latched, the engagement rate is always >= the success rate, as it must be |
+| `termination/success`, `termination/timeout` | `ForgeTaskMetricsWrapper` | one 0/1 per cause, so each averages into a rate. `timeout` is the **clock** (`truncated & ~success`), not "any done that was not a success" — a broken peg ends an episode through `terminated`, and counting it as a timeout made the two namespaces disagree. With `success` + `timeout` + `fragile/broke` every episode is accounted for |
 | `reward/<term>` | `ForgeTaskMetricsWrapper` | the per-term reward decomposition, per step |
 | `Success_Prediction/error`, `/<thr>_precision`, `/<thr>_recall`, `/<thr>_delay_all`, `/<thr>_delay_correct` | `ForgeTaskMetricsWrapper` | how good Forge's 7th action is |
 | `fragile/force` | `ForgeFragileObjectWrapper` | per step |
-| `fragile/broke`, `/break_force`, `/break_normal`, `/break_shear`, `/break_contact_loss`, `/break_step` | `ForgeFragileObjectWrapper` | one rate per cause; `break_step` is NaN where nothing broke |
+| `fragile/broke` | `ForgeFragileObjectWrapper` | the break rate over the episodes that ended |
+| `fragile/rate_cause_{force,normal,shear,contact_loss}` | `ForgeFragileObjectWrapper` | the fraction of ended episodes whose break had this cause, so a value under 1 reads as the rate it is. **The set depends on the mode**: magnitude mode (`break_force: [n]`) publishes `rate_cause_force` only; `direction_break_force` publishes `rate_cause_normal` and `rate_cause_shear` instead, never `force`. `rate_cause_contact_loss` appears only with `require_contact` |
+| `fragile/break_step` | `ForgeFragileObjectWrapper` | the episode step the break happened on, NaN where nothing broke. Sampled in `_get_dones`, because `_reset_idx` zeroes `episode_length_buf` for exactly the envs that broke before the wrapper's `step` sees them |
 | `contact/in_contact_{x,y,z,any}` | `ForgeContactSensorWrapper` | per step |
 | `selection/force_<axis>` | `ForgeControllerWrapper` | per step; the fraction of envs whose axis was force-controlled (1 = force) |
 | `selection/p_force_<axis>` | `LearnerBase.emit_selection` | the policy's probability of force control on that axis |
@@ -514,9 +520,14 @@ real per-env prims — and both say so rather than failing cryptically.
 * **`ForgeEfficientResetWrapper`** — a full reset runs the env's chain and caches the scene;
   a partial reset runs only `DirectRLEnv._reset_idx` and teleports the finished env onto a
   random donor's cached state, then copies the bookkeeping the lightweight path skips,
-  re-samples Forge's per-episode randomization and clears the force smoothing. **Training
-  only**: `scripts/eval.py` refuses it, because eval's accounting needs every episode to start
-  from an independently sampled condition.
+  re-samples Forge's per-episode randomization and clears the force smoothing.
+  **`wrappers.fragile.enabled` requires it** (`WrappersCfg.validate`), and that is not an
+  optimization: a peg breaks one env at a time, so the env resets a *subset* mid-episode, and
+  Factory/Forge's `randomize_initial_state` is written assuming every env resets together —
+  it samples `len(env_ids)` rows, assigns them into the full buffer (which raises) and builds
+  the rest at `num_envs`. Stock Factory/Forge never notices because those tasks end only on
+  the clock, so every env times out on the same step. Eval uses the wrapper too: a teleported
+  episode is not independently sampled, but it is never counted either (see below).
 * **`ForgeContactSensorWrapper`** — per-axis in-contact flags from a real contact sensor,
   published on the step channel, on `env.in_contact` for other wrappers, and optionally
   appended to the observation. The sensor is built *after* `clone_environments`, because the
@@ -546,7 +557,13 @@ camera and video path. Both scripts take the same policy sources and config laye
 exactly its FIRST episode of the round.** Isaac Lab keeps auto-resetting envs mid-round;
 every step after an env's first done is masked out of the counts, the returns, the metrics,
 the trace and the video — one mask (`EvalAccounting.step` returns it) drives all of them, so
-they cannot disagree. `ceil(num_rollouts / num_envs)` rounds run, and the last one uses only
+they cannot disagree.
+
+That mask is also why eval runs the **efficient reset** like training does. Those mid-round
+resets have to happen (the env auto-resets whatever we do, and with a fragile peg they are
+partial), the wrapper is what makes them safe, and the episodes they start are already
+excluded: `valid = active & ~finished`. Independent initial conditions come from the global
+`force_env_reset` at the top of each round, which is the only reset whose episodes count. `ceil(num_rollouts / num_envs)` rounds run, and the last one uses only
 the envs still needed.
 
 Two details that are easy to get wrong:
@@ -567,7 +584,14 @@ the checkpoint from that run's **plain files** into `~/.cache/robonuke_rl_core/.
 like a local run dir; `--local <run dir>` skips wandb. Either way the config for the eval is
 the run's resolved config, then the `--eval_config` file (with its own `base` chain), then
 CLI overrides — so the eval config sets the test conditions and the env count, and anything
-it omits keeps the trained run's value. `--checkpoint` takes `best` (default), a step number
+it omits keeps the trained run's value.
+
+**Both entry points inject `experiment.num_agents=1`** (`evaluation.SINGLE_AGENT_OVERRIDE`,
+appended last so it wins over a CLI value too). Eval and debug load one checkpoint slot into
+a one-agent shell and give it every env, so the trained run's agent count is not just unused:
+left in place, `trainer.validate`'s divisibility rule rejects any eval env count that does not
+divide by it (64 envs over a 3-agent run), and the eval's own `resolved_config.yaml` would
+claim an agent count that never ran. `--checkpoint` takes `best` (default), a step number
 or an exact file name. The policy is a 1-agent shell whatever the run trained, loaded with
 `load_agent(..., with_optimizer=False)`, normalizers frozen, `mean_actions` unless
 `eval.deterministic: false`.
@@ -575,7 +599,10 @@ or an exact file name. The policy is a 1-agent shell whatever the run trained, l
 ### What an eval writes
 
 Under `<run dir>/eval/<eval-config-stem>_<timestamp>/`: `summary.yaml` (aggregates plus one
-row per episode), `<stem>.parquet` (the per-step trace: one row per valid (round, env, step),
+row per episode; each metric gets a `/mean`, and a `/std` **only where it carries
+information** — the std of a 0/1 column is `sqrt(p(1-p))`, so beside the mean it can only
+restate it, while inviting the reading that a 0.89 success rate with a 0.31 "std" says
+something about spread between episodes), `<stem>.parquet` (the per-step trace: one row per valid (round, env, step),
 vector signals expanded to `name_0..k`, NaN back-fill so it stays rectangular),
 `resolved_config.yaml` (the eval's own, so it reproduces like a run), and `videos/` when
 recording. With `--run`, those same files go back to the training run under

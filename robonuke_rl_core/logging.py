@@ -39,6 +39,10 @@ DISTRIBUTIONS = (
     "q/q1_mean",
     "q/q2_mean",
     "q/target_mean",
+    # a peak is the whole question with memory: a mean that fits says nothing about the
+    # spike that did not
+    "stats/gpu_used_mb",
+    "stats/ram_mb",
 )
 
 

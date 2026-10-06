@@ -45,8 +45,8 @@ wrappers:
     force_threshold: 1.0
     append_to_policy_obs: true
   efficient_reset:
-    # a fragile peg terminates envs one at a time; this keeps the survivors from paying for it.
-    # Training only — eval refuses it.
+    # required with a fragile peg: it terminates envs one at a time, and Factory/Forge's own
+    # reset path assumes every env resets together. The config refuses fragile without it.
     enabled: true
   orientation:
     mode: 6d_rot_mat

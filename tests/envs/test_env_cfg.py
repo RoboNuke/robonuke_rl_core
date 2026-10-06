@@ -128,6 +128,34 @@ def test_a_single_branch_must_declare_no_bernoulli_dims():
     assert "no selection block" in str(err.value)
 
 
+# ------------------------------------------------------------------ wrapper dependencies
+def test_a_fragile_peg_requires_the_efficient_reset():
+    """Ported from V, which enforces the same pair at config load.
+
+    A peg breaks one env at a time, so the env resets a subset mid-episode, and
+    Factory/Forge's `randomize_initial_state` is written assuming every env resets together
+    (it assigns a `len(env_ids)`-sized sample into the full buffer). The efficient-reset
+    wrapper is what makes a partial reset safe -- without it the run dies on the first break,
+    which is a terrible way to find out.
+    """
+    wrappers = WrappersCfg()
+    wrappers.fragile.enabled = True
+    with pytest.raises(ValueError) as err:
+        wrappers.validate(None)
+    message = str(err.value)
+    assert "wrappers.efficient_reset.enabled" in message and "fragile" in message
+
+    wrappers.efficient_reset.enabled = True
+    wrappers.validate(None)  # the pair is what makes it legal
+
+
+def test_the_efficient_reset_is_fine_on_its_own():
+    """The dependency is one-way: a run with no fragile peg may still want fast resets."""
+    wrappers = WrappersCfg()
+    wrappers.efficient_reset.enabled = True
+    wrappers.validate(None)
+
+
 def test_force_zero_dims_may_not_collide_with_controller_blocks():
     with pytest.raises(ValueError) as err:
         controller(use_force=True).validate(
@@ -145,6 +173,7 @@ def test_the_check_is_skipped_when_there_is_no_model_section():
 def test_fragile_break_force_shape_follows_the_mode():
     wrappers = WrappersCfg()
     wrappers.fragile.enabled = True
+    wrappers.efficient_reset.enabled = True  # a fragile peg is not legal without it
     wrappers.fragile.break_force = [50.0]
     wrappers.validate(None)
 
@@ -163,6 +192,7 @@ def test_fragile_break_force_shape_follows_the_mode():
 def test_loss_of_contact_needs_the_contact_sensor():
     wrappers = WrappersCfg()
     wrappers.fragile.enabled = True
+    wrappers.efficient_reset.enabled = True  # a fragile peg is not legal without it
     wrappers.fragile.require_contact = True
     with pytest.raises(ValueError) as err:
         wrappers.validate(None)

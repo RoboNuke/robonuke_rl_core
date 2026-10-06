@@ -21,8 +21,17 @@ correctly on the recipient's own origin. Everything else the lightweight path sk
 per-env bookkeeping tensors, Forge's per-episode randomization, the force-sensor smoothing —
 is copied or cleared explicitly.
 
-**Training only.** Episodes reset this way share initial conditions with a donor, which is
-exactly what eval must not do; ``scripts/eval.py`` refuses the flag.
+**Required whenever an env can end early**, i.e. whenever ``wrappers.fragile`` is on
+(``WrappersCfg.validate`` enforces it): Factory/Forge's own reset path is written assuming
+every env resets together, so a partial reset through it corrupts the envs still mid-episode
+— or raises outright. Making a partial reset safe is the whole reason this wrapper exists.
+
+A teleported episode shares its initial condition with a donor, so it is **not**
+independently sampled. That does not disturb eval: an env stops being tracked the moment its
+first episode of the round closes (``EvalAccounting.valid``), so every teleported episode is
+already masked out of the returns, the metrics, the trace and the video. Each round still
+begins with a global ``force_env_reset``, which is where eval's independent conditions come
+from.
 """
 
 from __future__ import annotations

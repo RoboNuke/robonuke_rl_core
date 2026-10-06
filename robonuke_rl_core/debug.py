@@ -30,6 +30,7 @@ from pathlib import Path
 
 from robonuke_rl_core.config import load_from_run  # noqa: E402
 from robonuke_rl_core.evaluation import (  # noqa: E402
+    SINGLE_AGENT_OVERRIDE,
     build_eval_policy,
     fetch_wandb_run,
     find_checkpoint,
@@ -177,7 +178,7 @@ def main(argv=None, setup=None) -> int:
 
     extra = [args.eval_config] if args.eval_config else []
     # debug watches one env; an eval config's env count would only confuse the view
-    injected = ["task.cfg.scene.num_envs=1"]
+    injected = ["task.cfg.scene.num_envs=1", SINGLE_AGENT_OVERRIDE]
     if headless:
         # the reset video needs a real per-env camera prim. Unlike eval -- where recording is
         # a deliberate choice the eval config states -- debug has no config of its own, so it

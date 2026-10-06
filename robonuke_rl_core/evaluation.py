@@ -21,6 +21,7 @@ import torch
 
 __all__ = [
     "EvalCfg",
+    "SINGLE_AGENT_OVERRIDE",
     "run_eval",
     "EvalResult",
     "force_env_reset",
@@ -35,6 +36,17 @@ __all__ = [
     "EvalAccounting",
     "EvalStateWriter",
 ]
+
+
+#: The config-layer override every eval and debug run injects, whatever the trained run said.
+#:
+#: Eval loads one agent's checkpoint into a one-agent shell and gives it every env, so the
+#: trained run's ``experiment.num_agents`` is not just unused here — left in place it is
+#: actively wrong twice over. The divisibility rule (``task.cfg.scene.num_envs`` must divide
+#: by ``experiment.num_agents``) would reject a perfectly good eval env count for a reason
+#: that does not apply, and the eval's own ``resolved_config.yaml`` would claim an agent
+#: count that never ran. Injected as a CLI-layer override, so it is recorded like any other.
+SINGLE_AGENT_OVERRIDE = "experiment.num_agents=1"
 
 
 # --------------------------------------------------------------------------------- config
@@ -123,6 +135,18 @@ def per_env_channel(
                 f"num_envs ({num_envs}), got {shown}"
             )
     return channel
+
+
+def _is_indicator(values: torch.Tensor) -> bool:
+    """True when every value is 0 or 1.
+
+    The std of a 0/1 column is ``sqrt(p(1-p))`` -- fully determined by the mean, so printing
+    it beside the mean can only restate it, while inviting the reading that a 0.89 success
+    rate with a 0.31 "std" says something about spread between episodes. A success either
+    happened or it did not; it is not a measurement with error. So :meth:`summary` emits a
+    std only where it carries information.
+    """
+    return bool(((values == 0.0) | (values == 1.0)).all())
 
 
 # ----------------------------------------------------------------------------- accounting
@@ -338,7 +362,8 @@ class EvalAccounting:
                 ]
                 tensor = torch.tensor(values, dtype=torch.float64)
                 out[f"{name}/mean"] = float(tensor.mean())
-                out[f"{name}/std"] = float(tensor.std(unbiased=False))
+                if not _is_indicator(tensor):
+                    out[f"{name}/std"] = float(tensor.std(unbiased=False))
                 if len(values) != len(episodes):
                     # an episode closed by the step budget never published an episode metric
                     out[f"{name}/episodes"] = len(values)

@@ -62,6 +62,18 @@ class ForgeTaskMetricsWrapper(gym.Wrapper):
         self._unloggable: set = set()
         self._successes: Optional[torch.Tensor] = None
         self._prediction: Optional[torch.Tensor] = None
+        #: "did this episode ever engage", latched like the env's own ``ep_succeeded``.
+        #: Engagement is the only quantity here read from live scene state rather than from
+        #: a buffer, so it is sampled in the ``_log_factory_metrics`` tap (inside
+        #: ``_get_rewards``, before ``_reset_idx``) and accumulated, never read at the end of
+        #: a step. See :meth:`engaged_now`.
+        self._engaged = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        threshold = getattr(getattr(unwrapped, "cfg_task", None), "engage_threshold", None)
+        self._engage_threshold = (
+            float(threshold)
+            if threshold is not None and hasattr(unwrapped, "_get_curr_successes")
+            else None
+        )
 
         self._original_factory_log = getattr(unwrapped, "_log_factory_metrics", None)
         if self._original_factory_log is None:
@@ -76,9 +88,17 @@ class ForgeTaskMetricsWrapper(gym.Wrapper):
 
     # ------------------------------------------------------------------ the taps
     def _log_factory_metrics(self, rew_dict, curr_successes):
-        """Capture the per-env reward terms and successes, then let the env log its own."""
+        """Capture the per-env reward terms and successes, then let the env log its own.
+
+        Also the one safe moment to sample engagement: this runs inside ``_get_rewards``,
+        which is before ``DirectRLEnv.step`` calls ``_reset_idx``. A step later the scene is
+        already back at its initial condition for every env that finished.
+        """
         self._terms.update({name: value.detach() for name, value in rew_dict.items()})
         self._successes = curr_successes.detach()
+        engaged = self.engaged_now()
+        if engaged is not None:
+            self._engaged |= engaged.reshape(-1).to(torch.bool)
         return self._original_factory_log(rew_dict, curr_successes)
 
     def _log_forge_metrics(self, rew_dict, policy_success_pred):
@@ -88,13 +108,17 @@ class ForgeTaskMetricsWrapper(gym.Wrapper):
         return self._original_forge_log(rew_dict, policy_success_pred)
 
     # ------------------------------------------------------------------ the metrics
-    def engaged(self) -> Optional[torch.Tensor]:
-        """Engagement by the task's own looser threshold, if the task defines one."""
-        unwrapped = self.env.unwrapped
-        threshold = getattr(getattr(unwrapped, "cfg_task", None), "engage_threshold", None)
-        if threshold is None or not hasattr(unwrapped, "_get_curr_successes"):
+    def engaged_now(self) -> Optional[torch.Tensor]:
+        """Is the peg engaged **right now**, by the task's looser threshold?
+
+        Instantaneous, so it is only meaningful while the scene still holds the state it is
+        asked about. None when the task defines no ``engage_threshold``.
+        """
+        if self._engage_threshold is None:
             return None
-        return unwrapped._get_curr_successes(success_threshold=threshold, check_rot=False)
+        return self.env.unwrapped._get_curr_successes(
+            success_threshold=self._engage_threshold, check_rot=False
+        )
 
     def step_metrics(self, dtype: torch.dtype) -> Dict[str, torch.Tensor]:
         """Per-step, per-env: the reward decomposition.
@@ -140,9 +164,11 @@ class ForgeTaskMetricsWrapper(gym.Wrapper):
             # NaN where it never succeeded, so the mean is "how long a success took"
             metrics["episode/success_step"] = torch.where(succeeded, times.to(dtype), nan)
 
-        engaged = self.engaged()
-        if engaged is not None:
-            metrics["episode/engaged"] = engaged.reshape(-1).to(dtype)
+        if self._engage_threshold is not None:
+            # the LATCH, not a live reading: "did this episode ever engage". Success implies
+            # engagement by a looser threshold, so latched this way the engagement rate is
+            # always >= the success rate, which is the only way the pair means anything.
+            metrics["episode/engaged"] = self._engaged.to(dtype)
 
         metrics.update(self._termination_causes(succeeded, terminated, truncated, dtype))
         metrics.update(self._prediction_metrics(succeeded, dtype, nan))
@@ -152,13 +178,20 @@ class ForgeTaskMetricsWrapper(gym.Wrapper):
         """One 0/1 per cause, so each averages into its own rate.
 
         ``success`` wins over ``timeout`` when both are true on the same step: the episode
-        ended because it was finished, not because the clock ran out. A peg break is reported
-        by the fragile wrapper, which owns that cause.
+        ended because it was finished, not because the clock ran out.
+
+        **``timeout`` is the clock, read off ``truncated`` alone.** Not "any done that was
+        not a success" — that counted every broken peg as a timeout, because the fragile
+        wrapper ends an episode by raising ``terminated``. Factory and Forge themselves end
+        only on the clock and raise both flags there, so ``truncated`` is exactly the clock
+        and ``terminated & ~truncated`` is exactly an early termination. The early causes are
+        owned by the wrapper that decides them: ``fragile/broke`` and ``fragile/cause_*``.
+        So ``termination/success``, ``termination/timeout`` and ``fragile/broke`` together
+        account for every episode, across the two namespaces.
         """
-        terminated = terminated.reshape(-1).to(torch.bool)
         truncated = truncated.reshape(-1).to(torch.bool)
         success = succeeded
-        timeout = (truncated | terminated) & ~success
+        timeout = truncated & ~success
         return {
             "termination/success": success.to(dtype),
             "termination/timeout": timeout.to(dtype),
@@ -210,4 +243,8 @@ class ForgeTaskMetricsWrapper(gym.Wrapper):
                 self.episode_metrics(terminated, truncated, dtype)
             )
         self._terms = {}
+        # the env clears its own ep_succeeded on the NEXT step's _pre_physics_step; the
+        # engagement latch is ours, so it is cleared here, once the episode is reported
+        done = torch.logical_or(terminated.reshape(-1), truncated.reshape(-1))
+        self._engaged &= ~done
         return observations, rewards, terminated, truncated, infos

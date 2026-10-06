@@ -33,6 +33,7 @@ from robonuke_rl_core.config import dump, load_from_run  # noqa: E402
 from robonuke_rl_core.envs.build import build_env, describe, prepare_task  # noqa: E402
 from robonuke_rl_core.recording import EvalRecorder, install_recorder_camera  # noqa: E402
 from robonuke_rl_core.evaluation import (  # noqa: E402
+    SINGLE_AGENT_OVERRIDE,
     build_eval_policy,
     fetch_wandb_run,
     find_checkpoint,
@@ -114,7 +115,12 @@ def main(argv=None, setup=None) -> int:
     config_path = resolved_config_path(run_dir)
     checkpoint = find_checkpoint(run_dir, args.checkpoint)
 
-    cfg = load_from_run(config_path, overrides, extra_files=[args.eval_config])
+    # eval runs ONE agent whatever the run trained, so the config has to say so
+    cfg = load_from_run(
+        config_path,
+        list(overrides) + [SINGLE_AGENT_OVERRIDE],
+        extra_files=[args.eval_config],
+    )
     record = bool(cfg.eval.record or args.record)
 
     stem = Path(args.eval_config).stem
@@ -127,13 +133,6 @@ def main(argv=None, setup=None) -> int:
             cfg.task_cfg,
             width=cfg.eval.video_width,
             height=cfg.eval.video_height,
-        )
-    if cfg.wrappers.efficient_reset.enabled:
-        raise ValueError(
-            "wrappers.efficient_reset.enabled is true, which eval cannot use: a partial reset "
-            "teleports a finished env onto another env's state, and the accounting here needs "
-            "every episode to start from an independently sampled initial condition. Set "
-            "wrappers.efficient_reset.enabled: false in the eval config."
         )
     prepare_task(cfg, cfg.task_name, cfg.task_cfg)
     env = gym.make(cfg.task_name, cfg=cfg.task_cfg)

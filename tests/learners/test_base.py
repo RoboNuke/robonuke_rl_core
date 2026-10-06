@@ -486,8 +486,151 @@ def test_the_checkpoint_hook_reports_every_file_written(tmp_path):
     assert seen == [(0, 5, checkpoint_name(5)), (1, 5, checkpoint_name(5))]
     assert [p.name for p in paths] == [name for _, _, name in seen]
 
-    # the best-checkpoint writer announces its file too
+    # the best-checkpoint writer announces its file too. The "is this a new best" decision
+    # is made in the flush, so that episode/best_success_rate can publish in the same
+    # interval -- so drive that first rather than calling the writer cold.
     seen.clear()
     learner._mean_return = [1.0, -1.0]
+    learner._update_best(6, [0.0, 0.0], [0.0, 0.0])
     learner._write_best_checkpoints(step=6)
     assert seen == [(0, 6, CHECKPOINT_BEST), (1, 6, CHECKPOINT_BEST)]
+
+
+# ------------------------------------------------------------------ the stats/* metrics
+def test_the_stats_metrics_report_time_and_memory():
+    """`stats/*` answers "what did that update cost" -- in wall time AND in memory.
+
+    An update time on its own cannot tell a run that is about to be OOM-killed from one
+    that is fine, which is the failure these exist to make visible.
+    """
+    learner = build_learner("sac", num_agents=3, envs_per_agent=2)
+    stats = learner.stats_metrics()
+
+    assert "stats/update_time_ms" in stats
+    assert "stats/ram_mb" in stats
+    for name, value in stats.items():
+        assert value.shape == (3,), name  # one per agent, same process-wide number
+        assert float(value.min()) == float(value.max()), name
+    # RSS is this pytest process: real, and nowhere near zero
+    assert float(stats["stats/ram_mb"][0]) > 1.0
+
+
+def test_the_gpu_numbers_appear_only_on_a_gpu():
+    """On CPU there is no device to report, and a zero would read as "no memory used"."""
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2)
+    assert learner.device.type == "cpu"
+    stats = learner.stats_metrics()
+    assert not [name for name in stats if "gpu" in name]
+
+
+def test_the_memory_metrics_publish_a_spread():
+    """A mean that fits says nothing about the spike that did not."""
+    from robonuke_rl_core.logging import DISTRIBUTIONS
+
+    assert "stats/gpu_used_mb" in DISTRIBUTIONS
+    assert "stats/ram_mb" in DISTRIBUTIONS
+
+
+def test_an_update_emits_the_stats(tmp_path):
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2)
+    fill_memory(learner)
+    seen: dict = {}
+
+    def hook(agent_idx, metrics, step):
+        seen.update({name: value for name, value in metrics.items() if name.startswith("stats/")})
+
+    learner.on_log.append(hook)
+    learner.update(timestep=4, timesteps=100)
+    assert sorted(seen) == ["stats/ram_mb", "stats/update_time_ms"]
+    assert float(seen["stats/ram_mb"]) > 1.0
+    # update_time_ms lags one update: the metrics are emitted inside the timed block, so the
+    # value published here is the PREVIOUS update's elapsed time, and 0.0 on the first one
+    assert float(seen["stats/update_time_ms"]) == 0.0
+
+    learner.update(timestep=8, timesteps=100)
+    assert float(seen["stats/update_time_ms"]) > 0.0
+
+
+# ------------------------------------------------------------------ the best success rate
+def best_rate_run(learner, intervals):
+    """Drive `intervals` of (mean_return, success_rate) and collect what was published.
+
+    Each tuple is one write interval for agent 0: the episodes' mean return and the fraction
+    of them that succeeded. Returns the `episode/best_success_rate` value seen per interval,
+    or None where nothing was published.
+    """
+    from robonuke_rl_core.learners.base import BEST_SUCCESS_METRIC
+
+    seen: list = []
+
+    def hook(agent_idx, metrics, step):
+        if agent_idx == 0 and BEST_SUCCESS_METRIC in metrics:
+            seen.append(float(metrics[BEST_SUCCESS_METRIC]))
+
+    learner.on_log.append(hook)
+    for step, (mean_return, rate) in enumerate(intervals):
+        before = len(seen)
+        learner._mean_return = [mean_return] * learner.num_agents
+        learner._update_best(step, [rate] * learner.num_agents, [1.0] * learner.num_agents)
+        if len(seen) == before:
+            seen.append(None)
+    return seen
+
+
+def test_the_best_success_rate_only_moves_when_best_moves():
+    """It is the success rate of the checkpoint on disk, republished every interval, so the
+    line is flat between improvements."""
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2)
+    seen = best_rate_run(
+        learner,
+        [
+            (1.0, 0.20),  # first best: rate 0.20
+            (0.5, 0.90),  # worse return, great success -> NOT a new best, rate stays 0.20
+            (2.0, 0.50),  # new best: rate becomes 0.50
+            (1.5, 0.99),  # worse return again -> stays 0.50
+        ],
+    )
+    assert seen == pytest.approx([0.20, 0.20, 0.50, 0.50], abs=1e-6)
+
+
+def test_it_can_go_down_because_best_is_chosen_by_return():
+    """Not monotonic, on purpose: a monotonic line would report a number no checkpoint on
+    disk ever achieved."""
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2)
+    seen = best_rate_run(learner, [(1.0, 0.80), (2.0, 0.30)])
+    assert seen == pytest.approx([0.80, 0.30], abs=1e-6)
+
+
+def test_nothing_is_published_before_an_interval_with_episodes():
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2)
+    from robonuke_rl_core.learners.base import BEST_SUCCESS_METRIC
+
+    seen: list = []
+    learner.on_log.append(
+        lambda agent, metrics, step: seen.extend(
+            name for name in metrics if name == BEST_SUCCESS_METRIC
+        )
+    )
+    learner._mean_return = [float("nan")] * learner.num_agents  # no finished episode yet
+    learner._update_best(0, [0.0, 0.0], [0.0, 0.0])
+    assert seen == []
+
+
+def test_the_success_channel_is_accumulated_per_agent():
+    """Agent 1's successes must not reach agent 0's rate."""
+    from robonuke_rl_core.learners.base import SUCCESS_METRIC
+
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2)
+    learner.on_log.append(lambda agent, metrics, step: None)  # the channels only flow with one
+    terminated = torch.ones(learner.num_envs, 1, dtype=torch.bool)
+    learner.observe_step(
+        infos={"episode_metrics_to_log": {
+            SUCCESS_METRIC: torch.tensor([1.0, 1.0, 0.0, 0.0]),  # agent 0 all, agent 1 none
+        }},
+        rewards=torch.zeros(learner.num_envs, 1),
+        terminated=terminated,
+        truncated=torch.zeros(learner.num_envs, 1, dtype=torch.bool),
+        step=1,
+    )
+    assert learner._success_total.tolist() == [2.0, 0.0]
+    assert learner._success_count.tolist() == [2.0, 2.0]

@@ -19,9 +19,9 @@ wandb:
   group: e2e_pose_10N
 
 trainer:
-  total_timesteps: 10000
+  total_timesteps: 5000
   write_interval: 150
-  checkpoint_interval: 2500
+  checkpoint_interval: 1000
 
 task:
   cfg:

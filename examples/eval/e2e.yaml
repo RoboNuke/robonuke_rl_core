@@ -1,6 +1,8 @@
 # The e2e run's eval: 256 fresh-condition episodes over 64 envs (4 rounds).
-# Efficient reset must be off in eval (eval raises otherwise): every round needs
-# independently sampled initial conditions.
+# The efficient reset stays ON, as the trained run had it: a fragile peg breaks one env
+# at a time, and it is what makes those partial resets safe. The teleported episodes it
+# produces are never counted -- an env stops being tracked the moment its first episode
+# of the round closes -- and each round still starts from a global reset.
 #
 #   python scripts/eval.py --run <entity>/forge_pih/<run> --eval_config examples/eval/e2e.yaml
 eval:
@@ -10,7 +12,3 @@ task:
   cfg:
     scene:
       num_envs: 64
-
-wrappers:
-  efficient_reset:
-    enabled: false

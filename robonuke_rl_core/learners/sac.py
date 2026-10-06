@@ -451,9 +451,7 @@ class SAC(LearnerBase):
                 metrics["policy/std"] = (
                     policy_outputs["log_std"].exp().view(self.num_agents, rows, -1).mean(dim=(1, 2))
                 )
-            metrics["stats/update_time_ms"] = torch.full(
-                (self.num_agents,), float(self.update_ms), device=self.device
-            )
+            metrics.update(self.stats_metrics())
             self.emit_per_agent(metrics, timestep)
 
     # ------------------------------------------------------------------ SimBa periodic reset
