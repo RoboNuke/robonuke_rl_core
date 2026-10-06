@@ -12,11 +12,14 @@ hpc:
   # cu128 kernels)
   partitions: dgxh,tiamat,eecs2
 
-  # The existing Isaac image -- the one built for
-  # RoboNuke/generalized_hybrid_vic_action_space. Nothing is installed into it: the job binds
-  # both repos at their own paths and puts them on PYTHONPATH, so this image is used as-is.
+  # The existing Isaac image, reused as-is. Nothing is installed into it: the job binds both
+  # repos at their own paths and puts them on PYTHONPATH.
+  # Matches generalized_hybrid_vic_action_space's own default --
+  # launchers/hpc/hpc_env.bash:25, SIF_IMAGE:=$HOME/hpc-share/isaac/ghvic.sif
   sif_image: ~/hpc-share/isaac/ghvic.sif
 
-  # bound as the container HOME. Kit and shader caches land here and run to GBs, so this must
-  # be scratch, never a quota'd NFS home.
-  cache_home: ~/hpc-share/isaac/cache
+  # Bound as the container HOME: Kit and shader caches land here and run to GBs, so it must be
+  # scratch, never a quota'd NFS home. This is the SAME directory the existing launchers use
+  # (hpc_env.bash:33, ISAAC_CACHE_HOME), so the caches it has already warmed are reused
+  # instead of starting cold.
+  cache_home: ~/hpc-share/isaac_cache_home
