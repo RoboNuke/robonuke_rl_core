@@ -1,0 +1,27 @@
+# End-to-end validation run, hybrid variant: everything identical to the pose-only e2e
+# (same task, agents, seed, SAC hyperparameters, model sizes, fragile 10 N, efficient
+# reset, contact in the critic state) except the control.
+#
+# The force branch is enabled on the translation axes with the gains still fixed
+# (gain_mapping stays `constant`), so the action grows from the native 7 to 13:
+# [pose 0-6 | selection 7-9 | force targets 10-12]. The selection dims are Bernoulli by
+# construction and the config refuses to load unless the model says so too.
+# target_entropy follows V's -|continuous|/2 convention: 13 - 3 Bernoulli = 10 -> -5.0.
+#
+#   python scripts/train.py --config examples/e2e_hybrid_fragile.yaml --headless
+base: e2e_pose_fragile.yaml
+
+wandb:
+  group: e2e_hybrid_10N
+
+controller:
+  use_force: true
+  # hybrid on the translation axes only; orientation stays position-controlled
+  force_axes: [1, 1, 1, 0, 0, 0]
+
+model:
+  actor:
+    bernoulli_action_dims: [7, 8, 9]
+
+sac:
+  target_entropy: -5.0
