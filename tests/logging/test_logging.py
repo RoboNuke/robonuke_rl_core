@@ -19,11 +19,13 @@ class FakeRun:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.logged: list[tuple[dict, int | None]] = []
+        self.commits: list = []
         self.saved: list[tuple[str, str, str]] = []
         self.finished = False
 
-    def log(self, data, step=None):
+    def log(self, data, step=None, commit=None):
         self.logged.append((dict(data), step))
+        self.commits.append(commit)
 
     def save(self, path, base_path=None, policy=None):
         # plain run files only; an Artifacts call would be an AttributeError here
@@ -293,3 +295,12 @@ def test_uploading_a_file_that_is_not_there_raises(tmp_path):
     with pytest.raises(FileNotFoundError) as err:
         log.save_file(tmp_path / "missing.ckpt")
     assert "missing.ckpt" in str(err.value)
+
+
+def test_every_flush_is_committed_at_once():
+    """wandb holds a row logged at an explicit step until a later step arrives; committing
+    each flush makes a point visible as soon as it is written, not one interval later."""
+    log, fake = logger(num_agents=1)
+    log(0, {"loss": torch.tensor(1.0)}, step=10)
+    log.flush(10)
+    assert fake.runs[0].commits == [True]

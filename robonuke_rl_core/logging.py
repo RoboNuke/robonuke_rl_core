@@ -295,7 +295,9 @@ class WandbLogger:
         """The ``on_flush`` hook: publish the interval's means at ``step``."""
         for agent, values in enumerate(self.accumulator.flush()):
             if values:
-                self.runs[agent].log(values, step=int(step))
+                # commit now: wandb otherwise holds a row logged at an explicit step until a
+                # later step arrives, so every point would show up one interval late
+                self.runs[agent].log(values, step=int(step), commit=True)
 
     def close(self) -> None:
         """Publish whatever is still pending (at the last step seen) and finish every run."""
