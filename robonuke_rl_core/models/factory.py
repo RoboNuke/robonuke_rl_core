@@ -48,9 +48,20 @@ def actor_kwargs(model_cfg, controller_cfg=None) -> dict:
 
 
 def _build_sac(
-    model_cfg: SimbaModelCfg, obs_space, state_space, action_space, num_agents, device, actor
+    model_cfg: SimbaModelCfg,
+    obs_space,
+    state_space,
+    action_space,
+    num_agents,
+    device,
+    actor,
+    num_critics: int = 2,
 ):
-    """Squashed-Gaussian actor + twin Q critics + their targets."""
+    """Squashed-Gaussian actor + ``num_critics`` Q critics (``critic_1 .. critic_N``) and a
+    target for each (``target_critic_k``). Two is classic SAC's twin; more is a REDQ / RLPD
+    ensemble (``sac.num_critics``)."""
+    if num_critics < 2:
+        raise ValueError(f"SAC needs at least 2 critics (sac.num_critics), got {num_critics}")
     critic_space = state_space if state_space is not None else obs_space
 
     def make_q():
@@ -62,7 +73,7 @@ def _build_sac(
             **_critic_kwargs(model_cfg),
         )
 
-    return {
+    models = {
         "policy": EnsembleActor(
             observation_space=obs_space,
             action_space=action_space,
@@ -70,17 +81,30 @@ def _build_sac(
             num_agents=num_agents,
             **actor,
         ),
-        "critic_1": make_q(),
-        "critic_2": make_q(),
-        "target_critic_1": make_q(),
-        "target_critic_2": make_q(),
     }
+    # the critics first, then the targets: the build order fixes the RNG stream, and with two
+    # critics this is the order the twin was always built in
+    for k in range(1, num_critics + 1):
+        models[f"critic_{k}"] = make_q()
+    for k in range(1, num_critics + 1):
+        models[f"target_critic_{k}"] = make_q()
+    return models
 
 
 def _build_ppo(
-    model_cfg: SimbaModelCfg, obs_space, state_space, action_space, num_agents, device, actor
+    model_cfg: SimbaModelCfg,
+    obs_space,
+    state_space,
+    action_space,
+    num_agents,
+    device,
+    actor,
+    num_critics: int = 2,
 ):
-    """Squashed-Gaussian actor + one state-value critic."""
+    """Squashed-Gaussian actor + one state-value critic. ``num_critics`` is SAC's; PPO has
+    one value critic and takes only the default."""
+    if num_critics != 2:
+        raise ValueError(f"num_critics is a SAC option; PPO builds one value critic (got {num_critics})")
     critic_space = state_space if state_space is not None else obs_space
     return {
         "policy": EnsembleActor(
@@ -126,6 +150,7 @@ def build_models(
     num_agents: int,
     device,
     controller_cfg=None,
+    num_critics: int = 2,
 ) -> Dict[str, Model]:
     """Build the networks ``learner`` needs, for ``model_cfg``'s architecture.
 
@@ -133,7 +158,8 @@ def build_models(
     builder. ``state_space`` not None means asymmetric actor-critic: the critic consumes
     the state vector while the actor keeps the policy observation. ``controller_cfg`` is the
     loaded `controller` section when there is one: it is where the MATCH pairs and the
-    selection axis names come from (see :func:`actor_kwargs`).
+    selection axis names come from (see :func:`actor_kwargs`). ``num_critics`` is
+    ``sac.num_critics`` for SAC (the Q ensemble's size) and must stay 2 for PPO.
     """
     key = (model_cfg.architecture, learner)
     if key not in MODEL_BUILDERS:
@@ -149,4 +175,5 @@ def build_models(
         num_agents,
         device,
         actor_kwargs(model_cfg, controller_cfg),
+        num_critics=num_critics,
     )

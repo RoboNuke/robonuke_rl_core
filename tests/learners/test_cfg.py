@@ -178,3 +178,21 @@ def test_ppo_minibatches_must_divide_the_per_agent_rows(tmp_path):
          "task.cfg.scene.num_envs=4", "experiment.num_agents=2"],
     )
     assert cfg.ppo.mini_batches == 4
+
+
+# ------------------------------------------------------------------ project learners
+def test_a_registered_project_learner_is_accepted_and_duplicates_raise():
+    from robonuke_rl_core.learners import cfg as learner_cfg
+
+    with pytest.raises(ValueError, match="trainer.learner"):
+        learner_cfg.TrainerCfg(learner="bc", total_timesteps=1).validate(None)
+    learner_cfg.register_learner("bc")
+    try:
+        assert learner_cfg.known_learners() == ("sac", "ppo", "bc")
+        assert learner_cfg.LEARNERS == ("sac", "ppo")  # the package's own set is unchanged
+        with pytest.raises(ValueError, match="already registered"):
+            learner_cfg.register_learner("bc")
+        with pytest.raises(ValueError, match="already registered"):
+            learner_cfg.register_learner("sac")
+    finally:
+        learner_cfg.PROJECT_LEARNERS.remove("bc")

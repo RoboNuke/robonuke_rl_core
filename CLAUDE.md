@@ -141,6 +141,18 @@ that a gradient's magnitude changed. Make sure each case really runs the path it
 test checks the *weights* changed (normalizer stats alone do not count), and the KL cases
 assert from `ppo/kept` that agent 1 was dropped in the copy but not in the control.
 
+### SAC's options beyond the twin
+
+`sac.num_critics` / `critic_subset` / `actor_q_reduction` (a REDQ / RLPD Q ensemble),
+`policy_delay` and `policy_learning_starts` (the actor's schedule) and `demo_transitions`
+with the `demo_sampling_*` window (demo rows in the critic's batches) are all off by default,
+and the default path is **bit-identical** to the twin it replaced (same RNG stream, same
+float expressions: a full-subset min draws nothing). Two independence details: the target's
+critic subset is drawn per agent (`(num_agents, num_critics)` uniforms), and a mixed batch's
+online/demo split depends only on the step count, never on the data. The demo file is loaded in
+`_create_memory_tensors`, so eval (no memory) never reads it. Tests:
+`tests/learners/test_sac_extensions.py`.
+
 ### The optimizer
 
 `BlockAdamW` (`robonuke_rl_core/optim.py`) is the only optimizer. AdamW's update is
@@ -176,6 +188,15 @@ The LR schedule is `lr_at(update, total_updates, lr, lr_end, schedule)`: `consta
 3. Add a builder to `MODEL_BUILDERS` in `models/factory.py`.
 4. Copy the independence test for it (one line in the parametrize list) and add it to
    `tests/learners/GPU/test_train_smoke.py`'s `LEARNERS`.
+
+A **project learner** that brings its own entry script and loop (no package models,
+memory or `LearnerBase`) only needs `register_learner("<name>")` in its `setup()`, so
+`trainer.learner` accepts it; `train.main` refuses it with a pointer to the project's script.
+A project adds env wrappers to every env the package builds (train, eval, debug) with
+`envs.build.register_env_wrapper(fn)` in `setup()`; `build_env` applies them outside all
+package wrappers, as `fn(cfg, env, task_name) -> env`.
+`run_eval` calls `policy.reset()` after each round's reset when the policy has one, for a
+policy that keeps state across steps (an action-chunking queue).
 
 ### Add a model
 
@@ -350,6 +371,7 @@ the episodes that have it.
 | `loss/policy`, `loss/critic`, `loss/value`, `loss/entropy` | the learner | SAC's `loss/entropy` is the temperature's loss, PPO's is the entropy bonus's contribution |
 | `policy/std`, `policy/entropy`, `policy/log_prob` | the learner | `policy/std` is the mean commanded sigma |
 | `entropy/coefficient` | SAC | alpha |
+| `sac/demo_fraction` | SAC | the share of each critic batch that came from `sac.demo_transitions`: 0.5 inside the window once the memory holds half a batch, more before, 0 outside. Only published when demos are configured. With `policy_delay` > 1 the actor's metrics (`loss/policy`, `policy/*`, `grad_norm/policy`) come only from the gradient steps that updated it |
 | `q/q1_mean`, `q/q2_mean`, `q/target_mean` | SAC | + `/min`, `/max` |
 | `ppo/kl`, `ppo/clip_fraction`, `ppo/kept` | PPO | `ppo/kept` is the per-agent KL early stop |
 | `grad_norm/*`, `lr/*` | the learner | per optimizer |

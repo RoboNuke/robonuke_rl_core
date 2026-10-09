@@ -51,6 +51,11 @@ def main(argv=None, setup=None) -> int:
 
     cfg = load_from_args(args, overrides)
     learner_name = cfg.trainer.learner
+    if learner_name not in learners:
+        raise ValueError(
+            f"trainer.learner: {learner_name!r} is a project-registered learner; this script runs "
+            f"only the package's {sorted(learners)}. Start it with the project's own entry script."
+        )
     learner_cfg = cfg[learner_name]
     num_agents = cfg.experiment.num_agents
     dirs = run_dirs(cfg)
@@ -85,6 +90,7 @@ def main(argv=None, setup=None) -> int:
         num_agents,
         env.device,
         controller_cfg,
+        num_critics=int(learner_cfg.num_critics) if learner_name == "sac" else 2,
     )
 
     # transitions per agent: PPO holds one rollout, SAC holds what the config asks for

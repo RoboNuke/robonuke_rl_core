@@ -103,6 +103,7 @@ def build_learner(
         num_agents,
         "cpu",
         controller_cfg,
+        num_critics=cfg.num_critics if learner == "sac" else 2,
     )
     memory = MultiRandomMemory(
         capacity=rollout * envs_per_agent, num_envs=num_envs, num_agents=num_agents, device="cpu"

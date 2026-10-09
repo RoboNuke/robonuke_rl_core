@@ -31,6 +31,8 @@ __all__ = [
     "fetch_wandb_run",
     "upload_eval_results",
     "build_eval_policy",
+    "EVAL_POLICY_BUILDERS",
+    "register_eval_policy",
     "eval_rounds",
     "per_env_channel",
     "EvalAccounting",
@@ -607,7 +609,9 @@ def run_eval(
     One round = one global reset (fresh random initial conditions, seeded
     ``seed + round``) plus exactly ``max_episode_length`` steps. ``policy`` is called as
     ``policy(observations, states) -> actions``; nothing here updates a normalizer or a
-    weight. ``recorder``, when given, follows the same ``start_round`` / ``capture`` /
+    weight. A policy with internal state across steps (an action-chunking policy's queue)
+    exposes ``policy.reset()``, which is called right after each round's global reset, so
+    nothing from the previous round leaks into the next. ``recorder``, when given, follows the same ``start_round`` / ``capture`` /
     ``end_round`` protocol as the state writer and sees the same valid mask.
     """
     num_envs = int(env.num_envs)
@@ -617,6 +621,8 @@ def run_eval(
     for index, active in enumerate(eval_rounds(num_rollouts, num_envs)):
         torch.manual_seed(int(seed) + index)
         observations, states = force_env_reset(env)
+        if hasattr(policy, "reset"):
+            policy.reset()
         accounting.start_round(active)
         if writer is not None:
             writer.start_round(index)
@@ -861,6 +867,21 @@ def upload_eval_results(
     return stored
 
 
+#: project learners' eval policies: ``trainer.learner`` -> ``fn(cfg, env, checkpoint,
+#: deterministic) -> (policy, learner_or_None, metadata)``, metadata holding ``step``,
+#: ``mean_return`` and ``agent_idx``. ``policy(observations, states) -> actions``.
+EVAL_POLICY_BUILDERS: Dict[str, Any] = {}
+
+
+def register_eval_policy(learner: str, fn: Any) -> None:
+    """Let eval and debug load a project learner's checkpoint (call in ``setup``)."""
+    if learner in ("sac", "ppo"):
+        raise ValueError(f"{learner!r} is the package's own learner; its eval policy is built in")
+    if learner in EVAL_POLICY_BUILDERS:
+        raise ValueError(f"an eval policy for learner {learner!r} is already registered")
+    EVAL_POLICY_BUILDERS[learner] = fn
+
+
 def build_eval_policy(
     cfg: Any, env: Any, checkpoint: Any, *, deterministic: bool = True
 ) -> tuple:
@@ -878,8 +899,13 @@ def build_eval_policy(
 
     classes = {"sac": SAC, "ppo": PPO}
     learner_name = cfg.trainer.learner
+    if learner_name in EVAL_POLICY_BUILDERS:
+        return EVAL_POLICY_BUILDERS[learner_name](cfg, env, checkpoint, deterministic)
     if learner_name not in classes:
-        raise ValueError(f"cannot evaluate learner {learner_name!r}; known: {sorted(LEARNERS)}")
+        raise ValueError(
+            f"cannot evaluate learner {learner_name!r}; known: {sorted(LEARNERS)} plus registered "
+            f"{sorted(EVAL_POLICY_BUILDERS)} (register_eval_policy)"
+        )
 
     state_space = env.state_space
     controller_cfg = getattr(cfg, "controller", None)
@@ -892,6 +918,7 @@ def build_eval_policy(
         1,  # one agent
         env.device,
         controller_cfg,
+        num_critics=int(cfg[learner_name].num_critics) if learner_name == "sac" else 2,
     )
     extra = (
         {"model_cfg": cfg.model, "controller_cfg": controller_cfg}

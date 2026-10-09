@@ -13,7 +13,15 @@ from __future__ import annotations
 
 from typing import Any, List
 
-__all__ = ["WRAPPER_ORDER", "prepare_task", "build_env", "describe", "rewrite_orientation_order"]
+__all__ = [
+    "WRAPPER_ORDER",
+    "PROJECT_WRAPPERS",
+    "register_env_wrapper",
+    "prepare_task",
+    "build_env",
+    "describe",
+    "rewrite_orientation_order",
+]
 
 #: The order wrappers are applied in, innermost first. Each edge is deliberate:
 #:
@@ -28,6 +36,25 @@ __all__ = ["WRAPPER_ORDER", "prepare_task", "build_env", "describe", "rewrite_or
 #: 5. ``task_metrics`` reads what the env did and publishes it per agent; it changes no
 #:    behaviour at all, so it goes outermost where it sees the finished step.
 WRAPPER_ORDER = ("controller", "efficient_reset", "fragile", "contact", "task_metrics")
+
+#: Wrappers a project registers with :func:`register_env_wrapper`, applied by
+#: :func:`build_env` **outside** every package wrapper, in registration order. Each is
+#: ``fn(cfg, env, task_name) -> env`` and decides from ``cfg`` whether to wrap at all.
+PROJECT_WRAPPERS: list = []
+
+
+def register_env_wrapper(fn: Any) -> None:
+    """Add a project wrapper to every env the package builds (train, eval, debug).
+
+    Call it in the entry script's ``setup``. Outermost is deliberate: a project wrapper may
+    change what the agent sees and sends (an action re-parameterization, a residual policy),
+    and the learner must be built from exactly that interface.
+    """
+    if not callable(fn):
+        raise TypeError(f"register_env_wrapper needs a callable fn(cfg, env, task_name), got {fn!r}")
+    if fn in PROJECT_WRAPPERS:
+        raise ValueError(f"{getattr(fn, '__qualname__', fn)} is already registered")
+    PROJECT_WRAPPERS.append(fn)
 
 
 def prepare_task(cfg: Any, task_name: str, task_cfg: Any) -> None:
@@ -121,7 +148,8 @@ def _publish_rot6d(quat_channels: List[str]) -> None:
 
 
 def build_env(cfg: Any, env: Any, task_name: str) -> Any:
-    """Apply the wrappers the config enables, innermost first. Unchanged when none are."""
+    """Apply the wrappers the config enables, innermost first, then the project's registered
+    ones (:func:`register_env_wrapper`). Unchanged when none are."""
     controller = getattr(cfg, "controller", None)
     wrappers = getattr(cfg, "wrappers", None)
 
@@ -159,6 +187,8 @@ def build_env(cfg: Any, env: Any, task_name: str) -> Any:
                     f"[envs] task metrics skipped: {task_name} is not a Forge-family task",
                     flush=True,
                 )
+    for fn in PROJECT_WRAPPERS:
+        env = fn(cfg, env, task_name)
     return env
 
 

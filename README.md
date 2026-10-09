@@ -165,6 +165,14 @@ Soft Actor-Critic. `batch_size` and the memory are per agent.
 | `periodic_reset_enabled` | bool | `False` | SimBa periodic reset: rebuild networks and optimizers, keep the replay buffer and the normalizer stats |
 | `periodic_reset_frequency` | int | `0` | env steps between resets; must be > 0 when resets are enabled |
 | `periodic_reset_max` | int | `0` | maximum number of resets (0 = unlimited) |
+| `num_critics` | int | `2` | Q critics in the ensemble (`critic_1 .. critic_N`, each with its own target); 2 is the classic twin, 10 is REDQ / RLPD. Must be >= 2 |
+| `critic_subset` | int | `2` | how many target critics the bootstrap target takes its min over, drawn at random **per agent** each gradient step (REDQ). Equal to `num_critics` = the min over all of them, with no random draw. In `[1, num_critics]` |
+| `actor_q_reduction` | str | `"min"` | how the actor's loss reduces the critics' Q: `min` over all of them (classic SAC) or `mean` (REDQ / RLPD, for a large ensemble) |
+| `policy_delay` | int | `1` | the actor and the temperature step once every this many gradient steps (counted over the whole run). `gradient_steps: G` with `policy_delay: G` gives the critics G updates per env step and the actor 1. At most `gradient_steps` |
+| `policy_learning_starts` | int or null | `null` | env step of the first actor (and temperature) update; null = `learning_starts`. `learning_starts` stays the first critic update, so a gap between them is a critic-only warm-up. Must be >= `learning_starts` |
+| `demo_transitions` | str or null | `null` | a `torch.save`d `{"transitions": {...}, "meta": {...}}` whose tensors are in the agent's own spaces: `observations`, `actions` (the policy's action space; values beyond the squashed actor's [-1, 1] are allowed, since only the critic reads them, as an input), `rewards`, `next_observations`, `terminated`, `truncated`, plus `states` / `next_states` when asymmetric, all `(rows, width)`. Mixed into the **critic's** batches only, inside the window below; loaded with the replay memory, so eval never reads it. Refused when an aux loss needs per-transition keys the demos do not carry |
+| `demo_sampling_start` | int | `0` | first env step of the demo window |
+| `demo_sampling_end` | int | `0` | end (exclusive) of the demo window. Inside it each agent's critic batch holds `min(batch_size // 2, rows stored)` online rows and demo rows for the rest (symmetric sampling, filling with demos while the memory is short); the actor's batch is always online only. A non-empty window needs `demo_transitions`, and `demo_transitions` needs a non-empty window |
 
 ## ppo
 
