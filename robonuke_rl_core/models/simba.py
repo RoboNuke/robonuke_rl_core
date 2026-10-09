@@ -571,7 +571,9 @@ class EnsembleActor(EnsembleModel, GaussianMixin, Model):
 
 
 class EnsembleQCritic(EnsembleModel, DeterministicMixin, Model):
-    """Q(observation, action) over ``num_agents`` agents."""
+    """Q(observation, action) over ``num_agents`` agents; with ``members > 1``, a Q ensemble
+    of that many independent critics per agent, stacked in one :class:`VmapEnsemble` and
+    evaluated in one call: ``compute`` then returns ``(members, num_agents * rows, 1)``."""
 
     def __init__(
         self,
@@ -583,19 +585,21 @@ class EnsembleQCritic(EnsembleModel, DeterministicMixin, Model):
         critic_n: int = 2,
         critic_latent: int = 512,
         clip_actions: bool = False,
+        members: int = 1,
     ) -> None:
         Model.__init__(
             self, observation_space=observation_space, action_space=action_space, device=device
         )
         DeterministicMixin.__init__(self, clip_actions=clip_actions)
         self.num_agents = num_agents
+        self.members = members
 
         def build() -> nn.Module:
             return SimbaQCriticNet(
                 self.num_observations, self.num_actions, critic_latent, critic_n, critic_output_init_mean
             )
 
-        self.net = VmapEnsemble(build, num_agents, device=device)
+        self.net = VmapEnsemble(build, num_agents, device=device, members=members)
 
     def compute(self, inputs, role):
         return self.net.forward_flat(inputs["observations"], inputs["taken_actions"]), {}

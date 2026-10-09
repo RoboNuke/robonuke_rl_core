@@ -296,7 +296,7 @@ def test_loading_one_slot_leaves_every_other_agent_alone(tmp_path, learner_name)
     torch.manual_seed(6)
     learner.update(timestep=10, timesteps=100)
     keys = learner._checkpoint_model_keys()
-    assert "target_critic_1" in keys and "target_critic_2" in keys
+    assert "target_critics" in keys
     before = {a: {k: getattr(learner, k).agent_state_dict(a) for k in keys} for a in (0, 2)}
 
     learner.load_agent(path, slot=1)
@@ -307,7 +307,7 @@ def test_loading_one_slot_leaves_every_other_agent_alone(tmp_path, learner_name)
             for name in after:
                 assert torch.equal(after[name], before[agent][key][name]), (agent, key, name)
     # slot 1 holds the saved agent's lagging targets, not a copy of its critics
-    for key in ("target_critic_1", "target_critic_2"):
+    for key in ("target_critics",):
         saved = getattr(source, key).agent_state_dict(2)
         loaded = getattr(learner, key).agent_state_dict(1)
         for name in saved:

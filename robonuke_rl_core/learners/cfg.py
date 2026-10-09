@@ -49,6 +49,9 @@ class TrainerCfg:
     #: env steps between per-agent checkpoints (0 disables)
     checkpoint_interval: int = 10000
     output_dir: str = "runs"
+    #: publish the learner's memory stats (``stats/ram_mb``, ``stats/gpu_used_mb``,
+    #: ``stats/gpu_torch_reserved_mb``); ``stats/update_time_ms`` is published either way
+    log_memory_stats: bool = True
 
     def validate(self, cfg: Any) -> None:
         if self.learner not in known_learners():
@@ -138,6 +141,11 @@ class SACCfg(_CommonCfg):
     #: a batch, demos fill the rest. The actor always trains on online data only
     demo_sampling_start: int = 0
     demo_sampling_end: int = 0
+    #: capture each kind of gradient step (critic only / with the actor, with or without demo
+    #: rows) as a CUDA graph and replay it as one launch: the update is launch-bound at small
+    #: batch sizes. CUDA only (ignored on CPU); updates with aux losses, and mixed batches
+    #: while the memory holds under half a batch, stay eager
+    cuda_graph: bool = False
 
     ACTOR_Q_REDUCTIONS = ("min", "mean")
 

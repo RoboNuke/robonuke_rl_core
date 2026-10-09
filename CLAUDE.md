@@ -146,12 +146,28 @@ assert from `ppo/kept` that agent 1 was dropped in the copy but not in the contr
 `sac.num_critics` / `critic_subset` / `actor_q_reduction` (a REDQ / RLPD Q ensemble),
 `policy_delay` and `policy_learning_starts` (the actor's schedule) and `demo_transitions`
 with the `demo_sampling_*` window (demo rows in the critic's batches) are all off by default,
-and the default path is **bit-identical** to the twin it replaced (same RNG stream, same
-float expressions: a full-subset min draws nothing). Two independence details: the target's
+and they share one layout: the critics (the twin too) are ONE stacked module, `critics`
+(`VmapEnsemble(members=num_critics)`: parameters `(agents, critics, ...)`, one nested vmap,
+output `(critics, agents * rows, 1)`), and `target_critics`; the leading dimension is still
+the agent, so the keep mask, per-agent clipping and checkpoint slices are unchanged. Stacking
+reorders float work (one batched matmul instead of one per critic), so it matches the old
+per-critic modules only up to rounding, not bit for bit; old `critic_k` checkpoints load
+through `_upgrade_checkpoint_models` (weights only). Two independence details: the target's
 critic subset is drawn per agent (`(num_agents, num_critics)` uniforms), and a mixed batch's
 online/demo split depends only on the step count, never on the data. The demo file is loaded in
 `_create_memory_tensors`, so eval (no memory) never reads it. Tests:
 `tests/learners/test_sac_extensions.py`.
+
+**The update is launch-bound at small batches**, so three things keep it on the GPU in few
+launches: the stacked critics, `torch._foreach_*` in `BlockAdamW`'s unmasked step and the
+Polyak update, and `sac.cuda_graph`, which captures `SAC._gradient_step` per mode
+(`learners/cuda_graph.py: StepGraphs`) and replays it. A graphed step must stay device-only:
+no host sync, no Python value read from a tensor, and **state written in place** (the
+normalizer's stats, the entropy coefficient, the LRs) — a reassigned tensor leaves the graph
+reading the old one. The memory's size reaches it through `sync_size` / `sample_graph_safe`.
+`tests/learners/GPU/test_cuda_graph.py` checks a replay against the eager step. Update metrics
+are emitted once per update (the last gradient step; the actor's last step), not per gradient
+step. Measured on the 10-critic residual config: 311 -> ~76 ms per env step.
 
 ### The optimizer
 
@@ -376,7 +392,7 @@ the episodes that have it.
 | `ppo/kl`, `ppo/clip_fraction`, `ppo/kept` | PPO | `ppo/kept` is the per-agent KL early stop |
 | `grad_norm/*`, `lr/*` | the learner | per optimizer |
 | `stats/update_time_ms` | the learner | wall time of one update, the number to compare against another implementation. Emitted from inside the timed block, so it **lags one update** and the first point is 0 |
-| `stats/ram_mb` | the learner | this process's resident set size, from `/proc/self/statm` — it counts what Kit and PhysX hold too, so it is the number that predicts an OOM kill. + `/min`, `/max` |
+| `stats/ram_mb` | the learner | (with `trainer.log_memory_stats`, as the two below) this process's resident set size, from `/proc/self/statm` — it counts what Kit and PhysX hold too, so it is the number that predicts an OOM kill. + `/min`, `/max` |
 | `stats/gpu_used_mb` | the learner | whole-device memory in use (`mem_get_info`: total - free), so it includes Isaac Sim. CUDA only. + `/min`, `/max` |
 | `stats/gpu_torch_reserved_mb` | the learner | our allocator's share of the above; a growing gap between the two says the leak is not in the learner. CUDA only |
 | `loss/<name>_<target>` | `losses.build_aux_losses` | one per configured aux loss |

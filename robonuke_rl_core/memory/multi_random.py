@@ -87,6 +87,8 @@ class MultiRandomMemory:
         self.size = 0
         # (num_agents, 1) so it broadcasts against a (num_agents, rows) index tensor
         self._agent_index = torch.arange(self.num_agents, device=self.device).unsqueeze(-1)
+        #: ``size`` on the device, for :meth:`sample_graph_safe`; refreshed by :meth:`sync_size`
+        self._size_on_device = torch.zeros((), dtype=torch.float32, device=self.device)
 
     # ------------------------------------------------------------------ properties
     @property
@@ -228,6 +230,22 @@ class MultiRandomMemory:
         indices = torch.randint(
             0, self.size, (self.num_agents, batch_size), device=self.device
         )
+        return [self._gather(names, indices)]
+
+    def sync_size(self) -> None:
+        """Copy ``size`` to the device (an async fill, no host sync) for
+        :meth:`sample_graph_safe`. Call before each replay of a captured sampler."""
+        self._size_on_device.fill_(float(self.size))
+
+    def sample_graph_safe(self, *, names: Sequence[str], batch_size: int) -> List[List[torch.Tensor]]:
+        """:meth:`sample`, with the row bound read from the device (``sync_size``) instead of
+        baked in as a Python number, so a CUDA graph that captured it stays right as the
+        memory fills. Uniform over the written rows, like :meth:`sample`; a different random
+        stream (``floor(u * size)`` rather than ``randint``)."""
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        uniform = torch.rand((self.num_agents, batch_size), device=self.device)
+        indices = (uniform * self._size_on_device).long().clamp_(max=self.capacity - 1)
         return [self._gather(names, indices)]
 
     def sample_all(

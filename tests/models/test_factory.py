@@ -52,7 +52,9 @@ def forward(model, observations: torch.Tensor, actions: torch.Tensor, training: 
     if model.__class__.__name__.endswith("QCritic"):
         inputs["taken_actions"] = actions
         value, _ = model.act(inputs, role="critic")
-        return value
+        # a stacked Q ensemble returns (critics, rows, 1): rows first, so slicing by agent rows
+        # keeps every critic's value
+        return value.transpose(0, 1) if value.dim() == 3 else value
     if model.__class__.__name__.endswith("ValueCritic"):
         value, _ = model.act(inputs, role="value")
         return value

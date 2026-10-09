@@ -585,13 +585,19 @@ class LearnerBase(Agent):
         well as us. ``gpu_torch_reserved_mb`` is our allocator's share of it, so a growing
         gap between the two says the leak is not in the learner.
         """
-        values = {"update_time_ms": self.update_ms, "ram_mb": process_rss_mb()}
+        values = {"update_time_ms": self.update_ms}
+        if not getattr(self.trainer_cfg, "log_memory_stats", True):
+            return self._stats_tensors(values)
+        values["ram_mb"] = process_rss_mb()
         if self.device.type == "cuda":
             free, total = torch.cuda.mem_get_info(self.device)
             values["gpu_used_mb"] = (total - free) / float(1 << 20)
             values["gpu_torch_reserved_mb"] = torch.cuda.memory_reserved(self.device) / float(
                 1 << 20
             )
+        return self._stats_tensors(values)
+
+    def _stats_tensors(self, values: Dict[str, float]) -> Dict[str, torch.Tensor]:
         return {
             f"stats/{name}": torch.full((self.num_agents,), float(value), device=self.device)
             for name, value in values.items()
@@ -623,6 +629,10 @@ class LearnerBase(Agent):
     def _checkpoint_model_keys(self) -> List[str]:
         """Attribute names of block-parallel models to slice per agent."""
         raise NotImplementedError
+
+    def _upgrade_checkpoint_models(self, models: Dict[str, Any], path: Path) -> Dict[str, Any]:
+        """Map an older checkpoint's model layout onto this learner's; identity by default."""
+        return models
 
     def _checkpoint_optimizer_keys(self) -> List[str]:
         """Attribute names of optimizers whose state is sliced per agent."""
@@ -720,6 +730,7 @@ class LearnerBase(Agent):
         if missing:
             raise KeyError(f"{path} is missing required checkpoint keys: {sorted(missing)}")
 
+        ckpt["models"] = self._upgrade_checkpoint_models(ckpt["models"], path)
         model_keys = self._checkpoint_model_keys()
         if set(ckpt["models"]) != set(model_keys):
             raise KeyError(

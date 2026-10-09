@@ -57,9 +57,9 @@ def _build_sac(
     actor,
     num_critics: int = 2,
 ):
-    """Squashed-Gaussian actor + ``num_critics`` Q critics (``critic_1 .. critic_N``) and a
-    target for each (``target_critic_k``). Two is classic SAC's twin; more is a REDQ / RLPD
-    ensemble (``sac.num_critics``)."""
+    """Squashed-Gaussian actor + ``num_critics`` Q critics stacked in one module
+    (``critics``, one vmapped call for all of them) and their targets (``target_critics``).
+    Two is classic SAC's twin; more is a REDQ / RLPD ensemble (``sac.num_critics``)."""
     if num_critics < 2:
         raise ValueError(f"SAC needs at least 2 critics (sac.num_critics), got {num_critics}")
     critic_space = state_space if state_space is not None else obs_space
@@ -70,6 +70,7 @@ def _build_sac(
             action_space=action_space,
             device=device,
             num_agents=num_agents,
+            members=num_critics,
             **_critic_kwargs(model_cfg),
         )
 
@@ -82,12 +83,10 @@ def _build_sac(
             **actor,
         ),
     }
-    # the critics first, then the targets: the build order fixes the RNG stream, and with two
-    # critics this is the order the twin was always built in
-    for k in range(1, num_critics + 1):
-        models[f"critic_{k}"] = make_q()
-    for k in range(1, num_critics + 1):
-        models[f"target_critic_{k}"] = make_q()
+    # the critics first, then the targets: the build order fixes the RNG stream (member-major,
+    # the order separate per-critic modules were built in)
+    models["critics"] = make_q()
+    models["target_critics"] = make_q()
     return models
 
 

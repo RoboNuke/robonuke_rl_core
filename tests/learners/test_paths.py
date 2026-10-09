@@ -50,11 +50,7 @@ def test_periodic_reset_rebuilds_the_networks_and_keeps_the_buffer():
     assert torch.equal(before_stats, learner.observation_normalizer.running_mean)
 
     # the targets start equal to the fresh critics
-    for target, critic in (
-        (learner.target_critic_1, learner.critic_1),
-        (learner.target_critic_2, learner.critic_2),
-    ):
-        assert torch.equal(params_of(target), params_of(critic))
+    assert torch.equal(params_of(learner.target_critics), params_of(learner.critics))
 
     # and it stops at periodic_reset_max
     learner._maybe_periodic_reset(timestep=8)
@@ -173,7 +169,7 @@ def test_asymmetric_critic_consumes_the_state(learner_name):
     torch.manual_seed(4)
     learner.update(timestep=10, timesteps=100)
     # the critic was built on the state space, not the observation space
-    critic = learner.critic_1 if learner_name != "ppo" else learner.value
+    critic = learner.critics if learner_name != "ppo" else learner.value
     assert critic.num_observations == STATE_DIM
     assert learner.policy.num_observations == OBS_DIM
     # both normalizers saw data

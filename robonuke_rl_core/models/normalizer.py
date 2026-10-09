@@ -79,9 +79,10 @@ class BlockRunningNorm(nn.Module):
             + var * count
             + delta**2 * self.current_count.unsqueeze(-1) * count / total
         )
-        self.running_mean = self.running_mean + delta * count / total
-        self.running_variance = m2 / total
-        self.current_count = self.current_count + count
+        # in place: a captured CUDA graph keeps reading these buffers
+        self.running_mean.add_(delta * count / total)
+        self.running_variance.copy_(m2 / total)
+        self.current_count.add_(count)
 
     def __call__(self, x: torch.Tensor, train: bool = False, inverse: bool = False) -> torch.Tensor:
         """Normalize ``x`` (or scale it back when ``inverse``), updating stats when ``train``."""

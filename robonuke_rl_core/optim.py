@@ -102,13 +102,19 @@ class BlockAdamW:
         decay = 1.0 - self.lr * self.weight_decay
 
         for index, param in enumerate(self.params):
-            grad = param.grad
-            if grad is None:
+            if param.grad is None:
                 raise ValueError(
                     f"BlockAdamW parameter #{index} with shape {tuple(param.shape)} has no "
                     "gradient. Every parameter must take part in the loss; call backward "
                     "before step."
                 )
+        if mask is None:
+            self._step_foreach(decay, step_size, bias_correction2_sqrt)
+            self.t += advance
+            return
+
+        for index, param in enumerate(self.params):
+            grad = param.grad
             view = (-1,) + (1,) * (param.dim() - 1)  # broadcast the per-agent scalars
             dtype = param.dtype
             exp_avg = self.exp_avg[index]
@@ -134,6 +140,24 @@ class BlockAdamW:
                 exp_avg_sq.copy_(torch.where(keep_view, new_exp_avg_sq, exp_avg_sq))
 
         self.t += advance
+
+    def _step_foreach(self, decay, step_size, bias_correction2_sqrt) -> None:
+        """The unmasked step over every parameter at once (``torch._foreach_*``: one launch
+        per op instead of one per tensor), op for op the per-tensor path above, in place."""
+        params = self.params
+        grads = [p.grad for p in params]
+        views = [(-1,) + (1,) * (p.dim() - 1) for p in params]
+        per = lambda scalars: [scalars.to(p.dtype).view(v) for p, v in zip(params, views)]
+        torch._foreach_mul_(params, per(decay))
+        torch._foreach_lerp_(self.exp_avg, grads, 1.0 - self.beta1)
+        torch._foreach_mul_(self.exp_avg_sq, self.beta2)
+        torch._foreach_addcmul_(self.exp_avg_sq, grads, grads, value=1.0 - self.beta2)
+        denom = torch._foreach_sqrt(self.exp_avg_sq)
+        torch._foreach_div_(denom, per(bias_correction2_sqrt))
+        torch._foreach_add_(denom, self.eps)
+        update = torch._foreach_mul(self.exp_avg, per(step_size))
+        torch._foreach_div_(update, denom)
+        torch._foreach_sub_(params, update)
 
     def set_lr(self, lr) -> None:
         """Set the learning rate: one value for every agent, or one per agent."""

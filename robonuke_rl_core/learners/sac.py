@@ -9,13 +9,17 @@ Beyond classic SAC, all off by default:
 
 * **A Q ensemble** (``num_critics`` > 2): the bootstrap target is the min over a random
   ``critic_subset`` of the target critics, drawn per agent (REDQ, Chen et al. 2021); the actor
-  reduces the critics' Q by ``actor_q_reduction``.
+  reduces the critics' Q by ``actor_q_reduction``. The critics (twin included) are ONE module,
+  ``critics``, stacked on a member axis inside each agent and evaluated in one vmapped call;
+  ``target_critics`` likewise.
 * **A delayed actor** (``policy_delay``): the actor and temperature step once every so many
   gradient steps, so ``gradient_steps`` raises the critic's update-to-data ratio alone.
 * **A critic-only start** (``policy_learning_starts``).
 * **Demo transitions in the critic's batches** (``demo_transitions`` with the
   ``demo_sampling_*`` window): half demo, half online, RLPD's symmetric sampling — for the
   critic only; the actor's batch is always online.
+* **CUDA graphs** (``cuda_graph``): each kind of gradient step is captured once and replayed
+  as one launch (:class:`~robonuke_rl_core.learners.cuda_graph.StepGraphs`).
 
 Every tensor op either keeps the rows separate (the block networks reduce within a block) or
 reduces with a constant factor, so agent ``i``'s update never depends on agent ``j``'s data.
@@ -23,7 +27,6 @@ reduces with a constant factor, so agent ``i``'s update never depends on agent `
 
 from __future__ import annotations
 
-import itertools
 from typing import Any, Dict, List, Optional
 
 import gymnasium
@@ -36,6 +39,7 @@ from ..models.factory import build_models
 from ..models.normalizer import BlockRunningNorm
 from ..losses.losses import LossContext
 from .base import LearnerBase
+from .cuda_graph import StepGraphs
 
 __all__ = ["SAC"]
 
@@ -50,21 +54,21 @@ class SAC(LearnerBase):
         self._controller_cfg = controller_cfg
 
         self._num_critics = int(self.cfg.num_critics)
-        required = ("policy", *self._critic_keys(), *self._target_keys())
+        required = ("policy", "critics", "target_critics")
         missing = [k for k in required if self.models.get(k) is None]
         if missing:
-            raise ValueError(
-                f"SAC requires models {required} (sac.num_critics={self._num_critics}); missing "
-                f"or None: {missing}"
-            )
-        extra = sorted(set(k for k in self.models if k.startswith(("critic_", "target_critic_"))) - set(required))
-        if extra:
-            raise ValueError(
-                f"SAC got critics {extra} beyond sac.num_critics={self._num_critics}; build the "
-                "models with the same num_critics"
-            )
+            raise ValueError(f"SAC requires models {required}; missing or None: {missing}")
         self.policy = self.models["policy"]
         self._bind_critics()
+        for key in ("critics", "target_critics"):
+            members = getattr(self.models[key], "members", None)
+            if members != self._num_critics:
+                raise ValueError(
+                    f"SAC's '{key}' stacks {members} critics but sac.num_critics is "
+                    f"{self._num_critics}; build the models with the same num_critics"
+                )
+        cuda = torch.device(self.device).type == "cuda"
+        self._graphs = StepGraphs() if (self.cfg.cuda_graph and cuda) else None
 
         self._asymmetric = self.state_space is not None
         self._n_periodic_resets = 0
@@ -105,24 +109,22 @@ class SAC(LearnerBase):
         self._demo: Optional[Dict[str, torch.Tensor]] = None
 
     # ------------------------------------------------------------------ setup helpers
-    def _critic_keys(self) -> List[str]:
-        return [f"critic_{k}" for k in range(1, self._num_critics + 1)]
-
-    def _target_keys(self) -> List[str]:
-        return [f"target_critic_{k}" for k in range(1, self._num_critics + 1)]
-
     def _bind_critics(self) -> None:
-        """``critic_k`` / ``target_critic_k`` attributes and the ``critics`` / ``target_critics``
-        lists, from ``self.models``."""
-        for key in (*self._critic_keys(), *self._target_keys()):
-            setattr(self, key, self.models[key])
-        self.critics = [self.models[k] for k in self._critic_keys()]
-        self.target_critics = [self.models[k] for k in self._target_keys()]
+        self.critics = self.models["critics"]
+        self.target_critics = self.models["target_critics"]
 
     def _sync_targets(self) -> None:
-        for target, critic in zip(self.target_critics, self.critics):
-            target.freeze_parameters(True)
-            target.update_parameters(critic, polyak=1)
+        self.target_critics.freeze_parameters(True)
+        self.target_critics.update_parameters(self.critics, polyak=1)
+
+    def _polyak(self) -> None:
+        """``target <- target + polyak * (critic - target)`` over every tensor in one launch."""
+        with torch.no_grad():
+            torch._foreach_lerp_(
+                list(self.target_critics.parameters()),
+                list(self.critics.parameters()),
+                float(self.cfg.polyak),
+            )
 
     def _policy_learning_starts(self) -> int:
         if self.cfg.policy_learning_starts is None:
@@ -202,12 +204,11 @@ class SAC(LearnerBase):
             self.cfg.demo_sampling_start <= timestep < self.cfg.demo_sampling_end
         )
 
-    def _sample(self, rows: int) -> Dict[str, torch.Tensor]:
-        return dict(
-            zip(self._tensors_names, self.memory.sample(names=self._tensors_names, batch_size=rows)[0])
-        )
+    def _sample(self, rows: int, graph: bool = False) -> Dict[str, torch.Tensor]:
+        sample = self.memory.sample_graph_safe if graph else self.memory.sample
+        return dict(zip(self._tensors_names, sample(names=self._tensors_names, batch_size=rows)[0]))
 
-    def _mixed_batch(self, rows: int) -> Dict[str, torch.Tensor]:
+    def _mixed_batch(self, rows: int, graph: bool = False) -> Dict[str, torch.Tensor]:
         """The critic's batch inside the demo window: per agent, ``min(rows // 2, stored)``
         online rows, the rest demo rows. Draw shapes depend only on the step count, never on
         the data, and each agent draws its own demo rows, so agents stay independent."""
@@ -216,7 +217,7 @@ class SAC(LearnerBase):
         names = self._demo_names()
         demo_rows = next(iter(self._demo.values())).shape[0]
         index = torch.randint(0, demo_rows, (self.num_agents, n_demo), device=self.device)
-        online = self._sample(n_online) if n_online else None
+        online = self._sample(n_online, graph) if n_online else None
         batch = {}
         for name in names:
             demo = self._demo[name][index]  # (num_agents, n_demo, width)
@@ -246,12 +247,14 @@ class SAC(LearnerBase):
             weight_decay=self.cfg.weight_decay,
         )
         self.critic_optimizer = BlockAdamW(
-            itertools.chain(*(critic.parameters() for critic in self.critics)),
+            self.critics.parameters(),
             self.num_agents,
             lr=self.cfg.critic_lr,
             weight_decay=self.cfg.weight_decay,
         )
         self._updates = 0
+        if getattr(self, "_graphs", None) is not None:
+            self._graphs.clear()  # captured against the replaced optimizers
 
     def _set_learning_rates(self, timesteps: int) -> None:
         """The LR for this gradient step, from the update count alone (never from the data)."""
@@ -371,14 +374,13 @@ class SAC(LearnerBase):
         self._maybe_periodic_reset(timestep)
 
     # ------------------------------------------------------------------ losses
-    def _target_min(self, target_qs: List[torch.Tensor], rows: int) -> torch.Tensor:
-        """Min over the target critics: all of them, or a random ``critic_subset`` per agent."""
+    def _target_min(self, target_qs: torch.Tensor, rows: int) -> torch.Tensor:
+        """Min over the target critics ``(critics, agents * rows, 1)``: all of them, or a random
+        ``critic_subset`` per agent."""
         subset = int(self.cfg.critic_subset)
         if subset == self._num_critics:
-            # the classic path draws nothing, so its RNG stream is the twin's
-            return torch.stack(target_qs).min(dim=0).values if self._num_critics > 2 else torch.min(*target_qs)
-        stacked = torch.stack(target_qs).view(self._num_critics, self.num_agents, rows, -1)
-        per_agent = stacked.permute(1, 0, 2, 3)  # (agents, critics, rows, 1)
+            return target_qs.min(dim=0).values  # draws nothing
+        per_agent = target_qs.view(self._num_critics, self.num_agents, rows, -1).permute(1, 0, 2, 3)
         chosen = torch.argsort(torch.rand(self.num_agents, self._num_critics, device=self.device), dim=1)[:, :subset]
         index = chosen[:, :, None, None].expand(-1, -1, rows, per_agent.shape[-1])
         return per_agent.gather(1, index).min(dim=1).values.reshape(self.num_agents * rows, -1)
@@ -387,10 +389,9 @@ class SAC(LearnerBase):
         """Min-over-targets bootstrapped target + mean MSE over the critics."""
         with torch.no_grad():
             next_actions, outputs = self.policy.act(next_inputs, role="policy")
-            target_qs = [
-                target.act({**critic_next_inputs, "taken_actions": next_actions}, role=key)[0]
-                for target, key in zip(self.target_critics, self._target_keys())
-            ]
+            target_qs, _ = self.target_critics.act(
+                {**critic_next_inputs, "taken_actions": next_actions}, role="target_critics"
+            )
             entropy = self.expand_per_agent(self._entropy_coefficient, rows)
             target_q = self._target_min(target_qs, rows) - entropy * outputs["log_prob"]
             # Bootstrap unless the next state is genuinely terminal. A time limit is not the
@@ -405,12 +406,11 @@ class SAC(LearnerBase):
                 + self.cfg.discount_factor * terminal.logical_not() * target_q
             )
 
-        values = [
-            critic.act({**critic_inputs, "taken_actions": sampled["actions"]}, role=key)[0]
-            for critic, key in zip(self.critics, self._critic_keys())
-        ]
-        critic_loss = sum(F.mse_loss(v, target_values) for v in values) / self._num_critics
-        self._critic_values = values
+        values, _ = self.critics.act(
+            {**critic_inputs, "taken_actions": sampled["actions"]}, role="critics"
+        )
+        # the mean over critics of each critic's MSE (they share the target)
+        critic_loss = (values - target_values.unsqueeze(0)).pow(2).mean(dim=(1, 2)).mean()
         return critic_loss, values[0], values[1], target_values
 
     def _compute_actor_loss(self, *, sampled, inputs, critic_inputs, rows):
@@ -418,16 +418,8 @@ class SAC(LearnerBase):
         critics."""
         actions, outputs = self.policy.act(inputs, role="policy")
         log_prob = outputs["log_prob"]
-        q_pi = [
-            critic.act({**critic_inputs, "taken_actions": actions}, role=key)[0]
-            for critic, key in zip(self.critics, self._critic_keys())
-        ]
-        if self.cfg.actor_q_reduction == "mean":
-            q = torch.stack(q_pi).mean(dim=0)
-        elif self._num_critics == 2:
-            q = torch.min(*q_pi)  # the twin's exact expression
-        else:
-            q = torch.stack(q_pi).min(dim=0).values
+        q_pi, _ = self.critics.act({**critic_inputs, "taken_actions": actions}, role="critics")
+        q = q_pi.mean(dim=0) if self.cfg.actor_q_reduction == "mean" else q_pi.min(dim=0).values
         entropy = self.expand_per_agent(self._entropy_coefficient, rows)
         policy_loss = (entropy * log_prob - q).mean()
         return policy_loss, actions, log_prob, q, outputs
@@ -441,72 +433,101 @@ class SAC(LearnerBase):
         rows = self.cfg.batch_size  # per agent; the memory returns N * batch_size rows
         policy_on = timestep >= self._policy_learning_starts()
         demo_on = self._demo_active(timestep)
+        # a graph replays fixed shapes: a mixed batch's online share is fixed only once the
+        # memory holds half a batch, and aux losses build per-step contexts: those run eagerly
+        graph = (
+            self._graphs is not None
+            and not self.aux_loss
+            and (not demo_on or int(self.memory.size) >= rows // 2)
+        )
+        if graph:
+            self.memory.sync_size()
 
+        last_critic, last_actor = {}, {}
         for gradient_step in range(self.cfg.gradient_steps):
             self._set_learning_rates(timesteps)
-            # outside the demo window one online batch serves both losses, as in classic SAC;
-            # inside it the critic's batch is mixed and the actor's stays online
-            online = self._sample(rows) if (policy_on or not demo_on) else None
-            sampled = self._mixed_batch(rows) if demo_on else online
-            inputs, next_inputs, critic_inputs, critic_next_inputs = self._batch_inputs(sampled)
-
-            critic_loss, critic_1_values, critic_2_values, target_values = self._compute_critic_loss(
-                sampled=sampled,
-                inputs=inputs,
-                next_inputs=next_inputs,
-                critic_inputs=critic_inputs,
-                critic_next_inputs=critic_next_inputs,
-                rows=rows,
-            )
-            aux = self.compute_aux_loss(
-                LossContext(
-                    learner=self,
-                    step=timestep,
-                    target="critic",
-                    sampled=sampled,
-                    critic_inputs=critic_inputs,
-                    critic_1_values=critic_1_values,
-                    critic_2_values=critic_2_values,
-                    target_values=target_values,
-                )
-            )
-            if aux is not None:
-                critic_loss = critic_loss + aux
-
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            critic_grad_norms = clip_grad_norm_per_agent(
-                self.critics, self.num_agents, self.cfg.grad_norm_clip
-            )
-            self.critic_optimizer.step()
-
             # the actor (and temperature) step on every policy_delay-th gradient step
             actor_step = policy_on and (self._updates + 1) % self.cfg.policy_delay == 0
-            actor_metrics = {}
-            if actor_step:
-                if online is not sampled:
-                    # a second batch this step: it must not count twice in the normalizer
-                    inputs, _, critic_inputs, _ = self._batch_inputs(online, train=False)
-                actor_metrics = self._actor_step(
-                    timestep=timestep, sampled=online, inputs=inputs, critic_inputs=critic_inputs, rows=rows
-                )
-
-            for target, critic in zip(self.target_critics, self.critics):
-                target.update_parameters(critic, polyak=self.cfg.polyak)
-
+            mode = (demo_on, policy_on, actor_step)
+            if graph:
+                out = self._graphs.run(mode, lambda: self._gradient_step(mode, rows, timestep, graph=True))
+            else:
+                out = self._gradient_step(mode, rows, timestep, graph=False)
             self._updates += 1
+            last_critic = out["critic"]
+            if actor_step:
+                last_actor = out["actor"]
 
-            if self.on_log:
-                self._emit_update_metrics(
-                    timestep=timestep,
-                    rows=rows,
-                    critic_1_values=critic_1_values,
-                    critic_2_values=critic_2_values,
-                    target_values=target_values,
-                    critic_grad_norms=critic_grad_norms,
-                    demo_rows=(rows - min(rows // 2, int(self.memory.size))) if demo_on else 0,
-                    **actor_metrics,
-                )
+        if self.on_log:
+            # once per update, from its last gradient step (the actor's from its last step in
+            # this update), not after every gradient step: emitting costs kernel launches and
+            # a memory query, and consecutive gradient steps' values are alike
+            self._emit_update_metrics(
+                timestep=timestep,
+                rows=rows,
+                demo_rows=(rows - min(rows // 2, int(self.memory.size))) if demo_on else 0,
+                **last_critic,
+                **last_actor,
+            )
+
+    def _gradient_step(self, mode, rows: int, timestep: int, graph: bool) -> Dict[str, Dict[str, torch.Tensor]]:
+        """One critic step, the actor and temperature step when ``mode`` says so, the targets'
+        Polyak step. Device work only (no host sync, every state written in place), so it can
+        be captured as a CUDA graph. Returns the tensors the metrics are built from."""
+        demo_on, policy_on, actor_step = mode
+        # outside the demo window one online batch serves both losses, as in classic SAC;
+        # inside it the critic's batch is mixed and the actor's stays online
+        online = self._sample(rows, graph) if (policy_on or not demo_on) else None
+        sampled = self._mixed_batch(rows, graph) if demo_on else online
+        inputs, next_inputs, critic_inputs, critic_next_inputs = self._batch_inputs(sampled)
+
+        critic_loss, critic_1_values, critic_2_values, target_values = self._compute_critic_loss(
+            sampled=sampled,
+            inputs=inputs,
+            next_inputs=next_inputs,
+            critic_inputs=critic_inputs,
+            critic_next_inputs=critic_next_inputs,
+            rows=rows,
+        )
+        aux = self.compute_aux_loss(
+            LossContext(
+                learner=self,
+                step=timestep,
+                target="critic",
+                sampled=sampled,
+                critic_inputs=critic_inputs,
+                critic_1_values=critic_1_values,
+                critic_2_values=critic_2_values,
+                target_values=target_values,
+            )
+        )
+        if aux is not None:
+            critic_loss = critic_loss + aux
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        critic_grad_norms = clip_grad_norm_per_agent(
+            self.critics, self.num_agents, self.cfg.grad_norm_clip
+        )
+        self.critic_optimizer.step()
+
+        actor = {}
+        if actor_step:
+            if online is not sampled:
+                # a second batch this step: it must not count twice in the normalizer
+                inputs, _, critic_inputs, _ = self._batch_inputs(online, train=False)
+            actor = self._actor_step(
+                timestep=timestep, sampled=online, inputs=inputs, critic_inputs=critic_inputs, rows=rows
+            )
+
+        self._polyak()
+        critic = dict(
+            critic_1_values=critic_1_values.detach(),
+            critic_2_values=critic_2_values.detach(),
+            target_values=target_values,
+            critic_grad_norms=critic_grad_norms,
+        )
+        return {"critic": critic, "actor": actor}
 
     def _batch_inputs(self, sampled, train: bool = True):
         """The (normalized) actor and critic inputs of a sampled batch; ``train`` updates the
@@ -550,23 +571,22 @@ class SAC(LearnerBase):
         )
         self.policy_optimizer.step()
 
-        if self.cfg.learn_entropy:
-            self._update_entropy(log_prob, rows)
-        if not self.on_log:
-            return {}
+        entropy_loss = self._update_entropy(log_prob, rows) if self.cfg.learn_entropy else None
         with torch.no_grad():
             per_agent_loss = self.per_agent_mean(
                 self.expand_per_agent(self._entropy_coefficient, rows) * log_prob - q_pi, rows
             )
         return {
             "policy_grad_norms": policy_grad_norms,
-            "log_prob": log_prob,
+            "log_prob": log_prob.detach(),
             "policy_loss": per_agent_loss,
-            "policy_outputs": outputs,
+            "log_std": outputs["log_std"].detach() if "log_std" in outputs else None,
+            "entropy_loss": entropy_loss,
         }
 
-    def _update_entropy(self, log_prob: torch.Tensor, rows: int) -> None:
-        """Per-agent temperature step: each agent's loss term holds only its own rows."""
+    def _update_entropy(self, log_prob: torch.Tensor, rows: int) -> torch.Tensor:
+        """Per-agent temperature step: each agent's loss term holds only its own rows. Returns
+        the temperature's loss per agent."""
         log_prob_per_agent = log_prob.view(self.num_agents, rows, 1).mean(dim=1)  # (N, 1)
         if self.cfg.entropy_loss_form == "alpha":
             # the multiplicative form: alpha * (H_hat - H_target); the adaptation rate is ~alpha
@@ -581,8 +601,10 @@ class SAC(LearnerBase):
         self.entropy_optimizer.zero_grad()
         entropy_loss.sum().backward()  # a sum of per-agent terms: no cross-agent gradient
         self.entropy_optimizer.step()
-        self._entropy_coefficient = torch.exp(self.log_entropy_coefficient.detach())
-        self._entropy_loss = entropy_loss.detach().reshape(-1)
+        with torch.no_grad():
+            # in place: a captured graph keeps reading this tensor
+            self._entropy_coefficient.copy_(torch.exp(self.log_entropy_coefficient))
+        return entropy_loss.detach().reshape(-1)
 
     def _emit_update_metrics(
         self,
@@ -597,9 +619,10 @@ class SAC(LearnerBase):
         policy_grad_norms=None,
         log_prob=None,
         policy_loss=None,
-        policy_outputs=None,
+        log_std=None,
+        entropy_loss=None,
     ) -> None:
-        """Critic metrics every gradient step; the actor's only on a step that updated it."""
+        """One point per update: the critic's last gradient step, the actor's last step."""
         with torch.no_grad():
             metrics = {
                 "loss/critic": 0.5
@@ -635,13 +658,11 @@ class SAC(LearnerBase):
             if policy_loss is not None:
                 # the actor's own objective: alpha * log_pi - min(Q1, Q2), per agent
                 metrics["loss/policy"] = policy_loss
-            if getattr(self, "_entropy_loss", None) is not None:
+            if entropy_loss is not None:
                 # the temperature's loss, i.e. how hard alpha is being pushed
-                metrics["loss/entropy"] = self._entropy_loss
-            if policy_outputs is not None and "log_std" in policy_outputs:
-                metrics["policy/std"] = (
-                    policy_outputs["log_std"].exp().view(self.num_agents, rows, -1).mean(dim=(1, 2))
-                )
+                metrics["loss/entropy"] = entropy_loss
+            if log_std is not None:
+                metrics["policy/std"] = log_std.exp().view(self.num_agents, rows, -1).mean(dim=(1, 2))
             metrics.update(self.stats_metrics())
             self.emit_per_agent(metrics, timestep)
 
@@ -678,7 +699,7 @@ class SAC(LearnerBase):
             self._controller_cfg,
             num_critics=self._num_critics,
         )
-        for key in ("policy", *self._critic_keys(), *self._target_keys()):
+        for key in ("policy", "critics", "target_critics"):
             self.models[key] = fresh[key]
         self.policy = self.models["policy"]
         self._bind_critics()
@@ -703,7 +724,35 @@ class SAC(LearnerBase):
     def _checkpoint_model_keys(self) -> List[str]:
         # the target critics are saved too: resuming must keep their EMA lag, and loading one
         # slot must not touch any other agent's targets
-        return ["policy", *self._critic_keys(), *self._target_keys()]
+        return ["policy", "critics", "target_critics"]
+
+    def _upgrade_checkpoint_models(self, models: Dict[str, Any], path) -> Dict[str, Any]:
+        """Checkpoints written before the critics were stacked hold ``critic_1 .. critic_N``
+        and ``target_critic_1 .. N`` as separate plain state dicts: stack them member-wise."""
+        if "critics" in models:
+            for key in ("critics", "target_critics"):
+                stacked = next(iter(models.get(key, {}).values()), None)
+                if stacked is not None and stacked.shape[0] != self._num_critics:
+                    raise ValueError(
+                        f"{path} stacks {stacked.shape[0]} critics in '{key}', but "
+                        f"sac.num_critics is {self._num_critics}"
+                    )
+            return models
+        if "critic_1" not in models:
+            return models
+        upgraded = {k: v for k, v in models.items() if not k.startswith(("critic_", "target_critic_"))}
+        for prefix, key in (("critic_", "critics"), ("target_critic_", "target_critics")):
+            found = sorted(
+                (int(k[len(prefix):]), v) for k, v in models.items()
+                if k.startswith(prefix) and k[len(prefix):].isdigit()
+            )
+            if [i for i, _ in found] != list(range(1, self._num_critics + 1)):
+                raise KeyError(
+                    f"{path} holds {[f'{prefix}{i}' for i, _ in found]}, but sac.num_critics is "
+                    f"{self._num_critics}"
+                )
+            upgraded[key] = {name: torch.stack([v[name] for _, v in found]) for name in found[0][1]}
+        return upgraded
 
     def _checkpoint_optimizer_keys(self) -> List[str]:
         return ["policy_optimizer", "critic_optimizer"]

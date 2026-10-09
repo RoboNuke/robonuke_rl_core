@@ -16,6 +16,14 @@ Rules for the module being stacked:
   wrappers in ``simba.py`` do).
 * Any vmap "falling back to a for-loop" warning is a failure, not a nuisance: it means an op
   in the module is not batchable. :meth:`VmapEnsemble.forward` turns it into an error.
+
+``members > 1`` adds a second stacked axis **inside** each agent: ``members`` independent
+copies per agent (a Q ensemble), parameters ``(num_agents, members, ...)``, all called in one
+nested vmap on the same inputs, output ``(num_agents, members, rows, ...)``. The leading
+dimension is still the agent, so the per-agent rules (BlockAdamW's keep mask, per-agent
+clipping, per-agent checkpoint slices) hold unchanged: freezing an agent freezes all of its
+members. Copies are built member-major (member 0 for every agent, then member 1, ...), the
+order separate per-member ensembles were built in.
 """
 
 from __future__ import annotations
@@ -35,10 +43,14 @@ __all__ = ["VmapEnsemble"]
 class VmapEnsemble(nn.Module):
     """``num_agents`` copies of ``build_fn()``, batched with vmap."""
 
-    def __init__(self, build_fn: Callable[[], nn.Module], num_agents: int, device=None) -> None:
+    def __init__(
+        self, build_fn: Callable[[], nn.Module], num_agents: int, device=None, members: int = 1
+    ) -> None:
         super().__init__()
         if num_agents < 1:
             raise ValueError(f"num_agents must be >= 1, got {num_agents}")
+        if members < 1:
+            raise ValueError(f"members must be >= 1, got {members}")
         # Sequential RNG: every agent gets its own init, as the block models did. The build
         # runs under the target device, so every parameter is ALLOCATED there rather than
         # created on the CPU and copied — which also means a module's own init math (an
@@ -47,7 +59,7 @@ class VmapEnsemble(nn.Module):
         # device.
         context = torch.device(device) if device is not None else contextlib.nullcontext()
         with context:
-            models = [build_fn() for _ in range(num_agents)]
+            models = [build_fn() for _ in range(num_agents * members)]  # member-major
         if device is not None:
             models = [model.to(device) for model in models]
         for model in models[1:]:
@@ -55,6 +67,15 @@ class VmapEnsemble(nn.Module):
                 raise TypeError("build_fn must return the same module type every call")
 
         params, buffers = stack_module_state(models)
+        if members > 1:
+            # (members * agents, ...) member-major -> (agents, members, ...)
+            def regroup(tensor):
+                shaped = tensor.reshape(members, num_agents, *tensor.shape[1:])
+                return shaped.transpose(0, 1).contiguous()
+
+            params = {name: regroup(t) for name, t in params.items()}
+            buffers = {name: regroup(t) for name, t in buffers.items()}
+        self.members = members
         self.num_agents = num_agents
         self._param_names: List[str] = list(params)
         self._buffer_names: List[str] = list(buffers)
@@ -91,19 +112,31 @@ class VmapEnsemble(nn.Module):
         def single(p, b, *args):
             return functional_call(meta, (p, b), args)
 
+        call = single
+        if self.members > 1:
+            # every member of an agent sees that agent's inputs: (members, rows, ...) out
+            call = torch.vmap(single, in_dims=(0, 0) + (None,) * len(inputs))
         with warnings.catch_warnings():
             # a for-loop fallback would silently serialize the agents
             warnings.filterwarnings("error", message=".*falling back.*")
-            return torch.vmap(single)(params, buffers, *inputs)
+            return torch.vmap(call)(params, buffers, *inputs)
 
     def forward_flat(self, *inputs: torch.Tensor) -> Any:
-        """Same, for flat ``(num_agents * rows, ...)`` tensors in and out."""
+        """Same, for flat ``(num_agents * rows, ...)`` tensors in and out. With ``members >
+        1`` the output is ``(members, num_agents * rows, ...)``: one flat batch per member."""
         rows = self._rows(inputs[0])
         shaped = [self.split(tensor, rows) for tensor in inputs]
         out = self.forward(*shaped)
+        flatten = self.flatten if self.members == 1 else self._flatten_members
         if torch.is_tensor(out):
-            return self.flatten(out)
-        return type(out)(self.flatten(tensor) for tensor in out)
+            return flatten(out)
+        return type(out)(flatten(tensor) for tensor in out)
+
+    @staticmethod
+    def _flatten_members(batched: torch.Tensor) -> torch.Tensor:
+        """``(num_agents, members, rows, ...) -> (members, num_agents * rows, ...)``."""
+        agents, members, rows = batched.shape[:3]
+        return batched.transpose(0, 1).reshape(members, agents * rows, *batched.shape[3:])
 
     def _rows(self, flat: torch.Tensor) -> int:
         if flat.shape[0] % self.num_agents != 0:
@@ -162,6 +195,6 @@ class VmapEnsemble(nn.Module):
 
     def __repr__(self) -> str:
         return (
-            f"VmapEnsemble(num_agents={self.num_agents}, module={type(self._meta).__name__}, "
-            f"params={len(self._param_names)})"
+            f"VmapEnsemble(num_agents={self.num_agents}, members={self.members}, "
+            f"module={type(self._meta).__name__}, params={len(self._param_names)})"
         )

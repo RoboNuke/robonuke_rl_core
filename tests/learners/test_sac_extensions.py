@@ -80,12 +80,15 @@ def test_the_defaults_and_a_full_setup_pass():
 
 
 # ---------------------------------------------------------------------- the ensemble
-def test_the_ensemble_builds_one_target_per_critic_and_checkpoints_them_all(tmp_path):
+def test_the_ensemble_is_one_stacked_module_with_a_target_and_checkpoints_whole(tmp_path):
     learner = build_learner("sac", num_agents=2, num_critics=4, critic_subset=2)
     keys = learner._checkpoint_model_keys()
-    assert keys == ["policy"] + [f"critic_{k}" for k in range(1, 5)] + [f"target_critic_{k}" for k in range(1, 5)]
-    for critic, target in zip(learner.critics, learner.target_critics):
-        assert_same(critic.agent_state_dict(0), target.agent_state_dict(0))
+    assert keys == ["policy", "critics", "target_critics"]
+    assert learner.critics.members == 4 and learner.target_critics.members == 4
+    # every parameter is (agents, critics, ...): the agent stays the leading dimension
+    for param in learner.critics.parameters():
+        assert param.shape[:2] == (2, 4)
+    assert_same(learner.critics.agent_state_dict(0), learner.target_critics.agent_state_dict(0))
 
     fill_memory(learner)
     learner.update(timestep=10, timesteps=100)
@@ -97,25 +100,25 @@ def test_the_ensemble_builds_one_target_per_critic_and_checkpoints_them_all(tmp_
         assert_same(getattr(fresh, key).agent_state_dict(0), getattr(learner, key).agent_state_dict(1), key)
 
     twin = build_learner("sac", num_agents=2)
-    with pytest.raises(KeyError, match="critic_3"):
+    with pytest.raises(ValueError, match="num_critics"):
         twin.load_agent(path, slot=0)
 
 
 def test_a_full_subset_takes_the_min_over_all_critics_and_draws_nothing():
     learner = build_learner("sac", num_agents=2, num_critics=3, critic_subset=3)
-    qs = [torch.randn(2 * 5, 1) for _ in range(3)]
+    qs = torch.randn(3, 2 * 5, 1)
     state = torch.random.get_rng_state()
     out = learner._target_min(qs, rows=5)
     assert torch.equal(torch.random.get_rng_state(), state)
-    assert torch.equal(out, torch.stack(qs).min(dim=0).values)
+    assert torch.equal(out, qs.min(dim=0).values)
 
 
 def test_a_subset_min_comes_from_one_subset_per_agent():
     learner = build_learner("sac", num_agents=3, num_critics=5, critic_subset=2)
     rows = 7
-    qs = [torch.randn(3 * rows, 1) for _ in range(5)]
+    qs = torch.randn(5, 3 * rows, 1)
     out = learner._target_min(qs, rows=rows).view(3, rows)
-    stacked = torch.stack(qs).view(5, 3, rows)
+    stacked = qs.view(5, 3, rows)
     for agent in range(3):
         pair_mins = [
             torch.minimum(stacked[i, agent], stacked[j, agent])
@@ -130,10 +133,8 @@ def test_a_subset_min_comes_from_one_subset_per_agent():
 def test_the_mean_reduction_feeds_the_actor_the_ensemble_mean(monkeypatch):
     learner = build_learner("sac", num_agents=1, num_critics=3, critic_subset=2, actor_q_reduction="mean")
     fill_memory(learner)
-    values = [torch.full((4, 1), v) for v in (1.0, 2.0, 6.0)]
-    calls = iter(values)
-    for critic in learner.critics:
-        monkeypatch.setattr(critic, "act", lambda inputs, role="": (next(calls), {}))
+    values = torch.stack([torch.full((4, 1), v) for v in (1.0, 2.0, 6.0)])
+    monkeypatch.setattr(learner.critics, "act", lambda inputs, role="": (values, {}))
     inputs = {"observations": torch.randn(4, OBS_DIM)}
     _, _, _, q, _ = learner._compute_actor_loss(sampled=None, inputs=inputs, critic_inputs=inputs, rows=4)
     assert torch.equal(q, torch.full((4, 1), 3.0))
@@ -158,11 +159,11 @@ def test_policy_delay_steps_the_actor_once_per_delay_and_the_critics_every_step(
 def test_before_policy_learning_starts_only_the_critics_learn():
     learner = build_learner("sac", num_agents=1, learning_starts=0, policy_learning_starts=20)
     fill_memory(learner)
-    policy, critic = weights(learner.policy), weights(learner.critic_1)
+    policy, critic = weights(learner.policy), weights(learner.critics)
     alpha = learner._entropy_coefficient.clone()
     learner._update_if_ready(timestep=5, timesteps=100)
     assert not changed(policy, learner.policy)
-    assert changed(critic, learner.critic_1)
+    assert changed(critic, learner.critics)
     assert torch.equal(alpha, learner._entropy_coefficient)
 
     learner._update_if_ready(timestep=20, timesteps=100)
@@ -327,8 +328,67 @@ def test_a_periodic_reset_rebuilds_the_whole_ensemble():
         "sac", num_agents=1, num_critics=3, critic_subset=2,
         periodic_reset_enabled=True, periodic_reset_frequency=5,
     )
-    old = learner.critic_3
+    old = learner.critics
     learner._periodic_reset()
-    assert learner.critic_3 is not old
-    assert learner.critics[2] is learner.critic_3 and learner.models["critic_3"] is learner.critic_3
-    assert_same(learner.critic_3.agent_state_dict(0), learner.target_critic_3.agent_state_dict(0))
+    assert learner.critics is not old and learner.models["critics"] is learner.critics
+    assert learner.critics.members == 3
+    assert_same(learner.critics.agent_state_dict(0), learner.target_critics.agent_state_dict(0))
+
+
+# ---------------------------------------------------------------------- stacking and graphs
+def test_a_stacked_ensemble_equals_its_members_run_separately():
+    """The stacked module is the separate critics, batched: same init (member-major build
+    order), same outputs and gradients up to float reordering."""
+    from robonuke_rl_core.models.ensemble import VmapEnsemble
+    from robonuke_rl_core.models.simba import SimbaQCriticNet
+
+    build = lambda: SimbaQCriticNet(OBS_DIM, ACT_DIM, 8, 1, 0.0)
+    torch.manual_seed(0)
+    stacked = VmapEnsemble(build, 2, members=3)
+    torch.manual_seed(0)
+    separate = [VmapEnsemble(build, 2) for _ in range(3)]
+    named = lambda m: dict(m.named_parameters())
+    for name, p in named(stacked).items():
+        assert torch.equal(p, torch.stack([named(m)[name] for m in separate], dim=1)), name
+    obs, act = torch.randn(2 * 5, OBS_DIM), torch.randn(2 * 5, ACT_DIM)
+    out = stacked.forward_flat(obs, act)  # (members, agents * rows, 1)
+    for k, member in enumerate(separate):
+        assert torch.allclose(out[k], member.forward_flat(obs, act), atol=1e-6)
+    out.sum().backward()
+    sum(m.forward_flat(obs, act).sum() for m in separate).backward()
+    for name, p in named(stacked).items():
+        grads = torch.stack([named(m)[name].grad for m in separate], dim=1)
+        assert torch.allclose(p.grad, grads, atol=1e-5), name
+
+
+def test_a_checkpoint_with_separate_critics_loads_into_the_stack(tmp_path):
+    learner = build_learner("sac", num_agents=1, num_critics=3, critic_subset=2)
+    fill_memory(learner)
+    learner.update(timestep=10, timesteps=100)
+    ckpt = learner._build_checkpoint(0, 10)
+    # written the old way: critic_k / target_critic_k plain state dicts
+    for key, prefix in (("critics", "critic_"), ("target_critics", "target_critic_")):
+        stacked = ckpt["models"].pop(key)
+        for k in range(3):
+            ckpt["models"][f"{prefix}{k + 1}"] = {n: t[k] for n, t in stacked.items()}
+    path = tmp_path / "old.ckpt"
+    torch.save(ckpt, path)
+    fresh = build_learner("sac", num_agents=1, num_critics=3, critic_subset=2)
+    fresh.load_agent(path, slot=0, with_optimizer=False)
+    assert_same(fresh.critics.agent_state_dict(0), learner.critics.agent_state_dict(0))
+    assert_same(fresh.target_critics.agent_state_dict(0), learner.target_critics.agent_state_dict(0))
+    wrong = build_learner("sac", num_agents=1, num_critics=4, critic_subset=2)
+    with pytest.raises(KeyError, match="num_critics"):
+        wrong.load_agent(path, slot=0, with_optimizer=False)
+
+
+def test_the_graph_safe_sampler_only_draws_written_rows():
+    learner = build_learner("sac", num_agents=2, rollout=50)
+    fill_memory(learner, steps=3)  # 6 rows per agent of 100
+    memory = learner.memory
+    memory.sync_size()
+    sampled = memory.sample_graph_safe(names=["rewards"], batch_size=4000)[0][0].view(2, -1)
+    for agent in range(2):
+        written = memory.get_tensor_by_name("rewards")[agent, : memory.size].reshape(-1)
+        assert torch.isin(sampled[agent], written).all()  # its own rows, never an unwritten (NaN) one
+        assert len(torch.unique(sampled[agent])) == memory.size  # and every written row is reachable
