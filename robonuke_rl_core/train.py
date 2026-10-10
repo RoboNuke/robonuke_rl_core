@@ -33,7 +33,7 @@ def main(argv=None, setup=None) -> int:
     # Isaac Sim is up: the task registry, the env and the learners can be imported now
     import gymnasium as gym
     import torch
-    from skrl.envs.wrappers.torch import wrap_env
+    from .envs.build import wrap_for_skrl
     from skrl.trainers.torch import SequentialTrainer, SequentialTrainerCfg
 
     from omegaconf import OmegaConf
@@ -71,7 +71,7 @@ def main(argv=None, setup=None) -> int:
     env = build_env(cfg, env, cfg.task_name)
     if describe(cfg):
         print(f"[train] env wrappers: {' -> '.join(describe(cfg))}", flush=True)
-    env = wrap_env(env, wrapper="isaaclab")
+    env = wrap_for_skrl(env, cfg.experiment.seed)
 
     torch.manual_seed(cfg.experiment.seed)
 

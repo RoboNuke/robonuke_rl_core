@@ -14,6 +14,8 @@ from __future__ import annotations
 from typing import Any, List
 
 __all__ = [
+    "wrap_for_skrl",
+    "reseed_env",
     "WRAPPER_ORDER",
     "PROJECT_WRAPPERS",
     "register_env_wrapper",
@@ -204,3 +206,35 @@ def describe(cfg: Any) -> List[str]:
         elif wrappers is not None and getattr(wrappers, name).enabled:
             enabled.append(name)
     return enabled
+
+
+def wrap_for_skrl(env: Any, seed: int) -> Any:
+    """skrl's Isaac Lab wrapper around ``env``, with the run's seed as its first reset's seed.
+
+    skrl's ``IsaacLabWrapper`` resets the env the first time with
+    ``env.reset(seed=skrl.config.torch.key)``, and that key defaults to **0**. Isaac Lab's
+    ``DirectRLEnv.reset(seed)`` then calls ``self.seed(seed)``, i.e. Isaac Sim's ``set_seed``,
+    which reseeds Python's ``random``, NumPy, torch (CPU and CUDA), Warp and Replicator. Left at
+    its default, every run therefore continued from seed 0 after its first reset, whatever
+    ``experiment.seed`` said. Setting the key here makes that first reset seed everything with
+    the run's own seed. Every env the package or a project hands to skrl goes through this.
+    """
+    from skrl import config
+    from skrl.envs.wrappers.torch import wrap_env
+
+    config.torch.key = int(seed)
+    return wrap_env(env, wrapper="isaaclab")
+
+
+def reseed_env(env: Any, seed: int) -> None:
+    """Reseed every generator the env's randomization can draw from, not just torch: Isaac
+    Lab's ``seed`` (Isaac Sim's ``set_seed``: ``random``, NumPy, torch CPU/CUDA, Warp,
+    Replicator). Falls back to ``torch.manual_seed`` for an env without one."""
+    import torch
+
+    unwrapped = getattr(env, "unwrapped", env)
+    seeder = getattr(unwrapped, "seed", None)
+    if callable(seeder):
+        seeder(int(seed))
+    else:
+        torch.manual_seed(int(seed))

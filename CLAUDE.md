@@ -12,6 +12,12 @@ create a new conda env for this project.
 
 ## Rules
 
+* **Wrap envs for skrl only with `envs.build.wrap_for_skrl(env, seed)`, never skrl's bare
+  `wrap_env`.** skrl's Isaac Lab wrapper does its first reset with `seed=skrl.config.torch.key`
+  (default 0), and Isaac Lab's reset then reseeds random / NumPy / torch / Warp / Replicator with
+  it: with a bare `wrap_env`, every run continued from seed 0 whatever `experiment.seed` said.
+  Reseed an env with `envs.build.reseed_env` (Isaac Sim's set_seed), not `torch.manual_seed`.
+  `tests/envs/test_seeding.py` guards both.
 * Fail fast and loud. No silent fallbacks. Errors say what is wrong and which file or CLI
   argument caused it.
 * Use OmegaConf (installed with Isaac Lab). Do not use Hydra.

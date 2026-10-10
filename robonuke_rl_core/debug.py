@@ -166,7 +166,7 @@ def main(argv=None, setup=None) -> int:
 
     import gymnasium as gym
     import torch
-    from skrl.envs.wrappers.torch import wrap_env
+    from .envs.build import wrap_for_skrl
 
     if args.run:
         print(f"[debug] fetching {args.run} from wandb", flush=True)
@@ -200,7 +200,7 @@ def main(argv=None, setup=None) -> int:
     env = build_env(cfg, env, cfg.task_name)
     if describe(cfg):
         print(f"[debug] env wrappers: {' -> '.join(describe(cfg))}", flush=True)
-    env = wrap_env(env, wrapper="isaaclab")
+    env = wrap_for_skrl(env, cfg.experiment.seed)
     torch.manual_seed(cfg.experiment.seed)
 
     policy, _, metadata = build_eval_policy(

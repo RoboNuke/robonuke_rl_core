@@ -619,7 +619,10 @@ def run_eval(
     writer = EvalStateWriter(num_envs) if save_state else None
 
     for index, active in enumerate(eval_rounds(num_rollouts, num_envs)):
-        torch.manual_seed(int(seed) + index)
+        # every generator the reset draws from, not torch alone (Isaac Sim's set_seed)
+        from .envs.build import reseed_env
+
+        reseed_env(env, int(seed) + index)
         observations, states = force_env_reset(env)
         if hasattr(policy, "reset"):
             policy.reset()

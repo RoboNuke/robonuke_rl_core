@@ -75,7 +75,6 @@ def gpu_env_factory(isaac_sim):
             )
         built.append(cfg.task_name)
         import gymnasium as gym
-        from skrl.envs.wrappers.torch import wrap_env
 
         # Both install pre-make, and only one env may exist per process, so the shared env
         # carries both ALWAYS: one `pytest -m gpu` then covers the recording and contact
@@ -90,7 +89,9 @@ def gpu_env_factory(isaac_sim):
             height=cfg.eval.video_height,
         )
         install_contact_sensor(cfg.task_name, cfg.task_cfg, cfg.wrappers.contact)
-        return wrap_env(gym.make(cfg.task_name, cfg=cfg.task_cfg), wrapper="isaaclab")
+        from robonuke_rl_core.envs.build import wrap_for_skrl
+
+        return wrap_for_skrl(gym.make(cfg.task_name, cfg=cfg.task_cfg), cfg.experiment.seed)
 
     return make
 
