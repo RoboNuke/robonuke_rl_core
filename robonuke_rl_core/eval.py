@@ -31,7 +31,7 @@ from pathlib import Path
 
 from robonuke_rl_core.config import dump, load_from_run  # noqa: E402
 from robonuke_rl_core.envs.build import build_env, describe, prepare_task  # noqa: E402
-from robonuke_rl_core.recording import EvalRecorder, install_recorder_camera  # noqa: E402
+from robonuke_rl_core.recording import EvalRecorder, install_recorder_camera, termination_causes, video_fps  # noqa: E402
 from robonuke_rl_core.evaluation import (  # noqa: E402
     SINGLE_AGENT_OVERRIDE,
     build_eval_policy,
@@ -133,6 +133,8 @@ def main(argv=None, setup=None) -> int:
             cfg.task_cfg,
             width=cfg.eval.video_width,
             height=cfg.eval.video_height,
+            light_intensity=cfg.eval.video_light_intensity,
+            light_radius=cfg.eval.video_light_radius,
         )
     prepare_task(cfg, cfg.task_name, cfg.task_cfg)
     env = gym.make(cfg.task_name, cfg=cfg.task_cfg)
@@ -163,15 +165,19 @@ def main(argv=None, setup=None) -> int:
     )
     recorder = None
     if record:
+        fps = video_fps(cfg.eval.video_fps, env)
         recorder = EvalRecorder(
             env,
             output_dir=out_dir / "videos",
-            fps=cfg.eval.video_fps,
+            fps=fps,
             overlays=cfg.eval.overlays,
+            pad_to=max_episode_length if cfg.eval.video_full_length else None,
+            causes=termination_causes(env),
         )
         print(
             f"[eval] recording {cfg.eval.video_width}x{cfg.eval.video_height} @ "
-            f"{cfg.eval.video_fps} fps, overlays={list(cfg.eval.overlays)}",
+            f"{fps} fps, overlays={list(cfg.eval.overlays)}"
+            + (f", every video {max_episode_length} frames" if cfg.eval.video_full_length else ""),
             flush=True,
         )
 

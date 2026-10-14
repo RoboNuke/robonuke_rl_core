@@ -24,6 +24,10 @@ from typing import Any, Dict, List, Optional, Sequence
 
 __all__ = [
     "CAMERA_KEY",
+    "LIGHT_KEY",
+    "end_card",
+    "termination_causes",
+    "video_fps",
     "CameraPlacement",
     "install_recorder_camera",
     "set_camera_active",
@@ -41,6 +45,8 @@ __all__ = [
 
 #: scene-sensor name the camera is registered under
 CAMERA_KEY = "recorder_camera"
+#: the optional light at the camera (``install_recorder_camera(light_intensity=...)``)
+LIGHT_KEY = "recorder_light"
 
 
 @dataclass
@@ -64,8 +70,14 @@ def install_recorder_camera(
     width: int,
     height: int,
     placement: Optional[CameraPlacement] = None,
+    light_intensity: Optional[float] = None,
+    light_radius: float = 0.1,
 ) -> None:
     """Attach a per-env ``TiledCamera`` to the task's scene. Call **before** ``gym.make``.
+
+    ``light_intensity``, when given, also puts a sphere light of that intensity (and
+    ``light_radius``, m) at the camera's position in every env (``LIGHT_KEY``), so the scene
+    is lit from the viewpoint; the task's own lights stay.
 
     A Direct env gets it through a one-shot shim on its ``_setup_scene`` (below); a
     manager-based env, which has no ``_setup_scene``, gets it as an entry of its scene cfg,
@@ -87,6 +99,13 @@ def install_recorder_camera(
     from isaaclab.sim.spawners.sensors import PinholeCameraCfg
 
     placement = placement or CameraPlacement()
+    light_cfg = None
+    if light_intensity is not None:
+        import isaaclab.sim as sim_utils
+
+        if light_intensity <= 0 or light_radius <= 0:
+            raise ValueError(f"camera light intensity and radius must be > 0, got {light_intensity}, {light_radius}")
+        light_cfg = sim_utils.SphereLightCfg(intensity=float(light_intensity), radius=float(light_radius), color=(1.0, 1.0, 1.0))
 
     if getattr(env_cfg.scene, "clone_in_fabric", False):
         raise ValueError(
@@ -131,6 +150,18 @@ def install_recorder_camera(
             CAMERA_KEY,
             camera_cfg.replace(prim_path="{ENV_REGEX_NS}/" + CAMERA_KEY),
         )
+        if light_cfg is not None:
+            from isaaclab.assets import AssetBaseCfg
+
+            setattr(
+                env_cfg.scene,
+                LIGHT_KEY,
+                AssetBaseCfg(
+                    prim_path="{ENV_REGEX_NS}/" + LIGHT_KEY,
+                    spawn=light_cfg,
+                    init_state=AssetBaseCfg.InitialStateCfg(pos=tuple(placement.pos)),
+                ),
+            )
         print(
             f"[recorder] TiledCamera {width}x{height} added to the scene cfg as "
             f"scene.{CAMERA_KEY} (manager-based env)",
@@ -145,6 +176,8 @@ def install_recorder_camera(
 
         def shim_clone(*args, **kwargs):
             self.scene.clone_environments = original_clone  # fires exactly once
+            if light_cfg is not None:  # spawned in env 0 before the clone, so every env has it
+                light_cfg.func(f"/World/envs/env_0/{LIGHT_KEY}", light_cfg, translation=tuple(placement.pos))
             camera = TiledCamera(camera_cfg)
             result = original_clone(*args, **kwargs)
             self.scene._sensors[CAMERA_KEY] = camera
@@ -353,7 +386,14 @@ class EvalRecorder:
         fps: int = 30,
         overlays: Sequence[str] = ("hud",),
         camera: Any = None,
+        pad_to: Optional[int] = None,
+        causes: Any = None,
     ) -> None:
+        """``pad_to``: frames every video is padded to (the episode limit), by holding an env's
+        last frame with the cause of its end written across it. ``causes``: a callable
+        returning, after a step, one label per env for why its episode ended
+        (:func:`termination_causes`); without it the label is the outcome (``terminal`` /
+        ``timeout``)."""
         from pathlib import Path
 
         self.env = env
@@ -369,6 +409,11 @@ class EvalRecorder:
         self._writers: Dict[int, Any] = {}
         self._step = 0
         self._returns: Dict[int, float] = {}
+        self.pad_to = int(pad_to) if pad_to else None
+        self.causes = causes
+        #: per env this round: the last written frame and, once it ended, why
+        self._last: Dict[int, Any] = {}
+        self._ended: Dict[int, str] = {}
 
     # ------------------------------------------------------------------ the round
     def start_round(self, round_index: int) -> None:
@@ -379,6 +424,7 @@ class EvalRecorder:
         self._writers = {}
         self._step = 0
         self._returns = {}
+        self._last, self._ended = {}, {}
         set_camera_active(self.camera, True)
 
     def capture(
@@ -408,6 +454,7 @@ class EvalRecorder:
                 name: _flat(value, self.num_envs) for name, value in (metrics or {}).items()
             }
             numpy_frames = frames.numpy()
+            labels = None
             for env in keep:
                 reward = float(rewards_list[env]) if rewards_list else 0.0
                 self._returns[env] = self._returns.get(env, 0.0) + reward
@@ -427,6 +474,12 @@ class EvalRecorder:
                 for overlay in self.overlays:
                     frame = overlay.apply(frame, step)
                 self._writer(env).append(frame)
+                self._last[env] = frame
+                if step.done and env not in self._ended:
+                    if labels is None and self.causes is not None:
+                        labels = self.causes()
+                    label = labels[env] if labels and labels[env] else step.outcome
+                    self._ended[env] = str(label)
                 key = (self._round, env)
                 self.frame_counts[key] = self.frame_counts.get(key, 0) + 1
         self._step += 1
@@ -434,6 +487,15 @@ class EvalRecorder:
     def end_round(self) -> None:
         if self._round is None:
             raise RuntimeError("call start_round() before end_round()")
+        if self.pad_to:
+            for env, writer in self._writers.items():
+                missing = self.pad_to - self.frame_counts.get((self._round, env), 0)
+                if missing <= 0:
+                    continue
+                held = end_card(self._last[env], self._ended.get(env, "timeout"))
+                for _ in range(missing):
+                    writer.append(held)
+                self.frame_counts[(self._round, env)] += missing
         for writer in self._writers.values():
             writer.close()
         set_camera_active(self.camera, False)
@@ -453,6 +515,64 @@ class EvalRecorder:
             self._writers[env] = VideoWriter(path, self.fps)
             self.paths[(self._round, env)] = path
         return self._writers[env]
+
+
+def end_card(frame: Any, label: str) -> Any:
+    """``frame`` darkened, with ``label`` in large letters across its middle: the frame a
+    video holds after its episode ended."""
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.fromarray((np.asarray(frame).astype(np.float32) * 0.6).astype(np.uint8))
+    draw = ImageDraw.Draw(image)
+    size = max(12, image.height // 8)
+    try:
+        font = ImageFont.load_default(size=size)
+    except TypeError:  # Pillow < 10.1: one small bitmap font
+        font = ImageFont.load_default()
+    text = label.upper()
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    x, y = (image.width - (right - left)) // 2, (image.height - (bottom - top)) // 2
+    pad = size // 3
+    draw.rectangle([(x - pad, y - pad), (x + right - left + pad, y + bottom - top + pad)], fill=(0, 0, 0))
+    color = {"SUCCESS": (60, 220, 60), "TIMEOUT": (230, 200, 60)}.get(text, (235, 70, 60))
+    draw.text((x - left, y - top), text, font=font, fill=color)
+    return np.asarray(image)
+
+
+def termination_causes(env: Any):
+    """A ``causes`` callable for :class:`EvalRecorder` on a manager-based env: after a step,
+    per env, the termination term that fired (a non-timeout term wins over ``time_out``),
+    shown through the env's optional ``termination_labels`` dict, else the term name with
+    spaces. None for an env without a termination manager (a Direct env): the recorder then
+    labels by outcome."""
+    unwrapped = getattr(env, "unwrapped", env)
+    manager = getattr(unwrapped, "termination_manager", None)
+    if manager is None:
+        return None
+    labels = dict(getattr(unwrapped, "termination_labels", {}) or {})
+
+    def causes() -> List[Optional[str]]:
+        n = int(unwrapped.num_envs)
+        out: List[Optional[str]] = [None] * n
+        names = list(manager.active_terms)
+        names = [k for k in names if k != "time_out"] + [k for k in names if k == "time_out"]
+        for name in names:
+            fired = manager.get_term(name).reshape(-1).tolist()
+            for env_index in range(n):
+                if out[env_index] is None and fired[env_index]:
+                    out[env_index] = labels.get(name, name.replace("_", " "))
+        return out
+
+    return causes
+
+
+def video_fps(cfg_value: Optional[int], env: Any) -> int:
+    """``eval.video_fps``, or, when null, the env's control rate (real-time playback)."""
+    if cfg_value:
+        return int(cfg_value)
+    step_dt = float(getattr(getattr(env, "unwrapped", env), "step_dt"))
+    return max(1, round(1.0 / step_dt))
 
 
 def _flat(value: Any, num_envs: int) -> list:

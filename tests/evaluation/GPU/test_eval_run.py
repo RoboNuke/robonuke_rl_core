@@ -164,13 +164,13 @@ def test_recording_writes_one_playable_mp4_per_env(gpu_cfg, gpu_env, eval_policy
     """The record path end to end: real camera, real frames, one file per (round, env)."""
     import imageio
 
-    from robonuke_rl_core.recording import EvalRecorder
+    from robonuke_rl_core.recording import EvalRecorder, video_fps
 
     policy, _ = eval_policy
     recorder = EvalRecorder(
         gpu_env,
         output_dir=tmp_path / "videos",
-        fps=gpu_cfg.eval.video_fps,
+        fps=video_fps(gpu_cfg.eval.video_fps, gpu_env),
         overlays=gpu_cfg.eval.overlays,
     )
     result = run_eval(

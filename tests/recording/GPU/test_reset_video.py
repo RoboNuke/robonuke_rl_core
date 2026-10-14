@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from robonuke_rl_core.recording import render_resets
+from robonuke_rl_core.recording import render_resets, video_fps
 
 pytestmark = pytest.mark.gpu
 
@@ -25,11 +25,11 @@ def test_the_reset_video_holds_each_sampled_initial_condition(gpu_cfg, gpu_env, 
         out,
         num_resets=RESETS,
         hold_seconds=HOLD_SECONDS,
-        fps=gpu_cfg.eval.video_fps,
+        fps=video_fps(gpu_cfg.eval.video_fps, gpu_env),
         overlays=gpu_cfg.eval.overlays,
     )
 
-    expected = RESETS * max(1, round(HOLD_SECONDS * gpu_cfg.eval.video_fps))
+    expected = RESETS * max(1, round(HOLD_SECONDS * video_fps(gpu_cfg.eval.video_fps, gpu_env)))
     assert writer.frames == expected  # the hold lasts the asked-for playing time
     assert out.is_file() and out.stat().st_size > 0
 

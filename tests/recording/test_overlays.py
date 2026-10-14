@@ -286,3 +286,72 @@ def test_a_missing_camera_says_how_to_install_it():
     with pytest.raises(RuntimeError) as err:
         recorder_camera(FakeEnv())
     assert "install_recorder_camera" in str(err.value)
+
+
+def test_full_length_videos_hold_the_last_frame_with_the_cause(tmp_path):
+    """pad_to: every video is the episode limit long; after an env's episode ends its last
+    frame is held, darkened, with the cause written across it."""
+    import imageio
+
+    rec = EvalRecorder(
+        FakeEnv(), output_dir=tmp_path / "videos", fps=10, overlays=(), camera=FakeCamera(),
+        pad_to=6, causes=lambda: ["success", None, "out of bounds"],
+    )
+    rec.start_round(0)
+    no = torch.zeros(NUM_ENVS, 1, dtype=torch.bool)
+    # env 0 succeeds at step 1, env 2 terminates at step 0, env 1 runs to step 3 and times out
+    rec.capture(torch.tensor([1, 1, 1], dtype=torch.bool), terminated=torch.tensor([[0], [0], [1]], dtype=torch.bool), truncated=no)
+    rec.capture(torch.tensor([1, 1, 0], dtype=torch.bool), terminated=torch.tensor([[1], [0], [0]], dtype=torch.bool), truncated=no)
+    rec.capture(torch.tensor([0, 1, 0], dtype=torch.bool), terminated=no, truncated=no)
+    rec.capture(torch.tensor([0, 1, 0], dtype=torch.bool), terminated=torch.tensor([[0], [1], [0]], dtype=torch.bool),
+                truncated=torch.tensor([[0], [1], [0]], dtype=torch.bool))
+    rec.end_round()
+    assert rec.frame_counts == {(0, 0): 6, (0, 1): 6, (0, 2): 6}
+    assert rec._ended == {0: "success", 1: "timeout", 2: "out of bounds"}  # env 1: no term label -> the outcome
+    reader = imageio.get_reader(str(rec.paths[(0, 0)]), format="FFMPEG")
+    try:
+        frames = [f for f in reader]
+    finally:
+        reader.close()
+    assert len(frames) == 6
+    # held frames differ from the live one (darkened + text) and are all the same
+    assert np.abs(frames[2].astype(int) - frames[5].astype(int)).max() <= 3
+    assert np.abs(frames[0].astype(int) - frames[2].astype(int)).max() > 10
+
+
+def test_the_end_card_labels_and_colours(tmp_path):
+    from robonuke_rl_core.recording import end_card
+
+    base = np.full((HEIGHT, WIDTH, 3), 200, dtype=np.uint8)
+    card = end_card(base, "success")
+    assert card.shape == base.shape and card.dtype == np.uint8
+    middle = card[HEIGHT // 3: 2 * HEIGHT // 3]
+    assert (middle[..., 1] > 180).any() and (middle[..., 0] < 100).any()  # green text on black
+    assert card[0, 0, 0] == 120  # the rest darkened to 60 %
+
+
+def test_termination_causes_reads_the_fired_term_and_prefers_it_over_the_timeout():
+    from robonuke_rl_core.recording import termination_causes
+
+    class Manager:
+        active_terms = ["time_out", "success", "part_out_of_limits"]
+        terms = {
+            "time_out": torch.tensor([True, True, False, False]),
+            "success": torch.tensor([False, True, False, False]),
+            "part_out_of_limits": torch.tensor([False, False, True, False]),
+        }
+
+        def get_term(self, name):
+            return self.terms[name]
+
+    env = type("E", (), {"num_envs": 4, "termination_manager": Manager(),
+                         "termination_labels": {"part_out_of_limits": "out of bounds", "time_out": "timeout"}})()
+    assert termination_causes(env)() == ["timeout", "success", "out of bounds", None]
+    assert termination_causes(FakeEnv()) is None  # a Direct env: the recorder labels by outcome
+
+
+def test_video_fps_defaults_to_the_control_rate():
+    from robonuke_rl_core.recording import video_fps
+
+    env = type("E", (), {"step_dt": 0.05})()
+    assert video_fps(None, env) == 20 and video_fps(30, env) == 30

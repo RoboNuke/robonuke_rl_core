@@ -72,17 +72,28 @@ class EvalCfg:
     record: bool = False
     #: registered overlay names, drawn in this order
     overlays: List[str] = field(default_factory=lambda: ["hud"])
-    video_fps: int = 30
+    #: playback rate; null = the env's control rate (real time)
+    video_fps: Optional[int] = None
     video_height: int = 180
     video_width: int = 240
+    #: every video is the episode limit long: an env's last frame is held, with the cause
+    #: of its end (success / the termination term / timeout) written across it
+    video_full_length: bool = True
+    #: a sphere light of this intensity at the camera, in every env; null = none
+    video_light_intensity: Optional[float] = None
+    video_light_radius: float = 0.1
 
     def validate(self, cfg: Any) -> None:
         if self.num_rollouts < 1:
             raise ValueError(f"eval.num_rollouts must be >= 1, got {self.num_rollouts}")
         for name in ("video_fps", "video_height", "video_width"):
             value = getattr(self, name)
-            if value < 1:
+            if value is not None and value < 1:
                 raise ValueError(f"eval.{name} must be >= 1, got {value}")
+        if self.video_light_intensity is not None and self.video_light_intensity <= 0:
+            raise ValueError(f"eval.video_light_intensity must be > 0 or null, got {self.video_light_intensity}")
+        if self.video_light_radius <= 0:
+            raise ValueError(f"eval.video_light_radius must be > 0, got {self.video_light_radius}")
         duplicates = sorted({name for name in self.overlays if self.overlays.count(name) > 1})
         if duplicates:
             raise ValueError(

@@ -40,6 +40,7 @@ from robonuke_rl_core.evaluation import (  # noqa: E402
 from robonuke_rl_core.envs.build import build_env, describe, prepare_task  # noqa: E402
 from robonuke_rl_core.recording import (  # noqa: E402
     install_recorder_camera,
+    video_fps,
     render_resets,
 )
 
@@ -193,6 +194,8 @@ def main(argv=None, setup=None) -> int:
             cfg.task_cfg,
             width=cfg.eval.video_width,
             height=cfg.eval.video_height,
+            light_intensity=cfg.eval.video_light_intensity,
+            light_radius=cfg.eval.video_light_radius,
         )
     prepare_task(cfg, cfg.task_name, cfg.task_cfg)
     env = gym.make(cfg.task_name, cfg=cfg.task_cfg, render_mode=None if headless else "human")
@@ -218,12 +221,12 @@ def main(argv=None, setup=None) -> int:
                 args.out,
                 num_resets=args.num_resets,
                 hold_seconds=args.hold_seconds,
-                fps=cfg.eval.video_fps,
+                fps=video_fps(cfg.eval.video_fps, env),
                 overlays=cfg.eval.overlays,
             )
             print(
                 f"[debug] wrote {writer.path} ({writer.frames} frames = {args.num_resets} "
-                f"resets x {args.hold_seconds:g}s at {cfg.eval.video_fps} fps)",
+                f"resets x {args.hold_seconds:g}s at {video_fps(cfg.eval.video_fps, env)} fps)",
                 flush=True,
             )
         elif args.resets:
