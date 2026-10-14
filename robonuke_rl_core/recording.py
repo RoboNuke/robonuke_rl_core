@@ -24,7 +24,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 __all__ = [
     "CAMERA_KEY",
-    "LIGHT_KEY",
     "end_card",
     "termination_causes",
     "video_fps",
@@ -45,8 +44,6 @@ __all__ = [
 
 #: scene-sensor name the camera is registered under
 CAMERA_KEY = "recorder_camera"
-#: the optional light at the camera (``install_recorder_camera(light_intensity=...)``)
-LIGHT_KEY = "recorder_light"
 
 
 @dataclass
@@ -70,14 +67,8 @@ def install_recorder_camera(
     width: int,
     height: int,
     placement: Optional[CameraPlacement] = None,
-    light_intensity: Optional[float] = None,
-    light_radius: float = 0.1,
 ) -> None:
     """Attach a per-env ``TiledCamera`` to the task's scene. Call **before** ``gym.make``.
-
-    ``light_intensity``, when given, also puts a sphere light of that intensity (and
-    ``light_radius``, m) at the camera's position in every env (``LIGHT_KEY``), so the scene
-    is lit from the viewpoint; the task's own lights stay.
 
     A Direct env gets it through a one-shot shim on its ``_setup_scene`` (below); a
     manager-based env, which has no ``_setup_scene``, gets it as an entry of its scene cfg,
@@ -99,13 +90,6 @@ def install_recorder_camera(
     from isaaclab.sim.spawners.sensors import PinholeCameraCfg
 
     placement = placement or CameraPlacement()
-    light_cfg = None
-    if light_intensity is not None:
-        import isaaclab.sim as sim_utils
-
-        if light_intensity <= 0 or light_radius <= 0:
-            raise ValueError(f"camera light intensity and radius must be > 0, got {light_intensity}, {light_radius}")
-        light_cfg = sim_utils.SphereLightCfg(intensity=float(light_intensity), radius=float(light_radius), color=(1.0, 1.0, 1.0))
 
     if getattr(env_cfg.scene, "clone_in_fabric", False):
         raise ValueError(
@@ -150,18 +134,6 @@ def install_recorder_camera(
             CAMERA_KEY,
             camera_cfg.replace(prim_path="{ENV_REGEX_NS}/" + CAMERA_KEY),
         )
-        if light_cfg is not None:
-            from isaaclab.assets import AssetBaseCfg
-
-            setattr(
-                env_cfg.scene,
-                LIGHT_KEY,
-                AssetBaseCfg(
-                    prim_path="{ENV_REGEX_NS}/" + LIGHT_KEY,
-                    spawn=light_cfg,
-                    init_state=AssetBaseCfg.InitialStateCfg(pos=tuple(placement.pos)),
-                ),
-            )
         print(
             f"[recorder] TiledCamera {width}x{height} added to the scene cfg as "
             f"scene.{CAMERA_KEY} (manager-based env)",
@@ -176,8 +148,6 @@ def install_recorder_camera(
 
         def shim_clone(*args, **kwargs):
             self.scene.clone_environments = original_clone  # fires exactly once
-            if light_cfg is not None:  # spawned in env 0 before the clone, so every env has it
-                light_cfg.func(f"/World/envs/env_0/{LIGHT_KEY}", light_cfg, translation=tuple(placement.pos))
             camera = TiledCamera(camera_cfg)
             result = original_clone(*args, **kwargs)
             self.scene._sensors[CAMERA_KEY] = camera

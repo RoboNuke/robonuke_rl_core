@@ -133,8 +133,6 @@ def main(argv=None, setup=None) -> int:
             cfg.task_cfg,
             width=cfg.eval.video_width,
             height=cfg.eval.video_height,
-            light_intensity=cfg.eval.video_light_intensity,
-            light_radius=cfg.eval.video_light_radius,
         )
     prepare_task(cfg, cfg.task_name, cfg.task_cfg)
     env = gym.make(cfg.task_name, cfg=cfg.task_cfg)
