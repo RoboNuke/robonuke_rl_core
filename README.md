@@ -313,7 +313,7 @@ Lab's Factory and Forge tasks raise both at the time limit (`_get_dones` returns
 | `num_rollouts` | int | `64` | valid episodes to collect |
 | `deterministic` | bool | `True` | act on the distribution's mean (Bernoulli dims thresholded); `false` samples |
 | `save_state` | bool | `True` | capture the full per-step state (observations, states, actions, rewards, dones, both metric channels, `infos["eval_state"]`) into the eval's `<stem>.parquet` trace, one row per (round, env, step) |
-| `record` | bool | `False` | write one mp4 per (round, env); `--record` forces it on. Use few envs by setting `task.cfg.scene.num_envs` in the eval config |
+| `record` | bool | `False` | write one mp4 per (round, env); `--record` forces it on. Use few envs by setting `task.cfg.scene.num_envs` in the eval config. Works on Direct envs (a shim on `_setup_scene`) and manager-based envs (the camera becomes a scene-cfg entry); both need `task.cfg.scene.clone_in_fabric: false` |
 | `overlays` | list[str] | `["hud"]` | registered overlay names, drawn in this order |
 | `video_fps` | int | `30` | playback rate of the written mp4s |
 | `video_height` | int | `180` | per-env camera height in pixels |

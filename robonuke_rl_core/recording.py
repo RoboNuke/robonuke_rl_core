@@ -67,6 +67,10 @@ def install_recorder_camera(
 ) -> None:
     """Attach a per-env ``TiledCamera`` to the task's scene. Call **before** ``gym.make``.
 
+    A Direct env gets it through a one-shot shim on its ``_setup_scene`` (below); a
+    manager-based env, which has no ``_setup_scene``, gets it as an entry of its scene cfg,
+    which its ``InteractiveScene`` turns into ``scene.sensors[CAMERA_KEY]`` on its own.
+
     The camera is a rendering sensor, so two things have to be true and neither is the
     default. Under ``clone_in_fabric=True`` the cloned cameras are Fabric-only — the view then
     resolves env 0 alone and ``scene.reset(env_ids)`` indexes an env_0-sized buffer out of
@@ -118,6 +122,22 @@ def install_recorder_camera(
             f"{entry_point!r}, which is not 'module:Class'"
         )
     env_class = getattr(importlib.import_module(module_name), class_name)
+
+    if not hasattr(env_class, "_setup_scene"):
+        # a manager-based env builds its scene from the cfg's entries: the camera becomes one,
+        # under the recorder's key, and the scene registers it as sensors[CAMERA_KEY] itself
+        setattr(
+            env_cfg.scene,
+            CAMERA_KEY,
+            camera_cfg.replace(prim_path="{ENV_REGEX_NS}/" + CAMERA_KEY),
+        )
+        print(
+            f"[recorder] TiledCamera {width}x{height} added to the scene cfg as "
+            f"scene.{CAMERA_KEY} (manager-based env)",
+            flush=True,
+        )
+        return
+
     original_setup_scene = env_class._setup_scene
 
     def patched_setup_scene(self):
