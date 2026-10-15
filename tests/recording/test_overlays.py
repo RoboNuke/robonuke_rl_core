@@ -373,15 +373,12 @@ def test_render_every_sets_the_render_interval_and_must_divide_the_decimation():
         return SimpleNamespace(decimation=12, sim=SimpleNamespace(render_interval=interval))
 
     untouched = cfg()
-    assert render_substeps(untouched, None, {}) == 1 and untouched.sim.render_interval == 12
-    env_cfg = cfg()
-    assert render_substeps(env_cfg, 4, {}) == 3 and env_cfg.sim.render_interval == 4
+    assert render_substeps(untouched, None) == 1 and untouched.sim.render_interval == 12
+    env_cfg = cfg(12)  # the run's resolved value: render_every wins
+    assert render_substeps(env_cfg, 4) == 3 and env_cfg.sim.render_interval == 4
     for bad in (5, 24):
         with pytest.raises(ValueError, match="divide"):
-            render_substeps(cfg(), bad, {})
-    with pytest.raises(ValueError, match="set one of them"):
-        render_substeps(cfg(2), 4, {"sim.render_interval": "eval.yaml"})
-    assert render_substeps(cfg(4), 4, {"sim.render_interval": "eval.yaml"}) == 3  # the same value: fine
+            render_substeps(cfg(), bad)
 
 
 class SubstepEnv:

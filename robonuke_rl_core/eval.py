@@ -135,7 +135,14 @@ def main(argv=None, setup=None) -> int:
     substeps = 1
     if record:
         # before gym.make: the render interval and the camera are scene/sim cfg
-        substeps = render_substeps(cfg.task_cfg, cfg.eval.render_every, cfg.task_overrides)
+        substeps = render_substeps(cfg.task_cfg, cfg.eval.render_every)
+        if cfg.eval.render_every:
+            # the config records the value the env runs with, so the resolved config and the
+            # kept-overrides check (dump) agree with the env
+            from omegaconf import OmegaConf
+
+            OmegaConf.update(cfg.root, "task.cfg.sim.render_interval", int(cfg.eval.render_every))
+            cfg.task_overrides["sim.render_interval"] = "eval.render_every"
         # the camera has to exist in the scene the task clones
         install_recorder_camera(
             cfg.task_name,

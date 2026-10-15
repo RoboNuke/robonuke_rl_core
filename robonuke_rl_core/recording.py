@@ -571,14 +571,14 @@ def video_fps(cfg_value: Optional[int], env: Any, frames_per_step: int = 1) -> i
     return max(1, round(frames_per_step / step_dt))
 
 
-def render_substeps(env_cfg: Any, render_every: Optional[int], task_overrides: Dict[str, str]) -> int:
+def render_substeps(env_cfg: Any, render_every: Optional[int]) -> int:
     """``eval.render_every`` -> frames per control step, setting ``env_cfg.sim.render_interval``.
     Call **before** ``gym.make``.
 
     Null: one frame per control step, the cfg untouched. Otherwise the env renders every
     ``render_every`` physics steps, which must divide its decimation so every control step
-    holds the same number of frames. A layer that also set ``task.cfg.sim.render_interval``
-    to something else is a conflict and raises.
+    holds the same number of frames. ``eval.render_every`` wins over any
+    ``task.cfg.sim.render_interval`` (the run's resolved config always holds one).
     """
     if not render_every:
         return 1
@@ -588,12 +588,6 @@ def render_substeps(env_cfg: Any, render_every: Optional[int], task_overrides: D
         raise ValueError(
             f"eval.render_every={every} must divide the task's decimation ({decimation}): "
             f"pick one of {[d for d in range(1, decimation + 1) if decimation % d == 0]}"
-        )
-    current = int(env_cfg.sim.render_interval)
-    if "sim.render_interval" in task_overrides and current != every:
-        raise ValueError(
-            f"eval.render_every={every} but {task_overrides['sim.render_interval']} set "
-            f"task.cfg.sim.render_interval={current}; set one of them"
         )
     env_cfg.sim.render_interval = every
     return decimation // every
