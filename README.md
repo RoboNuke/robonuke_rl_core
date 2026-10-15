@@ -263,6 +263,7 @@ new config fields. An empty list means no extra loss and no hook.
 | `terms[i].target` | str | required | which loss it feeds: `policy` or `critic`; the loss must support it |
 | `terms[i].weight` | float | required | multiplies the term's per-agent mean |
 | `terms[i].kwargs` | dict | `{}` | constructor arguments for the loss class |
+| `terms[i].graph_safe` | bool | `false` | keep SAC's `cuda_graph` on with this term: its loss is computed inside the captured gradient step. Only for a loss class that declares `graph_safe = True` (device-only `compute`, no host sync, no `ctx.step`); building the hook refuses it otherwise. SAC captures the step only when **every** term is graph-safe, and runs eagerly otherwise |
 
 ```yaml
 losses:
@@ -277,9 +278,14 @@ The package ships **one** built-in loss; every other `name` comes from a project
 it cannot be written as a reward: a penalty on action magnitude belongs in the env's reward,
 not in a policy-side term. See the "Add a loss" checklist in `CLAUDE.md`.
 
+Each term's per-agent raw value is logged as `loss/<name>_<target>`, on every call of the
+hook (every SAC gradient step, every PPO minibatch). When every term is graph-safe the learner
+logs them instead: PPO after every minibatch, SAC once per update with its other update
+metrics (the last gradient step's; the policy term's from the last actor step).
+
 | name | target | kwargs | what it does |
 | --- | --- | --- | --- |
-| `supervised_selection` | `policy` | `num_axes` (int, required): the number of selection dims, i.e. `sum(controller.force_axes)` | binary cross entropy between the actor's per-axis probability of **force** control and whether that axis is in contact. Needs `wrappers.contact.enabled` (it publishes the per-transition flags) and a policy with selection dims |
+| `supervised_selection` | `policy` | `num_axes` (int, required): the number of selection dims, i.e. `sum(controller.force_axes)` | binary cross entropy between the actor's per-axis probability of **force** control and whether that axis is in contact. Needs `wrappers.contact.enabled` (it publishes the per-transition flags) and a policy with selection dims. Graph-safe |
 
 ```yaml
 losses:

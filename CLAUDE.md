@@ -171,6 +171,8 @@ Polyak update, and `sac.cuda_graph`, which captures `SAC._gradient_step` per mod
 no host sync, no Python value read from a tensor, and **state written in place** (the
 normalizer's stats, the entropy coefficient, the LRs) — a reassigned tensor leaves the graph
 reading the old one. The memory's size reaches it through `sync_size` / `sample_graph_safe`.
+Aux losses are captured with it only when every `losses.terms[*].graph_safe` is true (see "Add
+a loss"); otherwise the update runs eagerly.
 `tests/learners/GPU/test_cuda_graph.py` checks a replay against the eager step. Update metrics
 are emitted once per update (the last gradient step; the actor's last step), not per gradient
 step. Measured on the 10-critic residual config: 311 -> ~76 ms per env step.
@@ -312,10 +314,20 @@ gate the wrong axis in silence.
    `learner.aux_loss` **before** the trainer calls `init()` — `robonuke_rl_core/train.py`
    appends it there; a hook added later gets no tensor and the loss raises by name through
    `AuxLoss.sampled`.
-4. Add a term to the experiment YAML (`losses.terms`), with `kwargs` for the constructor. No
+4. **Graph-safe?** If `compute` is device work only — tensor ops on the context, no host sync
+   (`.item()`, `bool(t)`, `if t.any()`), no Python value computed from a tensor, no
+   `ctx.step` — set the class attribute `graph_safe = True`. A term with `graph_safe: true` in
+   its config may then run inside SAC's captured gradient step (`sac.cuda_graph`); the hook
+   refuses the flag on a class that does not declare it. The hook writes
+   `loss/<name>_<target>` into `ctx.aux_metrics`; with any eager hook it also logs them itself,
+   every call, as before. When every hook is graph-safe it does not, and the learner returns
+   them with the step's outputs and emits them (SAC once per update, PPO per minibatch), which
+   is what keeps a replayed graph's values fresh. `tests/learners/GPU/test_cuda_graph.py` checks a captured
+   loss against the eager step.
+5. Add a term to the experiment YAML (`losses.terms`), with `kwargs` for the constructor. No
    new config fields are needed, so nothing to add to the README except a row in its built-in
    loss table for a package loss.
-5. Copy tests 7-8 of `tests/losses/test_losses.py`: the weighted total and the per-agent
+6. Copy tests 7-8 of `tests/losses/test_losses.py`: the weighted total and the per-agent
    values, and independence under a change to agent 1's data. A loss with memory keys also
    needs the end-to-end pass of `tests/learners/test_match_integration.py`: the tensor is
    created, filled, sampled, and the update moves the weights.

@@ -434,10 +434,11 @@ class SAC(LearnerBase):
         policy_on = timestep >= self._policy_learning_starts()
         demo_on = self._demo_active(timestep)
         # a graph replays fixed shapes: a mixed batch's online share is fixed only once the
-        # memory holds half a batch, and aux losses build per-step contexts: those run eagerly
+        # memory holds half a batch; aux losses are captured only when every term is graph-safe
+        # (losses.terms[*].graph_safe), the others run eagerly
         graph = (
             self._graphs is not None
-            and not self.aux_loss
+            and self.aux_loss_graph_safe()
             and (not demo_on or int(self.memory.size) >= rows // 2)
         )
         if graph:
@@ -489,18 +490,17 @@ class SAC(LearnerBase):
             critic_next_inputs=critic_next_inputs,
             rows=rows,
         )
-        aux = self.compute_aux_loss(
-            LossContext(
-                learner=self,
-                step=timestep,
-                target="critic",
-                sampled=sampled,
-                critic_inputs=critic_inputs,
-                critic_1_values=critic_1_values,
-                critic_2_values=critic_2_values,
-                target_values=target_values,
-            )
+        ctx = LossContext(
+            learner=self,
+            step=timestep,
+            target="critic",
+            sampled=sampled,
+            critic_inputs=critic_inputs,
+            critic_1_values=critic_1_values,
+            critic_2_values=critic_2_values,
+            target_values=target_values,
         )
+        aux = self.compute_aux_loss(ctx)
         if aux is not None:
             critic_loss = critic_loss + aux
 
@@ -526,6 +526,8 @@ class SAC(LearnerBase):
             critic_2_values=critic_2_values.detach(),
             target_values=target_values,
             critic_grad_norms=critic_grad_norms,
+            # the aux terms' raw values: returned like the rest, so a replayed graph's are fresh
+            aux_metrics={k: v.detach() for k, v in ctx.aux_metrics.items()},
         )
         return {"critic": critic, "actor": actor}
 
@@ -549,18 +551,17 @@ class SAC(LearnerBase):
         policy_loss, actions, log_prob, q_pi, outputs = self._compute_actor_loss(
             sampled=sampled, inputs=inputs, critic_inputs=critic_inputs, rows=rows
         )
-        aux = self.compute_aux_loss(
-            LossContext(
-                learner=self,
-                step=timestep,
-                target="policy",
-                sampled=sampled,
-                inputs=inputs,
-                actions=actions,
-                log_prob=log_prob,
-                policy_outputs=outputs,
-            )
+        ctx = LossContext(
+            learner=self,
+            step=timestep,
+            target="policy",
+            sampled=sampled,
+            inputs=inputs,
+            actions=actions,
+            log_prob=log_prob,
+            policy_outputs=outputs,
         )
+        aux = self.compute_aux_loss(ctx)
         if aux is not None:
             policy_loss = policy_loss + aux
 
@@ -582,6 +583,7 @@ class SAC(LearnerBase):
             "policy_loss": per_agent_loss,
             "log_std": outputs["log_std"].detach() if "log_std" in outputs else None,
             "entropy_loss": entropy_loss,
+            "actor_aux_metrics": {k: v.detach() for k, v in ctx.aux_metrics.items()},
         }
 
     def _update_entropy(self, log_prob: torch.Tensor, rows: int) -> torch.Tensor:
@@ -621,8 +623,11 @@ class SAC(LearnerBase):
         policy_loss=None,
         log_std=None,
         entropy_loss=None,
+        aux_metrics=None,
+        actor_aux_metrics=None,
     ) -> None:
-        """One point per update: the critic's last gradient step, the actor's last step."""
+        """One point per update: the critic's last gradient step, the actor's last step (with
+        graph-safe aux losses, their terms' raw values too, from the same steps)."""
         with torch.no_grad():
             metrics = {
                 "loss/critic": 0.5
@@ -663,6 +668,9 @@ class SAC(LearnerBase):
                 metrics["loss/entropy"] = entropy_loss
             if log_std is not None:
                 metrics["policy/std"] = log_std.exp().view(self.num_agents, rows, -1).mean(dim=(1, 2))
+            if self.aux_loss_graph_safe():  # otherwise the hook emitted them every gradient step
+                metrics.update(aux_metrics or {})
+                metrics.update(actor_aux_metrics or {})
             metrics.update(self.stats_metrics())
             self.emit_per_agent(metrics, timestep)
 

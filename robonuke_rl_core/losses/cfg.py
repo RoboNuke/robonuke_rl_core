@@ -31,6 +31,11 @@ class LossTermCfg:
     weight: float = MISSING
     #: constructor arguments for the loss class
     kwargs: Dict[str, Any] = field(default_factory=dict)
+    #: let SAC keep ``sac.cuda_graph`` with this term on. Only for a loss class that declares
+    #: ``graph_safe = True`` (device-only ``compute``, no Python value read from a tensor, no use
+    #: of ``ctx.step``); building the hook refuses it otherwise. SAC captures its gradient step
+    #: only when every term is graph-safe; otherwise it runs eagerly, as before
+    graph_safe: bool = False
 
 
 @dataclass

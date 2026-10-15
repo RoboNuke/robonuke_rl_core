@@ -328,10 +328,16 @@ class LearnerBase(Agent):
             step,
         )
 
+    def aux_loss_graph_safe(self) -> bool:
+        """Every ``aux_loss`` hook may run inside a captured CUDA graph (its ``graph_safe``)."""
+        return all(bool(getattr(hook, "graph_safe", False)) for hook in self.aux_loss)
+
     def compute_aux_loss(self, ctx: LossContext) -> Optional[torch.Tensor]:
         """Sum of what the ``aux_loss`` hooks return for ``ctx.target``, or None.
 
-        ``losses.build_aux_losses`` builds the usual hook; a project can append its own.
+        ``losses.build_aux_losses`` builds the usual hook; a project can append its own. The
+        hooks put their metrics in ``ctx.aux_metrics``; the learner emits them when
+        :meth:`aux_loss_graph_safe` (otherwise the hooks did).
         """
         total = None
         for hook in self.aux_loss:

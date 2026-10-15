@@ -67,3 +67,88 @@ def test_a_replayed_graph_step_equals_the_same_step_run_eagerly():
                 assert torch.allclose(a[name], b[name], atol=1e-5), (key, agent, name)
     assert torch.allclose(eager._entropy_coefficient, graphed._entropy_coefficient)
     assert torch.allclose(eager.observation_normalizer.running_mean, graphed.observation_normalizer.running_mean)
+
+
+def test_a_graph_safe_aux_loss_is_captured_and_its_metric_stays_fresh():
+    """With every aux term graph-safe the step is captured with the loss inside it: the weights
+    match the eager step's, and the loss's raw values, returned with the step's other outputs,
+    are each replay's own (not the capture's)."""
+    if not torch.cuda.is_available():
+        pytest.fail("this GPU test needs CUDA")
+    from robonuke_rl_core.losses import LOSSES, AuxLoss, LossesCfg, LossTermCfg, build_aux_losses, register_loss
+
+    class _SquaredActions(AuxLoss):
+        name = "_test_graph_squared_actions"
+        supported_targets = ("policy", "critic")
+        graph_safe = True
+
+        def compute(self, ctx):
+            values = ctx.actions if ctx.target == "policy" else ctx.critic_1_values
+            return values.pow(2).view(ctx.learner.num_agents, -1).mean(dim=1)
+
+    known = dict(LOSSES)
+    register_loss(_SquaredActions)
+    try:
+        device = torch.device("cuda")
+        terms = [LossTermCfg(name=_SquaredActions.name, target=t, weight=0.5, graph_safe=True) for t in ("policy", "critic")]
+        eager = _learner(device)
+        eager.aux_loss.append(build_aux_losses(LossesCfg(terms=terms), 2))
+        assert eager.aux_loss_graph_safe()
+        graphed = copy.deepcopy(eager)
+        graphed._graphs = StepGraphs(warmup=1)
+        mode = (False, True, True)
+        step = lambda learner: (lambda: learner._gradient_step(mode, 16, 10, graph=True))
+
+        seen = []
+        for _ in range(4):
+            state = torch.cuda.get_rng_state()
+            out_g = graphed._graphs.run(mode, step(graphed))
+            got = {k: v.clone() for k, v in {**out_g["critic"]["aux_metrics"], **out_g["actor"]["actor_aux_metrics"]}.items()}
+            torch.cuda.set_rng_state(state)
+            out_e = step(eager)()
+            want = {**out_e["critic"]["aux_metrics"], **out_e["actor"]["actor_aux_metrics"]}
+            assert sorted(got) == sorted(want) == sorted(f"loss/{_SquaredActions.name}_{t}" for t in ("critic", "policy"))
+            for name in want:
+                assert torch.allclose(got[name], want[name], atol=1e-5), name
+            seen.append(got[f"loss/{_SquaredActions.name}_policy"])
+        torch.cuda.synchronize()
+        assert graphed._graphs.captured == 1
+        # replays after the capture produced new values, not the captured ones repeated
+        assert not torch.equal(seen[-1], seen[-2])
+        for key in eager._checkpoint_model_keys():
+            for agent in range(2):
+                a, b = getattr(eager, key).agent_state_dict(agent), getattr(graphed, key).agent_state_dict(agent)
+                for name in a:
+                    assert torch.allclose(a[name], b[name], atol=1e-5), (key, agent, name)
+    finally:
+        LOSSES.clear()
+        LOSSES.update(known)
+
+
+def test_the_built_in_selection_loss_captures_and_replays_to_the_eager_value():
+    """``supervised_selection`` declares ``graph_safe``: capture its compute and replay it."""
+    if not torch.cuda.is_available():
+        pytest.fail("this GPU test needs CUDA")
+    from types import SimpleNamespace
+
+    from robonuke_rl_core.losses import LOSSES, LossContext
+
+    device = torch.device("cuda")
+    loss = LOSSES["supervised_selection"](num_axes=3)
+    prob = torch.rand(8, 3, device=device).clamp(0.05, 0.95)
+    flags = (torch.rand(8, 3, device=device) > 0.5).float()
+    ctx = LossContext(learner=SimpleNamespace(num_agents=2), target="policy", sampled={"in_contact": flags}, policy_outputs={"selection_prob": prob})
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        loss.compute(ctx)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = loss.compute(ctx)
+    for _ in range(3):
+        prob.copy_(torch.rand_like(prob).clamp(0.05, 0.95))
+        flags.copy_((torch.rand_like(flags) > 0.5).float())
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.allclose(out, loss.compute(ctx), atol=1e-6)

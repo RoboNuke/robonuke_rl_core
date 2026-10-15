@@ -16,6 +16,13 @@ could be written as a reward (a penalty on action magnitude, say) belongs in the
 reward, not here. This one cannot — it supervises a *head of the policy network* against a
 per-transition fact the env knows, so it has to reach inside the model's outputs.
 
+**Logging.** The hook writes each term's per-agent raw values into ``ctx.aux_metrics``
+(``loss/<name>_<target>``). Unless every hook on the learner is ``graph_safe`` it also emits
+them itself, on every call, as it always has. When every one is, it does not (Python does not run on a replay of a captured
+CUDA graph): the learner emits them -- PPO after each minibatch, SAC once per update with its
+other update metrics. A term is allowed in a graph when its config says ``graph_safe`` and its
+class declares :attr:`AuxLoss.graph_safe` (see :func:`build_aux_losses`).
+
 A loss may also declare :meth:`AuxLoss.required_memory_keys`: per-transition tensors it
 needs from the replay batch. :func:`build_aux_losses` merges them onto the returned hook as
 ``memory_keys``, the learner creates them in ``_create_memory_tensors`` and fills them from
@@ -75,12 +82,22 @@ class LossContext:
     target_values: Optional[torch.Tensor] = None
     critic_inputs: Optional[Dict[str, torch.Tensor]] = None
 
+    #: written by the aux-loss hook: ``loss/<name>_<target>`` -> ``(num_agents,)`` raw values;
+    #: the learner emits them when the hook is ``graph_safe`` (otherwise the hook already did)
+    aux_metrics: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
+
 
 class AuxLoss:
     """Base class for an auxiliary loss. Constructed with the term's ``kwargs``."""
 
     name: str = ""
     supported_targets: Tuple[str, ...] = ()
+    #: ``compute`` is device work only: tensor ops on what the context holds, no host sync
+    #: (``.item()``, ``bool(tensor)``, ``if tensor.any()``), no Python value computed from a
+    #: tensor, and no use of ``ctx.step`` (a captured graph would keep the value it was captured
+    #: with). Shape checks are fine: shapes are fixed in a graph. Declaring it lets a term's
+    #: ``graph_safe: true`` keep SAC's CUDA graph on
+    graph_safe: bool = False
 
     def __init__(self, **kwargs: Any) -> None:
         if kwargs:
@@ -161,12 +178,22 @@ def _merge_memory_keys(built) -> Dict[str, int]:
     return merged
 
 
+def _learner_emits(learner) -> bool:
+    """The learner emits ``ctx.aux_metrics`` itself: every one of its hooks is graph-safe."""
+    check = getattr(learner, "aux_loss_graph_safe", None)
+    return bool(check()) if callable(check) else False
+
+
 def build_aux_losses(losses_cfg: "LossesCfg", num_agents: int) -> Optional[Callable]:
     """Build the callable the learners put in ``aux_loss``, or None when no term is configured.
 
     The callable returns ``Σ weight * raw.mean()`` for the context's target — ``raw.mean()``
     is a fixed ``1/num_agents`` per agent, so one agent's value never scales another's
-    gradient — and emits each term's per-agent raw values as ``loss/<name>_<target>``.
+    gradient — and writes each term's per-agent raw values into ``ctx.aux_metrics`` as
+    ``loss/<name>_<target>``; it emits them too unless it is ``graph_safe`` (then the learner does).
+
+    It carries ``graph_safe``: true when every term's config asks for it, each of which must be
+    a loss class that declares :attr:`AuxLoss.graph_safe`.
 
     It also carries ``memory_keys``: the union of the terms' ``required_memory_keys``, which
     the learner reads in ``_create_memory_tensors``. Append the hook to ``learner.aux_loss``
@@ -190,6 +217,13 @@ def build_aux_losses(losses_cfg: "LossesCfg", num_agents: int) -> Optional[Calla
                 f"losses.terms[{index}]: loss {term.name!r} does not support target "
                 f"{term.target!r} (supported: {loss_cls.supported_targets})"
             )
+        if term.graph_safe and not loss_cls.graph_safe:
+            raise ValueError(
+                f"losses.terms[{index}]: graph_safe is true but loss {term.name!r} "
+                f"({loss_cls.__module__}:{loss_cls.__qualname__}) does not declare graph_safe = True: "
+                "its compute may sync with the host or read ctx.step, which a captured CUDA graph "
+                "cannot replay. Set graph_safe: false (SAC then runs the update eagerly)."
+            )
         built.append((term, loss_cls(**dict(term.kwargs))))
 
     checked: set = set()
@@ -211,11 +245,13 @@ def build_aux_losses(losses_cfg: "LossesCfg", num_agents: int) -> Optional[Calla
                 checked.add(term.name)
             total = term.weight * raw.mean() if total is None else total + term.weight * raw.mean()
             raw_values[f"loss/{term.name}_{term.target}"] = raw.detach()
-        if raw_values:
+        ctx.aux_metrics.update(raw_values)
+        if raw_values and not _learner_emits(ctx.learner):
             ctx.learner.emit_per_agent(raw_values, ctx.step)
         return total
 
     aux_loss.memory_keys = _merge_memory_keys(built)
+    aux_loss.graph_safe = all(term.graph_safe for term, _ in built)
     return aux_loss
 
 
@@ -241,6 +277,7 @@ class SupervisedSelectionLoss(AuxLoss):
 
     name = "supervised_selection"
     supported_targets = ("policy",)
+    graph_safe = True
     #: the probability is clamped to this before the log, so a saturated head is finite
     EPS = 1.0e-7
     #: the per-transition contact flags, one per selection axis

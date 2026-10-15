@@ -355,34 +355,36 @@ class PPO(LearnerBase):
                         self.cfg.entropy_loss_scale * (keep_f * entropy_per_agent).sum() / num_agents
                     )
 
-                aux = self.compute_aux_loss(
-                    LossContext(
-                        learner=self,
-                        step=timestep,
-                        target="policy",
-                        sampled=sampled,
-                        inputs=inputs,
-                        log_prob=outputs["log_prob"],
-                        policy_outputs=outputs,
-                    )
+                ctx = LossContext(
+                    learner=self,
+                    step=timestep,
+                    target="policy",
+                    sampled=sampled,
+                    inputs=inputs,
+                    log_prob=outputs["log_prob"],
+                    policy_outputs=outputs,
                 )
+                aux = self.compute_aux_loss(ctx)
                 if aux is not None:
                     total_loss = total_loss + aux
+                if ctx.aux_metrics and self.aux_loss_graph_safe():  # otherwise the hook emitted them
+                    self.emit_per_agent(ctx.aux_metrics, timestep)
 
                 value_loss, value_per_agent = self._value_loss(sampled, value_inputs, rows)
                 total_loss = total_loss + value_loss
-                aux = self.compute_aux_loss(
-                    LossContext(
-                        learner=self,
-                        step=timestep,
-                        target="critic",
-                        sampled=sampled,
-                        critic_inputs=value_inputs,
-                        target_values=sampled["returns"],
-                    )
+                ctx = LossContext(
+                    learner=self,
+                    step=timestep,
+                    target="critic",
+                    sampled=sampled,
+                    critic_inputs=value_inputs,
+                    target_values=sampled["returns"],
                 )
+                aux = self.compute_aux_loss(ctx)
                 if aux is not None:
                     total_loss = total_loss + aux
+                if ctx.aux_metrics and self.aux_loss_graph_safe():  # otherwise the hook emitted them
+                    self.emit_per_agent(ctx.aux_metrics, timestep)
 
                 # one combined backward, then each optimizer steps the agents it keeps
                 self.policy_optimizer.zero_grad()

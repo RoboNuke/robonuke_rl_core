@@ -104,6 +104,62 @@ def test_terms_for_another_target_do_not_contribute():
     assert learner.logged == []
 
 
+def test_graph_safe_needs_every_term_to_ask_and_the_class_to_declare_it():
+    one = lambda **kw: LossesCfg(terms=[LossTermCfg(name="action_squared", target="policy", weight=1.0, **kw)])
+    assert build_aux_losses(one(), NUM_AGENTS).graph_safe is False
+    # the test loss does not declare graph_safe: asking for it is refused, naming the loss
+    with pytest.raises(ValueError, match="action_squared"):
+        build_aux_losses(one(graph_safe=True), NUM_AGENTS)
+
+    @register_loss
+    class SafeLoss(ActionSquaredLoss):
+        name = "safe_squared"
+        graph_safe = True
+
+    safe = LossTermCfg(name="safe_squared", target="policy", weight=1.0, graph_safe=True)
+    unsafe = LossTermCfg(name="action_squared", target="policy", weight=1.0)
+    assert build_aux_losses(LossesCfg(terms=[safe]), NUM_AGENTS).graph_safe is True
+    # one eager term keeps the whole hook eager
+    assert build_aux_losses(LossesCfg(terms=[safe, unsafe]), NUM_AGENTS).graph_safe is False
+
+
+def test_the_built_in_selection_loss_is_graph_safe():
+    assert LOSSES["supervised_selection"].graph_safe is True
+
+
+def test_the_values_are_handed_back_and_logged_by_whoever_owns_logging():
+    """The hook always fills ``ctx.aux_metrics``; it logs them itself unless the learner says
+    every hook is graph-safe (then the learner emits them, outside any captured graph)."""
+
+    @register_loss
+    class SafeLoss(ActionSquaredLoss):
+        name = "safe_squared"
+        graph_safe = True
+
+    aux = build_aux_losses(
+        LossesCfg(terms=[LossTermCfg(name="safe_squared", target="policy", weight=1.0, graph_safe=True)]), NUM_AGENTS
+    )
+    actions = torch.randn(NUM_AGENTS * ROWS, ACT_DIM)
+
+    learner = FakeLearner()  # a learner without aux_loss_graph_safe: the hook logs, as always
+    ctx = policy_ctx(learner, actions)
+    aux(ctx)
+    assert len(learner.logged) == NUM_AGENTS
+    assert ctx.aux_metrics["loss/safe_squared_policy"].shape == (NUM_AGENTS,)
+
+    learner = FakeLearner()
+    learner.aux_loss_graph_safe = lambda: True  # the learner emits them itself
+    ctx = policy_ctx(learner, actions)
+    aux(ctx)
+    assert learner.logged == []
+    assert ctx.aux_metrics["loss/safe_squared_policy"].shape == (NUM_AGENTS,)
+
+    learner = FakeLearner()
+    learner.aux_loss_graph_safe = lambda: False  # another hook on the learner runs eagerly
+    aux(policy_ctx(learner, actions))
+    assert len(learner.logged) == NUM_AGENTS
+
+
 def test_no_terms_means_no_hook():
     assert build_aux_losses(LossesCfg(), NUM_AGENTS) is None
 
