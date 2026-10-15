@@ -31,7 +31,13 @@ from pathlib import Path
 
 from robonuke_rl_core.config import dump, load_from_run  # noqa: E402
 from robonuke_rl_core.envs.build import build_env, describe, prepare_task  # noqa: E402
-from robonuke_rl_core.recording import EvalRecorder, install_recorder_camera, termination_causes, video_fps  # noqa: E402
+from robonuke_rl_core.recording import (  # noqa: E402
+    EvalRecorder,
+    install_recorder_camera,
+    render_substeps,
+    termination_causes,
+    video_fps,
+)
 from robonuke_rl_core.evaluation import (  # noqa: E402
     SINGLE_AGENT_OVERRIDE,
     build_eval_policy,
@@ -126,8 +132,11 @@ def main(argv=None, setup=None) -> int:
     stem = Path(args.eval_config).stem
     out_dir = run_dir / "eval" / f"{stem}_{time.strftime('%Y%m%d-%H%M%S')}"
 
+    substeps = 1
     if record:
-        # before gym.make: the camera has to exist in the scene the task clones
+        # before gym.make: the render interval and the camera are scene/sim cfg
+        substeps = render_substeps(cfg.task_cfg, cfg.eval.render_every, cfg.task_overrides)
+        # the camera has to exist in the scene the task clones
         install_recorder_camera(
             cfg.task_name,
             cfg.task_cfg,
@@ -163,19 +172,20 @@ def main(argv=None, setup=None) -> int:
     )
     recorder = None
     if record:
-        fps = video_fps(cfg.eval.video_fps, env)
+        fps = video_fps(cfg.eval.video_fps, env, substeps)
         recorder = EvalRecorder(
             env,
             output_dir=out_dir / "videos",
             fps=fps,
             overlays=cfg.eval.overlays,
-            pad_to=max_episode_length if cfg.eval.video_full_length else None,
+            pad_to=max_episode_length * substeps if cfg.eval.video_full_length else None,
             causes=termination_causes(env),
+            substeps=substeps,
         )
         print(
             f"[eval] recording {cfg.eval.video_width}x{cfg.eval.video_height} @ "
-            f"{fps} fps, overlays={list(cfg.eval.overlays)}"
-            + (f", every video {max_episode_length} frames" if cfg.eval.video_full_length else ""),
+            f"{fps} fps, {substeps} frame(s) per control step, overlays={list(cfg.eval.overlays)}"
+            + (f", every video {max_episode_length * substeps} frames" if cfg.eval.video_full_length else ""),
             flush=True,
         )
 

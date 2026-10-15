@@ -315,7 +315,8 @@ Lab's Factory and Forge tasks raise both at the time limit (`_get_dones` returns
 | `save_state` | bool | `True` | capture the full per-step state (observations, states, actions, rewards, dones, both metric channels, `infos["eval_state"]`) into the eval's `<stem>.parquet` trace, one row per (round, env, step) |
 | `record` | bool | `False` | write one mp4 per (round, env); `--record` forces it on. Use few envs by setting `task.cfg.scene.num_envs` in the eval config. Works on Direct envs (a shim on `_setup_scene`) and manager-based envs (the camera becomes a scene-cfg entry); both need `task.cfg.scene.clone_in_fabric: false` |
 | `overlays` | list[str] | `["hud"]` | registered overlay names, drawn in this order |
-| `video_fps` | int or null | `null` | playback rate of the written mp4s; null = the env's control rate (`1 / step_dt`), i.e. real time |
+| `video_fps` | int or null | `null` | playback rate of the written mp4s; null = real time: the env's control rate (`1 / step_dt`) times the frames per control step |
+| `render_every` | int or null | `null` | recording: a frame every this many physics steps, grabbed inside the control step (sets `task.cfg.sim.render_interval`; must divide the decimation; a layer setting that field to another value is an error); null = one frame per control step |
 | `video_full_length` | bool | `True` | every video is the episode limit long: once an env's episode ends, its last frame is held, darkened, with the cause written across it (the termination term that fired on a manager-based env, through the env's optional `termination_labels`; else `terminal` / `timeout`) |
 | `video_height` | int | `180` | per-env camera height in pixels |
 | `video_width` | int | `240` | per-env camera width in pixels |

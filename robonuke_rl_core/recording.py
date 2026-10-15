@@ -27,6 +27,8 @@ __all__ = [
     "end_card",
     "termination_causes",
     "video_fps",
+    "render_substeps",
+    "SubstepFrames",
     "CameraPlacement",
     "install_recorder_camera",
     "set_camera_active",
@@ -358,12 +360,14 @@ class EvalRecorder:
         camera: Any = None,
         pad_to: Optional[int] = None,
         causes: Any = None,
+        substeps: int = 1,
     ) -> None:
         """``pad_to``: frames every video is padded to (the episode limit), by holding an env's
         last frame with the cause of its end written across it. ``causes``: a callable
         returning, after a step, one label per env for why its episode ended
         (:func:`termination_causes`); without it the label is the outcome (``terminal`` /
-        ``timeout``)."""
+        ``timeout``). ``substeps``: frames per control step; above 1 they are grabbed inside
+        the step, one per ``sim.render()`` (:class:`SubstepFrames`, ``eval.render_every``)."""
         from pathlib import Path
 
         self.env = env
@@ -384,6 +388,10 @@ class EvalRecorder:
         #: per env this round: the last written frame and, once it ended, why
         self._last: Dict[int, Any] = {}
         self._ended: Dict[int, str] = {}
+        self.substeps = int(substeps)
+        if self.substeps < 1:
+            raise ValueError(f"substeps must be >= 1, got {substeps}")
+        self._grabber = SubstepFrames(env, self.camera) if self.substeps > 1 else None
 
     # ------------------------------------------------------------------ the round
     def start_round(self, round_index: int) -> None:
@@ -396,6 +404,9 @@ class EvalRecorder:
         self._returns = {}
         self._last, self._ended = {}, {}
         set_camera_active(self.camera, True)
+        if self._grabber is not None:
+            self._grabber.active = True
+            self._grabber.take()  # nothing from before the round
 
     def capture(
         self,
@@ -409,7 +420,17 @@ class EvalRecorder:
         """Write this step's frame for every env still on its first episode."""
         if self._round is None:
             raise RuntimeError("call start_round() before capture()")
-        frames = read_camera_rgb(self.camera)
+        if self._grabber is None:
+            per_step = [read_camera_rgb(self.camera)]
+        else:
+            per_step = self._grabber.take()
+            if len(per_step) != self.substeps:
+                raise RuntimeError(
+                    f"the step rendered {len(per_step)} frames, expected {self.substeps}: "
+                    "sim.render_interval must divide the decimation and the env must render "
+                    "inside its step (a camera in the scene, Isaac Lab's ManagerBased/Direct step)"
+                )
+        frames = per_step[-1]
         if frames.shape[0] != self.num_envs:
             raise RuntimeError(
                 f"the camera returned {frames.shape[0]} frames for {self.num_envs} envs; the "
@@ -423,7 +444,7 @@ class EvalRecorder:
             metric_lists = {
                 name: _flat(value, self.num_envs) for name, value in (metrics or {}).items()
             }
-            numpy_frames = frames.numpy()
+            numpy_steps = [f.numpy() for f in per_step]
             labels = None
             for env in keep:
                 reward = float(rewards_list[env]) if rewards_list else 0.0
@@ -440,10 +461,11 @@ class EvalRecorder:
                         name: float(values[env]) for name, values in metric_lists.items()
                     },
                 )
-                frame = numpy_frames[env]
-                for overlay in self.overlays:
-                    frame = overlay.apply(frame, step)
-                self._writer(env).append(frame)
+                for numpy_frames in numpy_steps:
+                    frame = numpy_frames[env]
+                    for overlay in self.overlays:
+                        frame = overlay.apply(frame, step)
+                    self._writer(env).append(frame)
                 self._last[env] = frame
                 if step.done and env not in self._ended:
                     if labels is None and self.causes is not None:
@@ -451,7 +473,7 @@ class EvalRecorder:
                     label = labels[env] if labels and labels[env] else step.outcome
                     self._ended[env] = str(label)
                 key = (self._round, env)
-                self.frame_counts[key] = self.frame_counts.get(key, 0) + 1
+                self.frame_counts[key] = self.frame_counts.get(key, 0) + len(numpy_steps)
         self._step += 1
 
     def end_round(self) -> None:
@@ -469,6 +491,9 @@ class EvalRecorder:
         for writer in self._writers.values():
             writer.close()
         set_camera_active(self.camera, False)
+        if self._grabber is not None:
+            self._grabber.active = False
+            self._grabber.take()
         self._writers = {}
         self._round = None
 
@@ -537,12 +562,85 @@ def termination_causes(env: Any):
     return causes
 
 
-def video_fps(cfg_value: Optional[int], env: Any) -> int:
-    """``eval.video_fps``, or, when null, the env's control rate (real-time playback)."""
+def video_fps(cfg_value: Optional[int], env: Any, frames_per_step: int = 1) -> int:
+    """``eval.video_fps``, or, when null, real-time playback: the env's control rate times
+    the frames recorded per control step."""
     if cfg_value:
         return int(cfg_value)
     step_dt = float(getattr(getattr(env, "unwrapped", env), "step_dt"))
-    return max(1, round(1.0 / step_dt))
+    return max(1, round(frames_per_step / step_dt))
+
+
+def render_substeps(env_cfg: Any, render_every: Optional[int], task_overrides: Dict[str, str]) -> int:
+    """``eval.render_every`` -> frames per control step, setting ``env_cfg.sim.render_interval``.
+    Call **before** ``gym.make``.
+
+    Null: one frame per control step, the cfg untouched. Otherwise the env renders every
+    ``render_every`` physics steps, which must divide its decimation so every control step
+    holds the same number of frames. A layer that also set ``task.cfg.sim.render_interval``
+    to something else is a conflict and raises.
+    """
+    if not render_every:
+        return 1
+    every = int(render_every)
+    decimation = int(env_cfg.decimation)
+    if every > decimation or decimation % every:
+        raise ValueError(
+            f"eval.render_every={every} must divide the task's decimation ({decimation}): "
+            f"pick one of {[d for d in range(1, decimation + 1) if decimation % d == 0]}"
+        )
+    current = int(env_cfg.sim.render_interval)
+    if "sim.render_interval" in task_overrides and current != every:
+        raise ValueError(
+            f"eval.render_every={every} but {task_overrides['sim.render_interval']} set "
+            f"task.cfg.sim.render_interval={current}; set one of them"
+        )
+    env_cfg.sim.render_interval = every
+    return decimation // every
+
+
+class SubstepFrames:
+    """Camera frames from inside the control step, one per ``sim.render()``.
+
+    Isaac Lab's step runs ``decimation`` physics steps, each ``sim.step(render=False)``, then
+    ``sim.render()`` every ``sim.render_interval`` steps, then ``scene.update()``. This wraps
+    those three calls on the live env: a render since the last physics step marks the next
+    ``scene.update`` as one whose camera image is fresh, and the frame is read right there.
+    Reset renders (after the last update of a step) are dropped by the next physics step.
+    Only collects while ``active``.
+    """
+
+    def __init__(self, env: Any, camera: Any) -> None:
+        unwrapped = getattr(env, "unwrapped", env)
+        sim, scene = unwrapped.sim, unwrapped.scene
+        self.camera = camera
+        self.active = False
+        self.frames: List[Any] = []
+        self._rendered = False
+        step, render, update = sim.step, sim.render, scene.update
+
+        def step_hook(*args: Any, **kwargs: Any) -> Any:
+            self._rendered = False
+            return step(*args, **kwargs)
+
+        def render_hook(*args: Any, **kwargs: Any) -> Any:
+            out = render(*args, **kwargs)
+            self._rendered = True
+            return out
+
+        def update_hook(*args: Any, **kwargs: Any) -> Any:
+            out = update(*args, **kwargs)
+            if self._rendered and self.active:
+                self.frames.append(read_camera_rgb(self.camera).clone())  # the buffer is reused
+            self._rendered = False
+            return out
+
+        sim.step, sim.render, scene.update = step_hook, render_hook, update_hook
+
+    def take(self) -> List[Any]:
+        """The frames since the last call, oldest first."""
+        frames, self.frames = self.frames, []
+        return frames
 
 
 def _flat(value: Any, num_envs: int) -> list:

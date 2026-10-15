@@ -72,8 +72,11 @@ class EvalCfg:
     record: bool = False
     #: registered overlay names, drawn in this order
     overlays: List[str] = field(default_factory=lambda: ["hud"])
-    #: playback rate; null = the env's control rate (real time)
+    #: playback rate; null = real time (the control rate x the frames per control step)
     video_fps: Optional[int] = None
+    #: recording: a frame every this many physics steps (it sets ``sim.render_interval``;
+    #: must divide the decimation); null = one frame per control step
+    render_every: Optional[int] = None
     video_height: int = 180
     video_width: int = 240
     #: every video is the episode limit long: an env's last frame is held, with the cause
@@ -83,7 +86,7 @@ class EvalCfg:
     def validate(self, cfg: Any) -> None:
         if self.num_rollouts < 1:
             raise ValueError(f"eval.num_rollouts must be >= 1, got {self.num_rollouts}")
-        for name in ("video_fps", "video_height", "video_width"):
+        for name in ("video_fps", "video_height", "video_width", "render_every"):
             value = getattr(self, name)
             if value is not None and value < 1:
                 raise ValueError(f"eval.{name} must be >= 1, got {value}")

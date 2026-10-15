@@ -355,3 +355,106 @@ def test_video_fps_defaults_to_the_control_rate():
 
     env = type("E", (), {"step_dt": 0.05})()
     assert video_fps(None, env) == 20 and video_fps(30, env) == 30
+
+
+def test_video_fps_counts_the_frames_per_control_step():
+    from robonuke_rl_core.recording import video_fps
+
+    env = type("E", (), {"step_dt": 0.1})()
+    assert video_fps(None, env, 3) == 30 and video_fps(12, env, 3) == 12
+
+
+def test_render_every_sets_the_render_interval_and_must_divide_the_decimation():
+    from types import SimpleNamespace
+
+    from robonuke_rl_core.recording import render_substeps
+
+    def cfg(interval=12):
+        return SimpleNamespace(decimation=12, sim=SimpleNamespace(render_interval=interval))
+
+    untouched = cfg()
+    assert render_substeps(untouched, None, {}) == 1 and untouched.sim.render_interval == 12
+    env_cfg = cfg()
+    assert render_substeps(env_cfg, 4, {}) == 3 and env_cfg.sim.render_interval == 4
+    for bad in (5, 24):
+        with pytest.raises(ValueError, match="divide"):
+            render_substeps(cfg(), bad, {})
+    with pytest.raises(ValueError, match="set one of them"):
+        render_substeps(cfg(2), 4, {"sim.render_interval": "eval.yaml"})
+    assert render_substeps(cfg(4), 4, {"sim.render_interval": "eval.yaml"}) == 3  # the same value: fine
+
+
+class SubstepEnv:
+    """Isaac Lab's step loop in miniature: decimation physics steps, a render every
+    render_interval, a scene update after each; the camera shows the physics step count."""
+
+    def __init__(self, camera, decimation=12, render_interval=4):
+        self.num_envs = NUM_ENVS
+        self.camera, self.decimation, self.render_interval = camera, decimation, render_interval
+        self.count = 0
+        env = self
+
+        class Sim:
+            def step(self, render=False):
+                env.count += 1
+
+            def render(self):
+                rgb = env.camera.data.output["rgb"]
+                rgb[:] = env.count
+
+        class Scene:
+            def update(self, dt=0.0):
+                pass
+
+        self.sim, self.scene = Sim(), Scene()
+
+    def step(self):
+        for _ in range(self.decimation):
+            self.sim.step(render=False)
+            if self.count % self.render_interval == 0:
+                self.sim.render()
+            self.scene.update()
+
+    def reset(self):
+        self.sim.render()  # a reset render, after the step's last update
+
+
+def test_substep_frames_record_every_render_inside_the_step(tmp_path):
+    camera = FakeCamera()
+    env = SubstepEnv(camera)
+    rec = EvalRecorder(env, output_dir=tmp_path / "videos", fps=30, overlays=(), camera=camera, substeps=3, pad_to=9)
+    env.step()  # before the round: not recorded
+    rec.start_round(0)
+    yes = torch.ones(NUM_ENVS, dtype=torch.bool)
+    seen = []
+    original = rec._writer
+
+    def spy(index):
+        writer = original(index)
+        if index == 0 and not hasattr(writer, "_spied"):
+            append = writer.append
+            writer.append = lambda frame: (seen.append(int(frame[0, 0, 0])), append(frame))[1]
+            writer._spied = True
+        return writer
+
+    rec._writer = spy
+    for _ in range(2):
+        env.step()
+        env.reset()  # the reset render must not add a frame
+        rec.capture(yes)
+    assert seen == [16, 20, 24, 28, 32, 36]  # physics steps 4, 8, 12 of each control step
+    rec.end_round()
+    assert rec.frame_counts[(0, 0)] == 9  # padded to the episode limit in frames
+    env.step()
+    with pytest.raises(RuntimeError, match="start_round"):
+        rec.capture(yes)
+
+
+def test_substep_frames_fail_loud_when_the_step_renders_a_different_count(tmp_path):
+    camera = FakeCamera()
+    env = SubstepEnv(camera, render_interval=6)  # 2 renders per step, the recorder wants 3
+    rec = EvalRecorder(env, output_dir=tmp_path / "videos", fps=30, overlays=(), camera=camera, substeps=3)
+    rec.start_round(0)
+    env.step()
+    with pytest.raises(RuntimeError, match="rendered 2 frames, expected 3"):
+        rec.capture(torch.ones(NUM_ENVS, dtype=torch.bool))
