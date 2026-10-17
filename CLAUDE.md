@@ -768,6 +768,11 @@ override of `wandb.project`, `wandb.group` or `wandb.tags`, naming the flag inst
 sources of truth for a run's name is how runs get lost. Every computed group is checked
 against the same rule `WandbCfg.validate` applies, before anything is queued.
 
+The job runs `hpc.train_script` (default `scripts/train.py`, relative to the project root,
+checked to exist before anything is queued). `train.main` runs sac / ppo only, so an
+experiment of a project-registered learner names that project's own entry script there
+(`hpc.train_script: scripts/train_bc.py`).
+
 ### Three rules that shape the code
 
 * **Import discipline.** Nothing in `robonuke_rl_core.hpc` may import torch, wandb or Isaac

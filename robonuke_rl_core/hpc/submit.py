@@ -59,6 +59,7 @@ __all__ = [
     "run_names",
     "existing_run_dir",
     "preflight",
+    "check_train_scripts",
     "log_paths",
     "python_command",
     "forwarded",
@@ -381,6 +382,18 @@ def preflight(submits: Sequence[SubmitConfig], *, dry_run: bool) -> None:
             raise SubmitError(
                 f"{submit.path}: hpc.sif_image {submit.hpc.sif_image!r} is not a file. Build "
                 "it with hpc/build_image.sh, or point the field at the built image."
+            )
+
+
+def check_train_scripts(submits: Sequence[SubmitConfig], project_root: Path) -> None:
+    """Every config's ``hpc.train_script`` is a file in the project clone -- before anything is
+    queued, so a typo does not become a job that dies at startup."""
+    for submit in submits:
+        script = Path(project_root) / submit.hpc.train_script
+        if not script.is_file():
+            raise SubmitError(
+                f"{submit.path}: hpc.train_script {submit.hpc.train_script!r} is not a file under "
+                f"the project root {project_root}"
             )
 
 

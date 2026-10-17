@@ -400,3 +400,37 @@ def test_the_launchers_never_produce_a_whitespace_argument(tmp_path, capsys):
     paths = tree(tmp_path, names=("alpha",))
     code, lines, _ = train(paths, "--tag", "one", "--tag", "two", capsys=capsys)
     assert code == 0 and lines
+
+
+# ------------------------------------------------------------------ hpc.train_script
+def test_a_config_s_train_script_is_the_entry_the_job_runs(tmp_path, capsys):
+    """A project learner (e.g. BC) has its own entry script; the config names it."""
+    paths = tree(tmp_path, names=("alpha",), extra="hpc:\n  train_script: scripts/train_bc.py\n")
+    project = tmp_path / "project"
+    (project / "scripts").mkdir(parents=True)
+    (project / "scripts" / "train_bc.py").write_text("")
+    code, lines, _ = train(paths, "--project_root", str(project), capsys=capsys)
+    assert code == 0
+    parts = lines[0].split()
+    script = str(S.job_script())
+    assert parts[parts.index(script) + 1 : parts.index(script) + 3] == ["python", "scripts/train_bc.py"]
+    # and a sweep follows it too
+    argv = [str(paths["root"]), "--project", "P", "--group_prefix", "G", "--dry_run", "--project_root", str(project),
+            "--sweep_param", "sac.actor_lr", "--label", "lr", "--value", "1.0e-4"]
+    assert launch_sweep.main(argv) == 0
+    sweep = sbatch_lines(capsys.readouterr().out)[0].split()
+    assert sweep[sweep.index(script) + 2] == "scripts/train_bc.py"
+
+
+def test_a_missing_train_script_aborts_before_anything_is_queued(tmp_path, capsys):
+    paths = tree(tmp_path, names=("alpha",), extra="hpc:\n  train_script: scripts/nope.py\n")
+    code, lines, out = train(paths, "--project_root", str(tmp_path), capsys=capsys)
+    assert code == 2 and not lines and "hpc.train_script" in out
+
+
+@pytest.mark.parametrize("bad", ["/abs/train.py", "~/train.py", "scripts/train", "scripts/my train.py", ""])
+def test_a_bad_train_script_is_rejected(bad):
+    from robonuke_rl_core.hpc.cfg import HpcCfg
+
+    with pytest.raises(ValueError, match="train_script"):
+        HpcCfg(train_script=bad).validate(None)

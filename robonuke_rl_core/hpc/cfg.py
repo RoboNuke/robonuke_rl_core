@@ -54,6 +54,10 @@ class HpcCfg:
     signal: str = "TERM@300"
     #: where the ``.out`` / ``.err`` land, relative to the project root
     exp_log_dir: str = "exp_logs"
+    #: the entry script ``launch_train`` / ``launch_sweep`` run, relative to the project root.
+    #: The package's ``train.main`` runs sac / ppo only, so a project-registered learner names
+    #: its own entry script here (e.g. ``scripts/train_bc.py``) in its experiment config
+    train_script: str = "scripts/train.py"
 
     # ---- container ----
     #: absolute path to the ``.sif`` on the cluster. Required at submit.
@@ -86,6 +90,17 @@ class HpcCfg:
         if self.signal and not SIGNAL_RE.match(self.signal):
             raise ValueError(
                 f"hpc.signal must be SIG@seconds, got {self.signal!r} (e.g. 'TERM@300')"
+            )
+        script = self.train_script
+        if (
+            not script
+            or any(character.isspace() for character in script)
+            or script.startswith(("/", "~"))
+            or not script.endswith(".py")
+        ):
+            raise ValueError(
+                f"hpc.train_script must be a whitespace-free .py path relative to the project "
+                f"root, got {script!r} (e.g. 'scripts/train.py')"
             )
         for index, bind in enumerate(self.binds):
             if not bind or any(character.isspace() for character in bind):

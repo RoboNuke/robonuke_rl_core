@@ -444,6 +444,7 @@ an unattended run must not be killed by its logging.
 | `cpus` | int | `12` | `-c`, CPUs per task |
 | `signal` | str | `"TERM@300"` | `--signal`; SLURM warns the job this far ahead of the walltime kill. The job `exec`s python, so the signal reaches the training process and not bash |
 | `exp_log_dir` | str | `"exp_logs"` | where `.out` / `.err` land, relative to the project root; logs go to `{exp_log_dir}/{project}/{name}_%j.out` |
+| `train_script` | str | `"scripts/train.py"` | the entry script `launch_train` / `launch_sweep` run, relative to the project root (checked to exist before anything is queued); a project-registered learner names its own, e.g. `scripts/train_bc.py`, since `train.main` runs sac / ppo only |
 | `sif_image` | str | `""` | path to the `.sif` on the cluster (`~` is expanded). Nothing is installed into it — the job binds both repos and puts them on `PYTHONPATH` — so the existing `ghvic.sif` is used as-is; see `examples/hpc.yaml`. **Required at submit** |
 | `apptainer_bin` | str | `"apptainer"` | or `"singularity"` |
 | `container_python` | str | `"python"` | the python inside the image |

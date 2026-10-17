@@ -127,6 +127,7 @@ def _run(args: argparse.Namespace, overrides: Sequence[str]) -> int:
 
     package = Path(args.package_root).resolve() if args.package_root else package_root()
     project = Path(args.project_root).resolve() if args.project_root else project_root()
+    S.check_train_scripts([config for config, _ in planned], project)
 
     submissions: List[S.Submission] = []
     for config, group in planned:
@@ -141,7 +142,7 @@ def _run(args: argparse.Namespace, overrides: Sequence[str]) -> int:
 
         tags = S.merge_tags(config.tags, args.tags)
         argv = [
-            "scripts/train.py",
+            config.hpc.train_script,
             "--config",
             str(config.path),
             "--headless",
