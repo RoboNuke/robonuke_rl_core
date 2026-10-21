@@ -611,6 +611,7 @@ def run_eval(
     save_state: bool = True,
     recorder: Any = None,
     device: Optional[Any] = None,
+    progress: bool = False,
 ) -> "EvalResult":
     """Collect ``num_rollouts`` valid episodes in rounds, under the first-episode rule.
 
@@ -621,10 +622,19 @@ def run_eval(
     exposes ``policy.reset()``, which is called right after each round's global reset, so
     nothing from the previous round leaks into the next. ``recorder``, when given, follows the same ``start_round`` / ``capture`` /
     ``end_round`` protocol as the state writer and sees the same valid mask.
+
+    ``progress``: a tqdm bar (stderr) of episode steps out of ``num_rollouts *
+    max_episode_length``, i.e. as if every episode ran to its time limit; an episode that
+    closes early adds the steps it did not use when it closes, so the bar ends at the total.
     """
     num_envs = int(env.num_envs)
     accounting = EvalAccounting(num_envs, max_episode_length, device)
     writer = EvalStateWriter(num_envs) if save_state else None
+    bar = None
+    if progress:
+        from tqdm import tqdm
+
+        bar = tqdm(total=int(num_rollouts) * int(max_episode_length), desc="eval", unit="step", dynamic_ncols=True)
 
     for index, active in enumerate(eval_rounds(num_rollouts, num_envs)):
         # every generator the reset draws from, not torch alone (Isaac Sim's set_seed)
@@ -640,7 +650,7 @@ def run_eval(
         if recorder is not None:
             recorder.start_round(index)
 
-        for _ in range(max_episode_length):
+        for step in range(max_episode_length):
             if not bool(accounting.valid.any()):
                 # every active env has closed its first episode; the rest of the budget would
                 # only step episodes that are masked out anyway. Isaac Lab tasks time out at
@@ -657,6 +667,10 @@ def run_eval(
                 metrics=metrics,
                 episode_metrics=episode_metrics,
             )
+            if bar is not None:
+                # one step per counted episode, plus the unused budget of each that closed now
+                closed = int((valid & ~accounting.valid).sum())
+                bar.update(int(valid.sum()) + closed * (max_episode_length - step - 1))
             if writer is not None:
                 writer.capture(
                     valid,
@@ -686,6 +700,9 @@ def run_eval(
             writer.end_round()
         if recorder is not None:
             recorder.end_round()
+
+    if bar is not None:
+        bar.close()
 
     return EvalResult(accounting=accounting, state=writer)
 

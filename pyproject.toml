@@ -20,6 +20,7 @@ dependencies = [
     "pandas",
     "pyarrow",
     "imageio[ffmpeg]",
+    "tqdm",  # run_eval(progress=True)
 ]
 
 [project.optional-dependencies]
