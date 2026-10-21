@@ -56,7 +56,9 @@ Load order: class defaults and task defaults → most-base file → … → pass
 7. Walk the task dict against the defaults' types (OmegaConf does not type it): int is fine
    for float **and is converted to one** (Isaac Lab's `from_dict` needs
    `isinstance(value, type(current))`), bool is not an int or float, a `None` default accepts
-   anything. The checked copy is what the env gets, and it goes back into `root` so the dump
+   anything, and an explicit `null` is accepted for any field or sub-config, as `from_dict`
+   takes it (a term switched off, a value left to the asset; an env writes these into its own
+   cfg, so a run's `resolved_config.yaml` carries them). The checked copy is what the env gets, and it goes back into `root` so the dump
    matches.
 8. Build the objects: `to_object` per section, `apply_task_cfg` for the env cfg.
 9. Derive `run_names = [f"{group}_a{i}"]`.
@@ -216,6 +218,9 @@ The LR schedule is `lr_at(update, total_updates, lr, lr_end, schedule)`: `consta
 A **project learner** that brings its own entry script and loop (no package models,
 memory or `LearnerBase`) only needs `register_learner("<name>")` in its `setup()`, so
 `trainer.learner` accepts it; `train.main` refuses it with a pointer to the project's script.
+Eval and debug load its checkpoints once `setup()` also calls
+`register_eval_policy("<name>", fn, best_checkpoint="<its best file>")`; the best file is what
+`--checkpoint best` (the default) downloads for its runs.
 A project adds env wrappers to every env the package builds (train, eval, debug) with
 `envs.build.register_env_wrapper(fn)` in `setup()`; `build_env` applies them outside all
 package wrappers, as `fn(cfg, env, task_name) -> env`.
@@ -444,7 +449,8 @@ wrapper that taps the env's own hooks. Nothing re-derives another component's nu
 * **Files go up as plain run files, never as Artifacts.** `resolved_config.yaml` once and each
   checkpoint as it is written, stored under their base names (`run.save(..., policy="now")`),
   because eval downloads them back by name. An eval launched with `--run` pushes its own
-  outputs back to the *same* training run under `eval/<eval-config-stem>_<timestamp>/`, and
+  outputs back to the *same* training run under `videos/<eval-config-stem>_<timestamp>/` (it
+  recorded) or `eval/<eval-config-stem>_<timestamp>/`, and
   logs no metrics: the parquet trace is the data. `wandb` is imported lazily, so the package imports
   without it. Runs are created with `reinit="create_new"` and logged through their own
   `run.log(data, step=...)` — never the global `wandb.log`, which with several live runs would
@@ -648,21 +654,27 @@ a one-agent shell and give it every env, so the trained run's agent count is not
 left in place, `trainer.validate`'s divisibility rule rejects any eval env count that does not
 divide by it (64 envs over a 3-agent run), and the eval's own `resolved_config.yaml` would
 claim an agent count that never ran. `--checkpoint` takes `best` (default), a step number
-or an exact file name. The policy is a 1-agent shell whatever the run trained, loaded with
+or an exact file name; `best` is `ckpt_best.ckpt` for the package's learners and, for a project
+learner, the file it registered (`register_eval_policy(name, fn, best_checkpoint=...)`), looked
+up from the run's `trainer.learner` before the checkpoint is downloaded. The policy is a 1-agent shell whatever the run trained, loaded with
 `load_agent(..., with_optimizer=False)`, normalizers frozen, `mean_actions` unless
 `eval.deterministic: false`.
 
 ### What an eval writes
 
-Under `<run dir>/eval/<eval-config-stem>_<timestamp>/`: `summary.yaml` (aggregates plus one
+In the run's local directory, beside its `checkpoints/` -- `--local`'s, or for `--run` where
+training writes that run (`local_run_dir`: `{trainer.output_dir}/{wandb.project}/{wandb.group}/`
+the wandb run's name, made if missing; never the download cache) -- an eval that records writes
+`videos/<eval-config-stem>_<timestamp>/` and any other `eval/<eval-config-stem>_<timestamp>/`
+(`eval_output_dir`): `summary.yaml` (aggregates plus one
 row per episode; each metric gets a `/mean`, and a `/std` **only where it carries
 information** — the std of a 0/1 column is `sqrt(p(1-p))`, so beside the mean it can only
 restate it, while inviting the reading that a 0.89 success rate with a 0.31 "std" says
 something about spread between episodes), `<stem>.parquet` (the per-step trace: one row per valid (round, env, step),
 vector signals expanded to `name_0..k`, NaN back-fill so it stays rectangular),
-`resolved_config.yaml` (the eval's own, so it reproduces like a run), and `videos/` when
-recording. With `--run`, those same files go back to the training run under
-`eval/<stem>_<timestamp>/`; nothing is ever logged as a wandb metric.
+`resolved_config.yaml` (the eval's own, so it reproduces like a run), and the mp4s
+(`round<r>_env<e>.mp4`) when recording. With `--run`, those same files go back to the training
+run under the same `videos/...` or `eval/...` path; nothing is ever logged as a wandb metric.
 
 ### Capture an env signal in eval
 
@@ -676,9 +688,16 @@ recording. With `--run`, those same files go back to the training run under
 
 Subclass `Overlay` in the project, set `name`, implement `apply(frame, step) -> frame` where
 `frame` is `(H, W, 3)` uint8 and `step` is a `StepData` (env, step, reward, return so far,
-the done flags, that env's metric values), decorate with `@register_overlay` at import time,
+the done flags, that env's metric values and its `eval_state` entries as `step.state`), decorate with `@register_overlay` at import time,
 and list the name in `eval.overlays`. The package ships `hud`; an unknown name raises when
-the config loads, not when the camera starts rolling.
+the config loads, not when the camera starts rolling. The reward and return an overlay sees are
+the env's times the recorder's `reward_scale`: eval passes `manager_reward_scale(env)`, which
+undoes Isaac Lab's manager-based `weight * step_dt` scaling (a success of 1 shows as 1, not
+0.1); the parquet and summary keep the env's own values. An overlay that needs the whole
+episode before its first frame (a timeline marking phases still to come) sets
+`whole_episode = True` and implements `start_episode(steps)`: the recorder then writes each
+env's raw frames to a lossless scratch mp4 while the round runs and draws every overlay at
+`end_round`, after handing each overlay that (round, env)'s `StepData` list.
 
 ### Debug the env or the policy
 

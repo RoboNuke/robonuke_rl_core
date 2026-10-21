@@ -38,6 +38,7 @@ class FakeFile:
 class FakeRun:
     def __init__(self, run_id: str, name: str, files: dict):
         self.id, self.display_name, self._files = run_id, name, files
+        self.name = name  # wandb's Run.name is the display name
         self.asked: list[str] = []
         self.uploaded: list[tuple[str, str]] = []
 
@@ -166,25 +167,70 @@ def test_a_missing_local_config_or_checkpoint_raises_with_what_it_looked_for(tmp
     assert checkpoint_name(5) in str(err.value)  # it says what is there instead
 
 
+def test_best_means_the_file_a_project_learner_registered_as_its_best(tmp_path):
+    from robonuke_rl_core import evaluation
+
+    evaluation.register_eval_policy("my_bc", lambda *a: None, best_checkpoint="actor_best.pt")
+    try:
+        run = FakeRun("bc1", "bc_a0", {
+            RESOLVED_NAME: FakeFile(RESOLVED_NAME, 120, "trainer:\n  learner: my_bc\n"),
+            "actor_best.pt": FakeFile("actor_best.pt", 2048),
+        })
+        directory = fetch_wandb_run("ent/proj/bc1", "best", tmp_path, api=FakeApi({"ent/proj/bc1": run}))
+        assert run.asked == [RESOLVED_NAME, "actor_best.pt"]  # the config first, then its best
+        learner = evaluation.run_learner(directory / RESOLVED_NAME)
+        assert learner == "my_bc"
+        assert find_checkpoint(directory, "best", learner) == directory / "checkpoints" / "actor_best.pt"
+        assert checkpoint_file("best", "sac") == CHECKPOINT_BEST  # the package's own learners unchanged
+    finally:
+        evaluation.EVAL_POLICY_BUILDERS.pop("my_bc", None)
+        evaluation.BEST_CHECKPOINTS.pop("my_bc", None)
+
+
+# ------------------------------------------------------------------ where results land
+def test_the_local_run_name_is_the_wandb_runs_display_name():
+    from robonuke_rl_core.evaluation import wandb_run_name
+
+    run = a_run("abc123", "grp_a2")
+    api = FakeApi({"ent/proj/abc123": run}, named={("ent/proj", "grp_a2"): [run]})
+    assert wandb_run_name("ent/proj/abc123", api=api) == "grp_a2"  # by id
+    assert wandb_run_name("ent/proj/grp_a2", api=api) == "grp_a2"  # by name
+    with pytest.raises(ValueError):
+        wandb_run_name("proj/abc123", api=api)
+
+
+def test_an_eval_lands_beside_the_runs_checkpoints_in_videos_or_eval(tmp_path):
+    from types import SimpleNamespace
+
+    from robonuke_rl_core.evaluation import eval_output_dir, local_run_dir
+
+    cfg = SimpleNamespace(trainer=SimpleNamespace(output_dir=str(tmp_path / "runs")),
+                          wandb=SimpleNamespace(project="proj", group="grp"))
+    run_dir = local_run_dir(cfg, "grp_a2")  # training's layout (learners.base.run_dirs)
+    assert run_dir == tmp_path / "runs" / "proj" / "grp" / "grp_a2"
+    assert eval_output_dir(run_dir, "quick", True, "20260101-000000") == run_dir / "videos" / "quick_20260101-000000"
+    assert eval_output_dir(run_dir, "quick", False, "20260101-000000") == run_dir / "eval" / "quick_20260101-000000"
+
+
 # ------------------------------------------------------------------ results back to the run
-def test_eval_results_upload_under_an_eval_prefix(tmp_path):
+def test_eval_results_upload_under_their_folder_in_the_run(tmp_path):
     from robonuke_rl_core.evaluation import upload_eval_results
 
     run = a_run()
     api = FakeApi({"ent/proj/abc123": run})
-    out_dir = tmp_path / "eval" / "quick_20260101-000000"
-    (out_dir / "videos").mkdir(parents=True)
+    out_dir = tmp_path / "videos" / "quick_20260101-000000"
+    out_dir.mkdir(parents=True)
     (out_dir / "summary.yaml").write_text("summary: {}\n")
     (out_dir / "quick.parquet").write_bytes(b"PAR1")
-    (out_dir / "videos" / "round0_env0.mp4").write_bytes(b"mp4")
+    (out_dir / "round0_env0.mp4").write_bytes(b"mp4")
 
     names = upload_eval_results("ent/proj/abc123", out_dir, tmp_path, api=api)
 
-    # stored paths carry the eval-config stem and timestamp, so repeat evals never collide
+    # stored paths carry the folder, the eval-config stem and timestamp, so repeat evals never collide
     assert names == [
-        "eval/quick_20260101-000000/quick.parquet",
-        "eval/quick_20260101-000000/summary.yaml",
-        "eval/quick_20260101-000000/videos/round0_env0.mp4",
+        "videos/quick_20260101-000000/quick.parquet",
+        "videos/quick_20260101-000000/round0_env0.mp4",
+        "videos/quick_20260101-000000/summary.yaml",
     ]
     assert [root for _, root in run.uploaded] == [str(tmp_path)] * 3
 

@@ -18,6 +18,7 @@ from robonuke_rl_core.recording import (
     Overlay,
     StepData,
     build_overlays,
+    manager_reward_scale,
     register_overlay,
 )
 
@@ -455,3 +456,113 @@ def test_substep_frames_fail_loud_when_the_step_renders_a_different_count(tmp_pa
     env.step()
     with pytest.raises(RuntimeError, match="rendered 2 frames, expected 3"):
         rec.capture(torch.ones(NUM_ENVS, dtype=torch.bool))
+
+
+def test_the_overlay_sees_each_envs_own_eval_state(tmp_path, clean_registry):
+    seen: list[StepData] = []
+
+    class Spy(Overlay):
+        name = "spy"
+
+        def apply(self, frame, step):
+            seen.append(step)
+            return frame
+
+    register_overlay(Spy)
+    rec = recorder(tmp_path, overlays=("spy",))
+    rec.start_round(0)
+    rec.capture(
+        torch.tensor([True, False, True]),
+        rewards=torch.zeros(NUM_ENVS, 1),
+        eval_state={"phase": torch.tensor([1.0, 2.0, 3.0]), "wrench": torch.arange(18.0).view(NUM_ENVS, 6)},
+    )
+    rec.capture(torch.tensor([True, False, False]), rewards=torch.zeros(NUM_ENVS, 1))
+    rec.end_round()
+
+    assert [s.env for s in seen] == [0, 2, 0]
+    assert seen[0].state["phase"] == pytest.approx(1.0) and isinstance(seen[0].state["phase"], float)
+    np.testing.assert_array_equal(seen[1].state["wrench"], np.arange(12.0, 18.0))  # env 2's row, flat
+    assert seen[2].state == {}  # a step without the channel
+
+
+def test_the_overlays_see_the_reward_times_the_reward_scale(tmp_path, clean_registry):
+    seen: list[StepData] = []
+
+    class Spy(Overlay):
+        name = "spy"
+
+        def apply(self, frame, step):
+            seen.append(step)
+            return frame
+
+    register_overlay(Spy)
+    rec = EvalRecorder(FakeEnv(), output_dir=tmp_path / "videos", fps=10, overlays=("spy",), camera=FakeCamera(),
+                       reward_scale=10.0)
+    rec.start_round(0)
+    for _ in range(2):
+        rec.capture(torch.tensor([True, False, False]), rewards=torch.full((NUM_ENVS, 1), 0.1))
+    rec.end_round()
+    assert [s.reward for s in seen] == pytest.approx([1.0, 1.0])
+    assert seen[-1].total_reward == pytest.approx(2.0)
+
+
+def test_the_manager_reward_scale_undoes_isaac_labs_step_dt():
+    class Manager:
+        reward_manager, step_dt = object(), 0.1
+
+    class Direct:
+        step_dt = 0.1
+
+    class Wrapped:
+        unwrapped = Manager()
+
+    assert manager_reward_scale(Manager()) == pytest.approx(10.0)
+    assert manager_reward_scale(Wrapped()) == pytest.approx(10.0)
+    assert manager_reward_scale(Direct()) == 1.0  # a direct env's reward is its own
+
+
+def test_a_whole_episode_overlay_sees_every_step_before_drawing_the_raw_frames(tmp_path, clean_registry):
+    events: list = []
+
+    class Timeline(Overlay):
+        name = "timeline"
+        whole_episode = True
+
+        def start_episode(self, steps):
+            events.append(("start", [s.step for s in steps], [s.state.get("phase") for s in steps]))
+
+        def apply(self, frame, step):
+            events.append(("frame", step.env, step.step, int(frame[0, 0, 0])))
+            out = frame.copy()
+            out[:4, :4] = 255
+            return out
+
+    register_overlay(Timeline)
+    rec = EvalRecorder(FakeEnv(), output_dir=tmp_path / "videos", fps=10, overlays=("timeline",),
+                       camera=FakeCamera(), pad_to=4)
+    rec.start_round(0)
+    for step, phase in enumerate((0.0, 1.0, 2.0)):
+        rec.capture(torch.tensor([True, step < 2, False]), rewards=torch.zeros(NUM_ENVS, 1),
+                    eval_state={"phase": torch.full((NUM_ENVS,), phase)})
+    assert events == []  # nothing is drawn while the round runs
+    rec.end_round()
+
+    # env 0: its three steps first, then its frames -- the camera's own pixels (env 0's value 0),
+    # bit for bit through the scratch file; then env 1's two
+    assert events == [
+        ("start", [0, 1, 2], [0.0, 1.0, 2.0]),
+        ("frame", 0, 0, 0), ("frame", 0, 1, 0), ("frame", 0, 2, 0),
+        ("start", [0, 1], [0.0, 1.0]),
+        ("frame", 1, 0, 1), ("frame", 1, 1, 1),
+    ]
+    assert rec.frame_counts == {(0, 0): 4, (0, 1): 4}  # padded to the episode limit as before
+    assert sorted(p.name for p in (tmp_path / "videos").iterdir()) == ["round0_env0.mp4", "round0_env1.mp4"]
+
+    import imageio
+
+    reader = imageio.get_reader(str(rec.paths[(0, 1)]), format="FFMPEG")
+    try:
+        frames = [f for f in reader]
+    finally:
+        reader.close()
+    assert len(frames) == 4 and frames[0][:4, :4].min() > 200  # the overlay's mark made it in

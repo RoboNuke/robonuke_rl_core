@@ -62,10 +62,14 @@ python scripts/debug.py --run entity/project/run_id --resets --headless \
 
 `--run` takes `entity/project/<run id or exact run name>` and pulls the config and checkpoint
 from that run's files; `--local` takes a run directory instead. `--checkpoint` accepts `best`
-(the default), a step number, or a file name. An eval writes `summary.yaml`, a per-step
-`.parquet` trace, its own resolved config and (with `--record`) one mp4 per episode under
-`<run dir>/eval/<eval-config-stem>_<timestamp>/`, and with `--run` mirrors them back to the
-training run. See `CLAUDE.md` for the episode accounting rule and the debug keys.
+(the default: `ckpt_best.ckpt`, or the file a project learner registered as its best with
+`register_eval_policy(..., best_checkpoint=...)`), a step number, or a file name. An eval writes `summary.yaml`, a per-step
+`.parquet` trace, its own resolved config and (with `--record`) one mp4 per episode into the
+run's local directory beside its `checkpoints/` -- `--local`'s, or for `--run` where training
+writes that run (`{trainer.output_dir}/{wandb.project}/{wandb.group}/{run name}`, made if
+missing): `videos/<eval-config-stem>_<timestamp>/` when it records, else
+`eval/<eval-config-stem>_<timestamp>/`. With `--run` it mirrors the folder back to the training
+run under the same path. See `CLAUDE.md` for the episode accounting rule and the debug keys.
 
 ## Tests
 
@@ -124,7 +128,8 @@ run-name field.
 Each run's Files tab gets `resolved_config.yaml` and every checkpoint (`ckpt_{step}.ckpt`,
 `ckpt_best.ckpt`) as ordinary run files — the Artifacts API is never used. That is what
 `scripts/eval.py --run entity/project/run` downloads, and an eval pushes its own results back
-to the same run under `eval/<eval-config-stem>_<timestamp>/`.
+to the same run under `videos/<eval-config-stem>_<timestamp>/` (an eval that records) or
+`eval/<eval-config-stem>_<timestamp>/`.
 
 ## trainer
 

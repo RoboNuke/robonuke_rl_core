@@ -36,6 +36,7 @@ from robonuke_rl_core.evaluation import (  # noqa: E402
     find_checkpoint,
     force_env_reset,
     resolved_config_path,
+    run_learner,
 )
 from robonuke_rl_core.envs.build import build_env, describe, prepare_task  # noqa: E402
 from robonuke_rl_core.recording import (  # noqa: E402
@@ -175,7 +176,7 @@ def main(argv=None, setup=None) -> int:
     else:
         run_dir = Path(args.local).expanduser()
     config_path = resolved_config_path(run_dir)
-    checkpoint = find_checkpoint(run_dir, args.checkpoint)
+    checkpoint = find_checkpoint(run_dir, args.checkpoint, run_learner(config_path))
 
     extra = [args.eval_config] if args.eval_config else []
     # debug watches one env; an eval config's env count would only confuse the view

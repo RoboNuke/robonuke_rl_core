@@ -340,7 +340,14 @@ def _check_task_types(merged: Any, default: Any, path: str = "task.cfg") -> Any:
     int is accepted where the default is a float and is **converted**: Isaac Lab's
     ``from_dict`` requires ``isinstance(value, type(current))``, so an int left as an int
     would be refused there (``Expected: float, Received: int``).
+
+    An explicit ``null`` is accepted for any field, a whole sub-config included, as Isaac Lab's
+    ``from_dict`` takes it (``value is None`` is set as is): it is how an Isaac Lab cfg switches
+    a term off or leaves a value to the asset, and an env can write it into its own cfg -- a
+    run's ``resolved_config.yaml`` is that live cfg, so refusing it would refuse the run.
     """
+    if merged is None:
+        return None
     if isinstance(default, dict):
         return {key: _check_task_types(merged[key], sub, f"{path}.{key}") for key, sub in default.items()}
     if default is None:

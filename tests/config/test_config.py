@@ -507,6 +507,17 @@ def test_int_for_a_float_field_is_converted_before_it_reaches_the_env():
     assert cfg.task_cfg.episode_length_s == 3.0
 
 
+def test_an_explicit_null_is_taken_like_isaac_lab_takes_it():
+    # a leaf (a value left to the asset) and a whole sub-config (a term switched off), as an env
+    # writes them into its own cfg and so into a run's resolved_config.yaml
+    cfg = load_config(FIXTURES / "minimal.yaml", ["task.cfg.episode_length_s=null"])
+    assert cfg.task_cfg.episode_length_s is None
+    checked = cfgmod._check_task_types({"term": None, "x": 2.0}, {"term": {"weight": 1.0}, "x": 1.0})
+    assert checked == {"term": None, "x": 2.0}
+    with pytest.raises(TypeError):  # a real type change still fails
+        cfgmod._check_task_types({"term": {"weight": "heavy"}}, {"term": {"weight": 1.0}})
+
+
 def test_a_type_change_in_the_task_cfg_cannot_reach_the_env():
     with pytest.raises(TypeError) as err:
         load_config(FIXTURES / "minimal.yaml", ["task.cfg.device=3"])

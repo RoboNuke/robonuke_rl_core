@@ -13,7 +13,10 @@ env rather than a whole round. An env's video holds exactly the steps its episod
 to the data: the recorder is driven by the same valid mask as the accounting and the trace.
 
 Overlays are a registry, like the losses: subclass :class:`Overlay`, set ``name``, decorate
-with :func:`register_overlay`, and name it in ``eval.overlays``. The package ships ``hud``.
+with :func:`register_overlay`, and name it in ``eval.overlays``. The package ships ``hud``. An
+overlay that sets ``whole_episode`` (a timeline marking what is still to come) is drawn once the
+round is over: the raw frames go to a lossless file per env first, and every overlay then draws
+over them with the episode's steps all known (:meth:`Overlay.start_episode`).
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ __all__ = [
     "HudOverlay",
     "EvalRecorder",
     "VideoWriter",
+    "manager_reward_scale",
     "render_resets",
 ]
 
@@ -212,9 +216,12 @@ class VideoWriter:
     H.264 in ``yuv420p`` needs even frame dimensions to stay playable in a browser or
     QuickTime, and ``macro_block_size=1`` stops ffmpeg padding small frames on its own; a
     stray odd row or column is trimmed instead.
+
+    ``lossless``: RGB H.264 at crf 0 (``libx264rgb``), which reads back bit for bit -- the
+    recorder's scratch file for overlays drawn after the round, not a file to watch.
     """
 
-    def __init__(self, path: Any, fps: int = 30) -> None:
+    def __init__(self, path: Any, fps: int = 30, lossless: bool = False) -> None:
         from pathlib import Path
 
         import imageio
@@ -222,14 +229,17 @@ class VideoWriter:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.frames = 0
+        encoding = (
+            dict(codec="libx264rgb", quality=None, pixelformat="rgb24", output_params=["-crf", "0", "-preset", "ultrafast"])
+            if lossless
+            else dict(codec="libx264", quality=8, pixelformat="yuv420p")
+        )
         self._writer = imageio.get_writer(
             str(self.path),
             format="FFMPEG",
             fps=max(1, int(fps)),
-            codec="libx264",
-            quality=8,
             macro_block_size=1,
-            pixelformat="yuv420p",
+            **encoding,
         )
 
     def append(self, frame: Any) -> None:
@@ -255,6 +265,9 @@ class StepData:
     truncated: bool
     #: that env's value for each per-step env metric
     metrics: Dict[str, float] = field(default_factory=dict)
+    #: that env's ``infos["eval_state"]`` entries: a float for a one-element entry, else a
+    #: flat numpy array (empty when the env publishes none)
+    state: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def done(self) -> bool:
@@ -269,9 +282,16 @@ class StepData:
 
 
 class Overlay:
-    """Base class for a frame overlay. Constructed with the config's kwargs."""
+    """Base class for a frame overlay. Constructed with the config's kwargs.
+
+    ``whole_episode = True``: the overlay needs the whole episode before its first frame (a
+    timeline that marks what is still to come). The recorder then draws every overlay after the
+    round, calling :meth:`start_episode` with each (round, env)'s steps before its frames.
+    """
 
     name: str = ""
+    #: draw once the episode is over, with all of its steps known (see the class docstring)
+    whole_episode: bool = False
 
     def __init__(self, **kwargs: Any) -> None:
         if kwargs:
@@ -282,6 +302,11 @@ class Overlay:
     def apply(self, frame: Any, step: StepData) -> Any:
         """Return the frame to write: an ``(H, W, 3)`` uint8 numpy array."""
         raise NotImplementedError
+
+    def start_episode(self, steps: List[StepData]) -> None:
+        """When the recorder draws after the round (an overlay in the list sets
+        ``whole_episode``): every step of the (round, env) about to be drawn, in order, before
+        its first :meth:`apply`. The default ignores it."""
 
 
 #: registered overlays, keyed by ``Overlay.name``
@@ -320,7 +345,8 @@ def build_overlays(names: Sequence[str]) -> List[Overlay]:
 
 @register_overlay
 class HudOverlay(Overlay):
-    """Step, reward and return in a banner across the top; the outcome when it ends."""
+    """Step, reward and return in a banner across the top; the outcome when it ends. The reward
+    is the recorder's (``reward_scale``: Isaac Lab's manager-based step_dt scaling undone)."""
 
     name = "hud"
     #: rows the banner owns; nothing outside it is touched
@@ -333,7 +359,7 @@ class HudOverlay(Overlay):
         image = Image.fromarray(np.ascontiguousarray(frame))
         draw = ImageDraw.Draw(image)
         draw.rectangle([(0, 0), (image.width - 1, self.banner_height - 1)], fill=(0, 0, 0))
-        text = f"t={step.step:03d} r={step.reward:+.2f} R={step.total_reward:+.2f}"
+        text = f"t={step.step:03d} step reward: {step.reward:+.2f} Return: {step.total_reward:+.2f}"
         outcome = step.outcome
         if outcome:
             text = f"{text} {outcome.upper()}"
@@ -347,7 +373,9 @@ class EvalRecorder:
 
     Follows the same ``start_round`` / ``capture`` / ``end_round`` protocol as the state
     writer and sees the same valid mask, so a video holds exactly the frames behind that
-    env's episode. Memory is one frame per env: files are appended to, not buffered.
+    env's episode. Memory is one frame per env: files are appended to, not buffered. With a
+    ``whole_episode`` overlay the raw frames go to a lossless scratch file per env instead
+    (``.round<r>_env<e>.raw.mp4``, deleted once drawn), and ``end_round`` draws the overlays.
     """
 
     def __init__(
@@ -361,13 +389,16 @@ class EvalRecorder:
         pad_to: Optional[int] = None,
         causes: Any = None,
         substeps: int = 1,
+        reward_scale: float = 1.0,
     ) -> None:
         """``pad_to``: frames every video is padded to (the episode limit), by holding an env's
         last frame with the cause of its end written across it. ``causes``: a callable
         returning, after a step, one label per env for why its episode ended
         (:func:`termination_causes`); without it the label is the outcome (``terminal`` /
         ``timeout``). ``substeps``: frames per control step; above 1 they are grabbed inside
-        the step, one per ``sim.render()`` (:class:`SubstepFrames`, ``eval.render_every``)."""
+        the step, one per ``sim.render()`` (:class:`SubstepFrames`, ``eval.render_every``).
+        ``reward_scale``: the overlays' reward and return are the env's times this
+        (:func:`manager_reward_scale` undoes Isaac Lab's manager-based step_dt scaling)."""
         from pathlib import Path
 
         self.env = env
@@ -392,6 +423,12 @@ class EvalRecorder:
         if self.substeps < 1:
             raise ValueError(f"substeps must be >= 1, got {substeps}")
         self._grabber = SubstepFrames(env, self.camera) if self.substeps > 1 else None
+        self.reward_scale = float(reward_scale)
+        #: draw after the round: some overlay needs the whole episode
+        self.deferred = any(overlay.whole_episode for overlay in self.overlays)
+        #: per env this round, when deferred: its lossless raw writer and its steps
+        self._raw: Dict[int, Any] = {}
+        self._steps: Dict[int, List[StepData]] = {}
 
     # ------------------------------------------------------------------ the round
     def start_round(self, round_index: int) -> None:
@@ -403,6 +440,7 @@ class EvalRecorder:
         self._step = 0
         self._returns = {}
         self._last, self._ended = {}, {}
+        self._raw, self._steps = {}, {}
         set_camera_active(self.camera, True)
         if self._grabber is not None:
             self._grabber.active = True
@@ -416,8 +454,11 @@ class EvalRecorder:
         terminated: Any = None,
         truncated: Any = None,
         metrics: Optional[Dict[str, Any]] = None,
+        eval_state: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Write this step's frame for every env still on its first episode."""
+        """Write this step's frame for every env still on its first episode. ``eval_state``:
+        the env's ``infos["eval_state"]`` channel, handed to the overlays per env
+        (:attr:`StepData.state`)."""
         if self._round is None:
             raise RuntimeError("call start_round() before capture()")
         if self._grabber is None:
@@ -444,10 +485,14 @@ class EvalRecorder:
             metric_lists = {
                 name: _flat(value, self.num_envs) for name, value in (metrics or {}).items()
             }
+            state_arrays = {
+                name: value.detach().to("cpu").reshape(self.num_envs, -1).float().numpy()
+                for name, value in (eval_state or {}).items()
+            }
             numpy_steps = [f.numpy() for f in per_step]
             labels = None
             for env in keep:
-                reward = float(rewards_list[env]) if rewards_list else 0.0
+                reward = float(rewards_list[env]) * self.reward_scale if rewards_list else 0.0
                 self._returns[env] = self._returns.get(env, 0.0) + reward
                 step = StepData(
                     env=env,
@@ -460,13 +505,22 @@ class EvalRecorder:
                     metrics={
                         name: float(values[env]) for name, values in metric_lists.items()
                     },
+                    state={
+                        name: float(values[env, 0]) if values.shape[1] == 1 else values[env].copy()
+                        for name, values in state_arrays.items()
+                    },
                 )
-                for numpy_frames in numpy_steps:
-                    frame = numpy_frames[env]
-                    for overlay in self.overlays:
-                        frame = overlay.apply(frame, step)
-                    self._writer(env).append(frame)
-                self._last[env] = frame
+                if self.deferred:
+                    self._steps.setdefault(env, []).append(step)
+                    for numpy_frames in numpy_steps:
+                        self._raw_writer(env).append(numpy_frames[env])
+                else:
+                    for numpy_frames in numpy_steps:
+                        frame = numpy_frames[env]
+                        for overlay in self.overlays:
+                            frame = overlay.apply(frame, step)
+                        self._writer(env).append(frame)
+                    self._last[env] = frame
                 if step.done and env not in self._ended:
                     if labels is None and self.causes is not None:
                         labels = self.causes()
@@ -479,6 +533,8 @@ class EvalRecorder:
     def end_round(self) -> None:
         if self._round is None:
             raise RuntimeError("call start_round() before end_round()")
+        for env in sorted(self._raw):
+            self._draw_after(env)
         if self.pad_to:
             for env, writer in self._writers.items():
                 missing = self.pad_to - self.frame_counts.get((self._round, env), 0)
@@ -503,6 +559,38 @@ class EvalRecorder:
             self.end_round()
 
     # ------------------------------------------------------------------ internals
+    def _raw_writer(self, env: int) -> VideoWriter:
+        """The lossless scratch file for this env's raw frames, when drawing after the round."""
+        if env not in self._raw:
+            path = self.output_dir / f".round{self._round}_env{env}.raw.mp4"
+            self._raw[env] = VideoWriter(path, self.fps, lossless=True)
+        return self._raw[env]
+
+    def _draw_after(self, env: int) -> None:
+        """Draw every overlay over this env's raw frames, the whole episode known, into its mp4."""
+        import imageio
+
+        raw = self._raw.pop(env)
+        raw.close()
+        steps = self._steps.pop(env)
+        for overlay in self.overlays:
+            overlay.start_episode(steps)
+        reader = imageio.get_reader(str(raw.path), format="FFMPEG")
+        count, frame = 0, None
+        try:
+            for index, frame in enumerate(reader):
+                step = steps[index // self.substeps]
+                for overlay in self.overlays:
+                    frame = overlay.apply(frame, step)
+                self._writer(env).append(frame)
+                count += 1
+        finally:
+            reader.close()
+        if count != raw.frames:
+            raise RuntimeError(f"{raw.path} read back {count} frames, {raw.frames} were written")
+        raw.path.unlink()
+        self._last[env] = frame
+
     def _writer(self, env: int) -> VideoWriter:
         """The open mp4 writer for this env, created on its first frame."""
         if env not in self._writers:
@@ -510,6 +598,16 @@ class EvalRecorder:
             self._writers[env] = VideoWriter(path, self.fps)
             self.paths[(self._round, env)] = path
         return self._writers[env]
+
+
+def manager_reward_scale(env: Any) -> float:
+    """``1 / step_dt`` for an Isaac Lab manager-based RL env, whose reward manager multiplies every
+    term by its weight and ``step_dt``, so a weight-1 term of 1 arrives as ``step_dt``; else 1.0
+    (a direct env's reward is whatever it computes)."""
+    unwrapped = getattr(env, "unwrapped", env)
+    if getattr(unwrapped, "reward_manager", None) is None:
+        return 1.0
+    return 1.0 / float(unwrapped.step_dt)
 
 
 def end_card(frame: Any, label: str) -> Any:

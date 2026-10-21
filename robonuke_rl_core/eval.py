@@ -12,15 +12,20 @@
 ``--run`` takes ``entity/project/<run id or exact run name>`` and pulls the run's
 ``resolved_config.yaml`` and the requested checkpoint out of its ordinary run files (never the
 Artifacts API) into a local cache, which the local path then treats as a run directory.
-``--checkpoint`` defaults to the best-return checkpoint and also accepts a step number or an
-exact file name.
+``--checkpoint`` defaults to the run's best checkpoint (the package learners' best-return
+``ckpt_best.ckpt``, or the file a project learner registered as its best) and also accepts a
+step number or an exact file name.
 
 The run says what was trained; the eval config says what to test it under (``task.cfg.*``, the
 env count and the ``eval`` section), and anything it leaves out keeps the trained run's value;
 CLI overrides still win. Episodes are collected in rounds: one global reset with fresh random
 initial conditions, up to ``max_episode_length`` steps, and each env contributes only its
-FIRST episode of the round. Everything lands under
-``<run_dir>/eval/<eval-config-stem>_<timestamp>/``.
+FIRST episode of the round. Everything lands in the run's local directory, beside its
+``checkpoints/``: ``--local``'s, or for ``--run`` where training writes that run
+(``{trainer.output_dir}/{wandb.project}/{wandb.group}/{run name}``, made if missing). An eval
+that records goes to ``videos/<eval-config-stem>_<timestamp>/`` (the mp4s with its summary,
+trace and config), any other to ``eval/<eval-config-stem>_<timestamp>/``; ``--run`` then
+uploads the folder to the run under that same path.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from robonuke_rl_core.envs.build import build_env, describe, prepare_task  # noq
 from robonuke_rl_core.recording import (  # noqa: E402
     EvalRecorder,
     install_recorder_camera,
+    manager_reward_scale,
     render_substeps,
     termination_causes,
     video_fps,
@@ -42,10 +48,14 @@ from robonuke_rl_core.evaluation import (  # noqa: E402
     SINGLE_AGENT_OVERRIDE,
     build_eval_policy,
     fetch_wandb_run,
+    eval_output_dir,
     find_checkpoint,
+    local_run_dir,
     resolved_config_path,
+    run_learner,
     run_eval,
     upload_eval_results,
+    wandb_run_name,
 )
 
 
@@ -119,7 +129,7 @@ def main(argv=None, setup=None) -> int:
     else:
         run_dir = Path(args.local).expanduser()
     config_path = resolved_config_path(run_dir)
-    checkpoint = find_checkpoint(run_dir, args.checkpoint)
+    checkpoint = find_checkpoint(run_dir, args.checkpoint, run_learner(config_path))
 
     # eval runs ONE agent whatever the run trained, so the config has to say so
     cfg = load_from_run(
@@ -130,7 +140,9 @@ def main(argv=None, setup=None) -> int:
     record = bool(cfg.eval.record or args.record)
 
     stem = Path(args.eval_config).stem
-    out_dir = run_dir / "eval" / f"{stem}_{time.strftime('%Y%m%d-%H%M%S')}"
+    # the run's own local directory (training's layout), not the download cache
+    local_dir = local_run_dir(cfg, wandb_run_name(args.run)) if args.run else run_dir
+    out_dir = eval_output_dir(local_dir, stem, record, time.strftime("%Y%m%d-%H%M%S"))
 
     substeps = 1
     if record:
@@ -156,6 +168,7 @@ def main(argv=None, setup=None) -> int:
     # env discarded any task.cfg value the eval config set (check_env_kept_overrides)
     print(f"[eval] config: {dump(cfg, out_dir, env.unwrapped.cfg)}", flush=True)
     max_episode_length = int(env.unwrapped.max_episode_length)
+    reward_scale = manager_reward_scale(env.unwrapped)
     env = build_env(cfg, env, cfg.task_name)
     if describe(cfg):
         print(f"[eval] env wrappers: {' -> '.join(describe(cfg))}", flush=True)
@@ -182,12 +195,14 @@ def main(argv=None, setup=None) -> int:
         fps = video_fps(cfg.eval.video_fps, env, substeps)
         recorder = EvalRecorder(
             env,
-            output_dir=out_dir / "videos",
+            output_dir=out_dir,
             fps=fps,
             overlays=cfg.eval.overlays,
             pad_to=max_episode_length * substeps if cfg.eval.video_full_length else None,
             causes=termination_causes(env),
             substeps=substeps,
+            # the video shows the reward as the task defines it, not Isaac Lab's dt-scaled one
+            reward_scale=reward_scale,
         )
         print(
             f"[eval] recording {cfg.eval.video_width}x{cfg.eval.video_height} @ "
@@ -214,7 +229,7 @@ def main(argv=None, setup=None) -> int:
     write_outputs(out_dir, result, cfg, checkpoint, metadata, stem)
     if recorder is not None:
         print(
-            f"[eval] videos: {len(recorder.paths)} files in {out_dir / 'videos'} "
+            f"[eval] videos: {len(recorder.paths)} files in {out_dir} "
             f"({sum(recorder.frame_counts.values())} frames)",
             flush=True,
         )
@@ -223,7 +238,7 @@ def main(argv=None, setup=None) -> int:
         print(f"[eval]   {name}: {value}", flush=True)
 
     if args.run:
-        names = upload_eval_results(args.run, out_dir, run_dir)
+        names = upload_eval_results(args.run, out_dir, local_dir)
         print(f"[eval] uploaded to {args.run}: {', '.join(names)}", flush=True)
     else:
         print("[eval] --local: results stay on disk, nothing uploaded", flush=True)

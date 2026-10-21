@@ -28,7 +28,12 @@ __all__ = [
     "resolved_config_path",
     "find_checkpoint",
     "checkpoint_file",
+    "run_learner",
+    "BEST_CHECKPOINTS",
     "fetch_wandb_run",
+    "wandb_run_name",
+    "local_run_dir",
+    "eval_output_dir",
     "upload_eval_results",
     "build_eval_policy",
     "EVAL_POLICY_BUILDERS",
@@ -660,6 +665,7 @@ def run_eval(
             next_observations, rewards, terminated, truncated, infos = env.step(actions)
             metrics = per_env_channel(infos, "metrics_to_log", num_envs)
             episode_metrics = per_env_channel(infos, "episode_metrics_to_log", num_envs)
+            eval_state = per_env_channel(infos, "eval_state", num_envs)
             valid = accounting.step(
                 rewards=rewards,
                 terminated=terminated,
@@ -682,7 +688,7 @@ def run_eval(
                     truncated=truncated,
                     metrics=metrics,
                     episode_metrics=episode_metrics,
-                    eval_state=per_env_channel(infos, "eval_state", num_envs),
+                    eval_state=eval_state,
                 )
             if recorder is not None:
                 recorder.capture(
@@ -691,6 +697,7 @@ def run_eval(
                     terminated=terminated,
                     truncated=truncated,
                     metrics=metrics,
+                    eval_state=eval_state,
                 )
             observations = next_observations
             states = env_states(env)
@@ -746,37 +753,38 @@ def resolved_config_path(run_dir: Any) -> "Path":
     )
 
 
-def find_checkpoint(run_dir: Any, which: str = "best") -> "Path":
-    """Resolve ``best``, a step number, a file name, or a path to one checkpoint file."""
+def find_checkpoint(run_dir: Any, which: str = "best", learner: Optional[str] = None) -> "Path":
+    """Resolve ``best`` (``learner``'s best, :func:`checkpoint_file`), a step number, a file
+    name, or a path to one checkpoint file."""
     from pathlib import Path
-
-    from .learners.base import CHECKPOINT_BEST, checkpoint_name
 
     direct = Path(str(which)).expanduser()
     if direct.is_file():
         return direct
     directory = Path(run_dir).expanduser() / "checkpoints"
-    path = directory / checkpoint_file(which)
+    path = directory / checkpoint_file(which, learner)
     if path.is_file():
         return path
-    available = sorted(p.name for p in directory.glob("ckpt_*")) if directory.is_dir() else []
+    available = sorted(p.name for p in directory.iterdir() if p.is_file()) if directory.is_dir() else []
     raise FileNotFoundError(
         f"checkpoint {which!r} not found: looked for {path}"
         + (f"; {directory} holds {available}" if available else f"; {directory} holds nothing")
     )
 
 
-def checkpoint_file(which: str = "best") -> str:
+def checkpoint_file(which: str = "best", learner: Optional[str] = None) -> str:
     """The checkpoint file name a ``--checkpoint`` value means.
 
-    ``best`` is the best-return checkpoint, a bare number is that step's checkpoint, and
-    anything else is taken as the file name itself, so an exact name always works.
+    ``best`` is the run's best checkpoint -- the best-return ``ckpt_best.ckpt`` of the package's
+    learners, or the file a project learner registered as its best
+    (``register_eval_policy(..., best_checkpoint=...)``) -- a bare number is that step's
+    checkpoint, and anything else is taken as the file name itself, so an exact name always works.
     """
     from .learners.base import CHECKPOINT_BEST, checkpoint_name
 
     text = str(which)
     if text == "best":
-        return CHECKPOINT_BEST
+        return BEST_CHECKPOINTS.get(learner, CHECKPOINT_BEST)
     if text.isdigit():
         return checkpoint_name(int(text))
     return text
@@ -811,14 +819,53 @@ def fetch_wandb_run(
         api = wandb.Api()
     run = _wandb_run(api, entity, project, wanted)
 
-    name = checkpoint_file(which)
     cache = Path(cache_root).expanduser() if cache_root else Path.home() / ".cache" / "robonuke_rl_core"
     directory = cache / entity / project / str(run.id)
     (directory / "checkpoints").mkdir(parents=True, exist_ok=True)
 
+    # the config first: which file ``best`` is depends on the run's learner
     _download(run, RESOLVED_NAME, directory, spec)
+    name = checkpoint_file(which, run_learner(directory / RESOLVED_NAME))
     _download(run, name, directory / "checkpoints", spec)
     return directory
+
+
+def run_learner(config_path: Any) -> Optional[str]:
+    """``trainer.learner`` of a run's ``resolved_config.yaml`` (None when it names none)."""
+    from omegaconf import OmegaConf
+
+    return OmegaConf.select(OmegaConf.load(str(config_path)), "trainer.learner")
+
+
+def wandb_run_name(spec: str, *, api: Any = None) -> str:
+    """The display name of the wandb run ``spec`` (``entity/project/<run id or exact name>``)
+    names: the name training gave its local run directory."""
+    parts = [piece for piece in str(spec).split("/") if piece]
+    if len(parts) != 3:
+        raise ValueError(f"expected 'entity/project/run' (run id or exact run name), got {spec!r}")
+    if api is None:
+        import wandb  # lazy
+
+        api = wandb.Api()
+    return str(_wandb_run(api, *parts).name)
+
+
+def local_run_dir(cfg: Any, run_name: str) -> "Path":
+    """Where training writes the run ``run_name`` locally, beside its ``checkpoints/``:
+    ``{trainer.output_dir}/{wandb.project}/{wandb.group}/{run_name}``
+    (``learners.base.run_dirs``)."""
+    from pathlib import Path
+
+    return Path(cfg.trainer.output_dir) / cfg.wandb.project / cfg.wandb.group / str(run_name)
+
+
+def eval_output_dir(run_dir: Any, stem: str, record: bool, stamp: str) -> "Path":
+    """An eval's folder in its run's local directory: ``videos/<stem>_<stamp>/`` when it records
+    (the mp4s with the summary, trace and config that go with them), else
+    ``eval/<stem>_<stamp>/`` -- both beside ``checkpoints/``."""
+    from pathlib import Path
+
+    return Path(run_dir) / ("videos" if record else "eval") / f"{stem}_{stamp}"
 
 
 def _wandb_run(api: Any, entity: str, project: str, wanted: str) -> Any:
@@ -866,8 +913,8 @@ def upload_eval_results(
     """Attach an eval's output files to the ORIGINAL training run, as plain run files.
 
     Stored under the path ``out_dir`` has relative to ``root`` — which is
-    ``eval/<eval-config-stem>_<timestamp>/...``, so repeated evals never overwrite each
-    other. Nothing is logged as a wandb metric: the per-step trace is the data, and any
+    ``videos/<eval-config-stem>_<timestamp>/...`` or ``eval/...`` (:func:`eval_output_dir`),
+    so repeated evals never overwrite each other. Nothing is logged as a wandb metric: the per-step trace is the data, and any
     aggregate can be re-derived from it offline.
 
     Returns the names the files were stored under.
@@ -901,13 +948,22 @@ def upload_eval_results(
 EVAL_POLICY_BUILDERS: Dict[str, Any] = {}
 
 
-def register_eval_policy(learner: str, fn: Any) -> None:
-    """Let eval and debug load a project learner's checkpoint (call in ``setup``)."""
+#: a project learner's best checkpoint file, what ``--checkpoint best`` means for its runs
+#: (``register_eval_policy(..., best_checkpoint=...)``); the package's learners: ``ckpt_best.ckpt``
+BEST_CHECKPOINTS: Dict[str, str] = {}
+
+
+def register_eval_policy(learner: str, fn: Any, *, best_checkpoint: Optional[str] = None) -> None:
+    """Let eval and debug load a project learner's checkpoint (call in ``setup``).
+    ``best_checkpoint``: the file name the learner keeps its best in, so ``--checkpoint best``
+    (the default) finds it."""
     if learner in ("sac", "ppo"):
         raise ValueError(f"{learner!r} is the package's own learner; its eval policy is built in")
     if learner in EVAL_POLICY_BUILDERS:
         raise ValueError(f"an eval policy for learner {learner!r} is already registered")
     EVAL_POLICY_BUILDERS[learner] = fn
+    if best_checkpoint is not None:
+        BEST_CHECKPOINTS[learner] = str(best_checkpoint)
 
 
 def build_eval_policy(
