@@ -138,6 +138,7 @@ to the same run under `videos/<eval-config-stem>_<timestamp>/` (an eval that rec
 | `learner` | str | required | which learner runs: `sac` or `ppo`. Only that section is used; both are dumped |
 | `total_timesteps` | int | required | env steps to train for |
 | `write_interval` | int | `1000` | env steps between episode-stat flushes through the `on_log` hooks (0 disables) |
+| `success_window` | int | `0` | `0`: `episode/success` is the mean over the episodes that finished in the write interval. `N > 0`: the mean over each agent's last `N` finished episodes, republished at every flush (a rolling window, not cleared between intervals), so a short `write_interval` still gives a meaningful rate. Nothing is published before an agent's first episode ends. `episode/best_success_rate` and the best-checkpoint rule are unchanged (per interval) |
 | `checkpoint_interval` | int | `10000` | env steps between per-agent checkpoints (0 disables) |
 | `output_dir` | str | `"runs"` | run directories are `{output_dir}/{wandb.project}/{wandb.group}/{run_name}` |
 | `log_memory_stats` | bool | `True` | publish the learner's memory stats (`stats/ram_mb`, `stats/gpu_used_mb`, `stats/gpu_torch_reserved_mb`); `stats/update_time_ms` is published either way |
@@ -168,6 +169,8 @@ Soft Actor-Critic. `batch_size` and the memory are per agent.
 | `initial_entropy_value` | float | `0.2` | starting temperature |
 | `target_entropy` | float or null | `null` | target entropy; `null` means `-|A|` |
 | `entropy_loss_form` | str | `"log_alpha"` | `log_alpha` (skrl's form) or `alpha` (the gentler multiplicative form) |
+| `backup_entropy` | bool | `True` | the entropy bonus `- alpha * log_pi(a'\|s')` in the critics' bootstrap target (classic SAC). `false`: the target is reward alone and the entropy shapes only the actor (SERL's `backup_entropy=False`) |
+| `entropy_observations` | str | `"current"` | the entropy the temperature steps on: `current` (the actor step's batch and its freshly sampled actions) or `next` (the critic step's batch at its next observations, with the next actions it sampled for the target; demo rows included inside the demo window: SERL's temperature loss) |
 | `periodic_reset_enabled` | bool | `False` | SimBa periodic reset: rebuild networks and optimizers, keep the replay buffer and the normalizer stats |
 | `periodic_reset_frequency` | int | `0` | env steps between resets; must be > 0 when resets are enabled |
 | `periodic_reset_max` | int | `0` | maximum number of resets (0 = unlimited) |

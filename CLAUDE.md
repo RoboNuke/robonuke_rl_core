@@ -74,7 +74,9 @@ value a file or the CLI set (some envs rewrite their cfg in `__init__`; see belo
 writes `resolved_config.yaml`: `meta` (`pkg_commit`, `project_commit` or null, timestamp),
 `derived`, then every value, with `task.cfg` taken from the live env cfg so the file holds
 what actually ran. `load_from_run(run_dir, overrides)` uses that file minus `meta`,
-`derived` and `task.cfg.seed` as the only file layer, then steps 2–11.
+`derived` and `task.cfg.seed` as the only file layer, then steps 2–11, and sets
+`Config.source_run` to that file's path (`None` from `load_config`): a consumer comparing
+`task.cfg` trees can tell a rebuilt config, whose `task.cfg` holds what the env derived.
 
 ## Task cfg fields an override cannot change
 

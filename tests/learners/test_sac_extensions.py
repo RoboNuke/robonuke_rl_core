@@ -56,6 +56,7 @@ def changed(before, module, agent: int = 0) -> bool:
         ({"demo_sampling_end": 100}, "names no file"),
         ({"demo_transitions": "x.pt"}, "window"),
         ({"demo_transitions": "x.pt", "demo_sampling_end": 10, "batch_size": 1}, "batch_size"),
+        ({"entropy_observations": "previous"}, "entropy_observations"),
     ],
 )
 def test_each_rule_rejects_a_bad_value(fields, match):
@@ -138,6 +139,63 @@ def test_the_mean_reduction_feeds_the_actor_the_ensemble_mean(monkeypatch):
     inputs = {"observations": torch.randn(4, OBS_DIM)}
     _, _, _, q, _ = learner._compute_actor_loss(sampled=None, inputs=inputs, critic_inputs=inputs, rows=4)
     assert torch.equal(q, torch.full((4, 1), 3.0))
+
+
+# ---------------------------------------------------------------------- entropy (SERL's options)
+def _critic_target(learner, rows: int = 4):
+    sampled = dict(zip(learner._tensors_names, learner.memory.sample(names=learner._tensors_names, batch_size=rows)[0]))
+    inputs = {"observations": sampled["observations"]}
+    next_inputs = {"observations": sampled["next_observations"]}
+    torch.manual_seed(0)  # the policy samples next_actions
+    _, _, _, target, next_log_prob = learner._compute_critic_loss(
+        sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=inputs,
+        critic_next_inputs=next_inputs, rows=rows,
+    )
+    return target, next_log_prob
+
+
+def test_without_backup_entropy_the_target_has_no_entropy_bonus():
+    """The two targets differ by exactly gamma * alpha * log_pi(a'|s') on non-terminal rows."""
+    learner = build_learner("sac", num_agents=1, normalize_observations=False, initial_entropy_value=0.5)
+    fill_memory(learner)
+    torch.manual_seed(1)
+    with_bonus, log_prob = _critic_target(learner)
+    learner.cfg.backup_entropy = False
+    torch.manual_seed(1)
+    without, _ = _critic_target(learner)
+    torch.manual_seed(1)
+    sampled = dict(zip(learner._tensors_names, learner.memory.sample(names=learner._tensors_names, batch_size=4)[0]))
+    alive = (sampled["terminated"] & sampled["truncated"].logical_not()).logical_not()
+    expected = without - learner.cfg.discount_factor * alive * 0.5 * log_prob
+    assert torch.allclose(with_bonus, expected, atol=1e-6)
+    assert not torch.allclose(with_bonus, without)
+
+
+@pytest.mark.parametrize("where", ["current", "next"])
+def test_the_temperature_reads_the_entropy_entropy_observations_names(where):
+    """next: the critic step's log-prob at the batch's next observations, not the actor's."""
+    learner = build_learner("sac", num_agents=1, entropy_observations=where)
+    fill_memory(learner)
+    critic_loss, actor_step = learner._compute_critic_loss, learner._actor_step
+    seen = {}
+
+    def critic(**kw):
+        out = critic_loss(**kw)
+        seen["next"] = out[4]
+        return out
+
+    def actor(**kw):
+        out = actor_step(**kw)
+        seen["current"] = out["log_prob"]
+        return out
+
+    fed = []
+    update = learner._update_entropy
+    learner._compute_critic_loss, learner._actor_step = critic, actor
+    learner._update_entropy = lambda log_prob, rows: (fed.append(log_prob.detach().clone()), update(log_prob, rows))[1]
+    learner.update(timestep=10, timesteps=100)
+    assert len(fed) == 1 and torch.equal(fed[0], seen[where].detach())
+    assert not torch.equal(seen["current"], seen["next"].detach())
 
 
 # ---------------------------------------------------------------------- the actor's schedule

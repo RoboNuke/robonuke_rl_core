@@ -176,6 +176,13 @@ class LearnerBase(Agent):
         #: per-agent success rate over the interval, from the env's episode/success channel
         self._success_total = torch.zeros(num_agents, device=self.device)
         self._success_count = torch.zeros(num_agents, device=self.device)
+        #: ``trainer.success_window`` > 0: each agent's last N episode successes (NaN until
+        #: filled) and the slot the next one goes in; ``episode/success`` is their mean
+        window = int(getattr(trainer_cfg, "success_window", 0) or 0)
+        self._success_window = (
+            torch.full((num_agents, window), float("nan"), device=self.device) if window > 0 else None
+        )
+        self._success_window_next = [0] * num_agents
         #: the success rate of the interval that produced the current best checkpoint, and
         #: which agents produced a new best in the interval just flushed
         self._best_success: List[float] = [float("nan")] * num_agents
@@ -411,6 +418,7 @@ class LearnerBase(Agent):
         if metrics is None or slots is None:
             return
         success = metrics.get(SUCCESS_METRIC)
+        windowed = self._success_window is not None
         for agent, index in enumerate(slots):
             if index.numel() == 0:
                 continue
@@ -421,14 +429,30 @@ class LearnerBase(Agent):
                 mine = success[lo:hi].index_select(0, index)
                 self._success_total[agent] += mine.sum()
                 self._success_count[agent] += mine.numel()
+                if windowed:
+                    self._push_success_window(agent, mine)
             self.emit(
                 agent,
                 {
                     name: value[lo:hi].index_select(0, index)
                     for name, value in metrics.items()
+                    # windowed, the rate is published at the flush instead (_flush_episode_stats)
+                    if not (windowed and name == SUCCESS_METRIC)
                 },
                 step,
             )
+
+    def _push_success_window(self, agent: int, values: torch.Tensor) -> None:
+        """Write an agent's newly finished episodes' successes into its rolling window,
+        overwriting the oldest. ``values.numel()`` is known on the host (the slots are), so
+        this adds no sync."""
+        size = self._success_window.shape[1]
+        start, count = self._success_window_next[agent], values.numel()
+        kept = values[-size:].to(self._success_window.dtype)  # more than N at once: the last N
+        first = start + count - kept.numel()
+        index = (first + torch.arange(kept.numel(), device=self.device)) % size
+        self._success_window[agent, index] = kept
+        self._success_window_next[agent] = (start + count) % size
 
     def _env_metrics(self, infos: Any, key: str) -> Optional[Dict[str, torch.Tensor]]:
         """The validated ``infos[key]`` dict, or None when the env does not provide it."""
@@ -511,6 +535,12 @@ class LearnerBase(Agent):
                     {"episode/count": torch.tensor(count, device=self.device)},
                     step,
                 )
+        if self._success_window is not None:
+            # every interval, episodes or not: the window carries over. An agent with no
+            # finished episode yet is all NaN, which the logger skips (no point published)
+            rates = torch.nanmean(self._success_window, dim=1)
+            for agent in range(self.num_agents):
+                self.emit(agent, {SUCCESS_METRIC: rates[agent]}, step)
         self._update_best(step, success_total, success_count)
         self._finished_count.zero_()
         self._finished_returns.zero_()

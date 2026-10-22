@@ -19,7 +19,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from omegaconf import MISSING, DictConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
@@ -167,6 +167,10 @@ class Config:
     #: every ``task.cfg`` path a file or the CLI set -> the layer that set it last, plus
     #: ``seed`` (set from ``experiment.seed``). :func:`check_env_kept_overrides` checks these.
     task_overrides: Dict[str, str]
+    #: the ``resolved_config.yaml`` a :func:`load_from_run` config was rebuilt from (eval, debug,
+    #: a checkpoint watcher); None for :func:`load_config`. Such a config's ``task.cfg`` is the
+    #: live env's (:func:`dump`): values the env derived at ``gym.make`` sit beside the ones set.
+    source_run: Optional[str] = None
 
     def __getattr__(self, name: str) -> Any:
         sections = self.__dict__.get("sections", {})
@@ -224,7 +228,9 @@ def load_from_run(
     for extra in list(extra_files or []):
         layers += load_file_chain(extra)
     layers.append(("CLI", _cli_layer(overrides)))
-    return _build(layers)
+    cfg = _build(layers)
+    cfg.source_run = str(path)
+    return cfg
 
 
 def _build(layers: List[tuple]) -> Config:

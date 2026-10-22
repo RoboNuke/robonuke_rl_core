@@ -634,3 +634,77 @@ def test_the_success_channel_is_accumulated_per_agent():
     )
     assert learner._success_total.tolist() == [2.0, 0.0]
     assert learner._success_count.tolist() == [2.0, 2.0]
+
+
+# ------------------------------------------------------------------ the success window
+def _finish(learner, successes, step):
+    """Every env of the learner ends an episode this step with the given successes."""
+    from robonuke_rl_core.learners.base import SUCCESS_METRIC
+
+    learner.observe_step(
+        infos={"episode_metrics_to_log": {SUCCESS_METRIC: torch.tensor(successes, dtype=torch.float32)}},
+        rewards=torch.zeros(learner.num_envs, 1),
+        terminated=torch.ones(learner.num_envs, 1, dtype=torch.bool),
+        truncated=torch.zeros(learner.num_envs, 1, dtype=torch.bool),
+        step=step,
+    )
+
+
+def test_the_success_window_is_each_agents_last_n_episodes_across_intervals():
+    """trainer.success_window: episode/success is the rolling mean of each agent's last N
+    episodes, published at every flush and carried across them, never the per-episode values."""
+    from robonuke_rl_core.learners.base import SUCCESS_METRIC
+
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2, trainer_overrides={"success_window": 3})
+    published, hook = collector()
+    learner.on_log.append(hook)
+    _finish(learner, [1.0, 1.0, 0.0, 0.0], step=0)  # agent 0: 1, 1 ; agent 1: 0, 0
+    assert not any(SUCCESS_METRIC in m for _, m, _ in published)  # nothing per episode
+    learner._flush_episode_stats(0)
+    _finish(learner, [0.0, 0.0, 1.0, 1.0], step=1)  # agent 0: 1, 1, 0, 0 -> last 3: 1, 0, 0
+    learner._flush_episode_stats(1)
+    learner._flush_episode_stats(2)  # no episode in this interval: the window is republished
+    rates = [(agent, float(m[SUCCESS_METRIC]), step) for agent, m, step in published if SUCCESS_METRIC in m]
+    assert rates == [
+        (0, pytest.approx(1.0), 0), (1, pytest.approx(0.0), 0),
+        (0, pytest.approx(1 / 3), 1), (1, pytest.approx(2 / 3), 1),
+        (0, pytest.approx(1 / 3), 2), (1, pytest.approx(2 / 3), 2),
+    ]
+
+
+def test_more_episodes_than_the_window_at_once_keep_the_last_n():
+    learner = build_learner("sac", num_agents=1, envs_per_agent=4, trainer_overrides={"success_window": 2})
+    learner.on_log.append(lambda agent, metrics, step: None)
+    _finish(learner, [1.0, 1.0, 0.0, 1.0], step=0)
+    assert sorted(learner._success_window[0].tolist()) == [0.0, 1.0]
+    assert learner._success_window_next == [0]
+
+
+def test_an_empty_window_publishes_nothing_and_off_keeps_the_per_episode_rate():
+    from robonuke_rl_core.learners.base import SUCCESS_METRIC
+
+    windowed = build_learner("sac", num_agents=1, envs_per_agent=2, trainer_overrides={"success_window": 10})
+    published, hook = collector()
+    windowed.on_log.append(hook)
+    windowed._flush_episode_stats(0)  # no episode yet: NaN, which the logger skips
+    nan = [m[SUCCESS_METRIC] for _, m, _ in published if SUCCESS_METRIC in m]
+    assert len(nan) == 1 and torch.isnan(nan[0])
+
+    plain = build_learner("sac", num_agents=1, envs_per_agent=2)
+    assert plain._success_window is None
+    published, hook = collector()
+    plain.on_log.append(hook)
+    _finish(plain, [1.0, 0.0], step=0)
+    per_episode = [m[SUCCESS_METRIC] for _, m, _ in published if SUCCESS_METRIC in m]
+    assert len(per_episode) == 1 and per_episode[0].tolist() == [1.0, 0.0]
+
+
+def test_a_negative_success_window_is_refused():
+    from types import SimpleNamespace
+
+    from robonuke_rl_core.learners.cfg import TrainerCfg
+
+    cfg = SimpleNamespace(root=SimpleNamespace(task=SimpleNamespace(cfg=SimpleNamespace(scene=SimpleNamespace(num_envs=1)))),
+                          experiment=SimpleNamespace(num_agents=1))
+    with pytest.raises(ValueError, match="success_window"):
+        TrainerCfg(learner="sac", total_timesteps=10, success_window=-1).validate(cfg)

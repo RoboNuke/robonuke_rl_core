@@ -386,14 +386,18 @@ class SAC(LearnerBase):
         return per_agent.gather(1, index).min(dim=1).values.reshape(self.num_agents * rows, -1)
 
     def _compute_critic_loss(self, *, sampled, inputs, next_inputs, critic_inputs, critic_next_inputs, rows):
-        """Min-over-targets bootstrapped target + mean MSE over the critics."""
+        """Min-over-targets bootstrapped target (with the entropy bonus unless
+        ``backup_entropy`` is off) + mean MSE over the critics. Also returns the policy's
+        log-prob of its next actions, for ``entropy_observations: next``."""
         with torch.no_grad():
             next_actions, outputs = self.policy.act(next_inputs, role="policy")
             target_qs, _ = self.target_critics.act(
                 {**critic_next_inputs, "taken_actions": next_actions}, role="target_critics"
             )
-            entropy = self.expand_per_agent(self._entropy_coefficient, rows)
-            target_q = self._target_min(target_qs, rows) - entropy * outputs["log_prob"]
+            target_q = self._target_min(target_qs, rows)
+            if self.cfg.backup_entropy:
+                entropy = self.expand_per_agent(self._entropy_coefficient, rows)
+                target_q = target_q - entropy * outputs["log_prob"]
             # Bootstrap unless the next state is genuinely terminal. A time limit is not the
             # end of the world: the episode had a future, it just stopped being observed, so
             # dropping gamma*V(next) there would teach the critic that running out the clock
@@ -411,7 +415,7 @@ class SAC(LearnerBase):
         )
         # the mean over critics of each critic's MSE (they share the target)
         critic_loss = (values - target_values.unsqueeze(0)).pow(2).mean(dim=(1, 2)).mean()
-        return critic_loss, values[0], values[1], target_values
+        return critic_loss, values[0], values[1], target_values, outputs["log_prob"]
 
     def _compute_actor_loss(self, *, sampled, inputs, critic_inputs, rows):
         """``alpha * log_pi - Q``, with Q the min (or mean, ``actor_q_reduction``) over the
@@ -482,7 +486,7 @@ class SAC(LearnerBase):
         sampled = self._mixed_batch(rows, graph) if demo_on else online
         inputs, next_inputs, critic_inputs, critic_next_inputs = self._batch_inputs(sampled)
 
-        critic_loss, critic_1_values, critic_2_values, target_values = self._compute_critic_loss(
+        critic_loss, critic_1_values, critic_2_values, target_values, next_log_prob = self._compute_critic_loss(
             sampled=sampled,
             inputs=inputs,
             next_inputs=next_inputs,
@@ -517,7 +521,8 @@ class SAC(LearnerBase):
                 # a second batch this step: it must not count twice in the normalizer
                 inputs, _, critic_inputs, _ = self._batch_inputs(online, train=False)
             actor = self._actor_step(
-                timestep=timestep, sampled=online, inputs=inputs, critic_inputs=critic_inputs, rows=rows
+                timestep=timestep, sampled=online, inputs=inputs, critic_inputs=critic_inputs, rows=rows,
+                next_log_prob=next_log_prob,
             )
 
         self._polyak()
@@ -547,7 +552,9 @@ class SAC(LearnerBase):
             critic_inputs, critic_next_inputs = inputs, next_inputs
         return inputs, next_inputs, critic_inputs, critic_next_inputs
 
-    def _actor_step(self, *, timestep: int, sampled, inputs, critic_inputs, rows: int) -> dict:
+    def _actor_step(self, *, timestep: int, sampled, inputs, critic_inputs, rows: int, next_log_prob=None) -> dict:
+        """The actor's step, then the temperature's on the entropy ``entropy_observations``
+        names: this batch's ``log_prob`` or the critic step's ``next_log_prob``."""
         policy_loss, actions, log_prob, q_pi, outputs = self._compute_actor_loss(
             sampled=sampled, inputs=inputs, critic_inputs=critic_inputs, rows=rows
         )
@@ -572,7 +579,13 @@ class SAC(LearnerBase):
         )
         self.policy_optimizer.step()
 
-        entropy_loss = self._update_entropy(log_prob, rows) if self.cfg.learn_entropy else None
+        if self.cfg.learn_entropy:
+            entropy_log_prob = next_log_prob if self.cfg.entropy_observations == "next" else log_prob
+            if entropy_log_prob is None:
+                raise RuntimeError("entropy_observations: next needs the critic step's next_log_prob")
+            entropy_loss = self._update_entropy(entropy_log_prob, rows)
+        else:
+            entropy_loss = None
         with torch.no_grad():
             per_agent_loss = self.per_agent_mean(
                 self.expand_per_agent(self._entropy_coefficient, rows) * log_prob - q_pi, rows

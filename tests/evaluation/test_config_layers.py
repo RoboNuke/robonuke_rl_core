@@ -158,3 +158,13 @@ def test_it_holds_whatever_the_run_trained(tmp_path, num_agents):
     )
     assert cfg.experiment.num_agents == 1
 
+
+def test_a_rebuilt_config_names_the_run_it_came_from(tmp_path):
+    """Its task.cfg is the live env's, so a consumer that compares config trees can tell."""
+    run_dir = trained_run(tmp_path)
+    cfg = load_from_run(run_dir, [SINGLE_AGENT_OVERRIDE], extra_files=[eval_config(tmp_path)])
+    assert cfg.source_run == str(run_dir / RESOLVED_NAME)
+    # the same settings as a config file (no meta / derived): not rebuilt from anything
+    plain = tmp_path / "train.yaml"
+    plain.write_text("experiment:\n" + (run_dir / RESOLVED_NAME).read_text().split("experiment:\n", 1)[1])
+    assert cfgmod.load_config(plain).source_run is None

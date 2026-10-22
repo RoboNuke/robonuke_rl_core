@@ -46,6 +46,10 @@ class TrainerCfg:
     total_timesteps: int = MISSING
     #: env steps between episode-stat flushes through the ``on_log`` hooks
     write_interval: int = 1000
+    #: 0: ``episode/success`` is the mean over the episodes that finished in the write
+    #: interval. N > 0: the mean over each agent's last N finished episodes, republished every
+    #: interval (a rolling window, not cleared at the flush), so a short interval still has a rate
+    success_window: int = 0
     #: env steps between per-agent checkpoints (0 disables)
     checkpoint_interval: int = 10000
     output_dir: str = "runs"
@@ -65,6 +69,8 @@ class TrainerCfg:
                 "trainer.write_interval and trainer.checkpoint_interval must be >= 0, got "
                 f"{self.write_interval} and {self.checkpoint_interval}"
             )
+        if self.success_window < 0:
+            raise ValueError(f"trainer.success_window must be >= 0, got {self.success_window}")
         total_envs = cfg.root.task.cfg.scene.num_envs
         num_agents = cfg.experiment.num_agents
         if total_envs % num_agents != 0:
@@ -113,6 +119,15 @@ class SACCfg(_CommonCfg):
     target_entropy: Optional[float] = None
     #: "log_alpha" (skrl's form) or "alpha" (the gentler multiplicative form)
     entropy_loss_form: str = "log_alpha"
+    #: the entropy bonus in the critics' bootstrap target (``- alpha * log_pi(a'|s')``):
+    #: classic SAC; false leaves the target pure reward (SERL's ``backup_entropy=False``), the
+    #: entropy then shaping only the actor
+    backup_entropy: bool = True
+    #: where the temperature's entropy estimate comes from: "current" (the actor step's batch
+    #: and its freshly sampled actions) or "next" (the critic step's batch at its next
+    #: observations, the policy's next actions it already sampled for the target, demo rows
+    #: included inside the demo window: SERL's temperature loss)
+    entropy_observations: str = "current"
     #: SimBa periodic reset: rebuild networks + optimizers, keep the replay buffer
     periodic_reset_enabled: bool = False
     periodic_reset_frequency: int = 0
@@ -148,6 +163,7 @@ class SACCfg(_CommonCfg):
     cuda_graph: bool = False
 
     ACTOR_Q_REDUCTIONS = ("min", "mean")
+    ENTROPY_OBSERVATIONS = ("current", "next")
 
     def validate(self, cfg: Any) -> None:
         if self.lr_schedule not in ("constant", "cosine"):
@@ -158,6 +174,11 @@ class SACCfg(_CommonCfg):
             raise ValueError(
                 f"{self._name()}.entropy_loss_form must be 'log_alpha' or 'alpha', got "
                 f"{self.entropy_loss_form!r}"
+            )
+        if self.entropy_observations not in self.ENTROPY_OBSERVATIONS:
+            raise ValueError(
+                f"{self._name()}.entropy_observations must be one of {self.ENTROPY_OBSERVATIONS}, "
+                f"got {self.entropy_observations!r}"
             )
         if self.batch_size < 1 or self.gradient_steps < 1:
             raise ValueError(
