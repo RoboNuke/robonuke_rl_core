@@ -18,7 +18,6 @@ from robonuke_rl_core.recording import (
     Overlay,
     StepData,
     build_overlays,
-    manager_reward_scale,
     register_overlay,
 )
 
@@ -485,7 +484,7 @@ def test_the_overlay_sees_each_envs_own_eval_state(tmp_path, clean_registry):
     assert seen[2].state == {}  # a step without the channel
 
 
-def test_the_overlays_see_the_reward_times_the_reward_scale(tmp_path, clean_registry):
+def test_the_overlays_see_the_reward_and_return_as_the_env_delivers_them(tmp_path, clean_registry):
     seen: list[StepData] = []
 
     class Spy(Overlay):
@@ -496,29 +495,13 @@ def test_the_overlays_see_the_reward_times_the_reward_scale(tmp_path, clean_regi
             return frame
 
     register_overlay(Spy)
-    rec = EvalRecorder(FakeEnv(), output_dir=tmp_path / "videos", fps=10, overlays=("spy",), camera=FakeCamera(),
-                       reward_scale=10.0)
+    rec = EvalRecorder(FakeEnv(), output_dir=tmp_path / "videos", fps=10, overlays=("spy",), camera=FakeCamera())
     rec.start_round(0)
     for _ in range(2):
         rec.capture(torch.tensor([True, False, False]), rewards=torch.full((NUM_ENVS, 1), 0.1))
     rec.end_round()
-    assert [s.reward for s in seen] == pytest.approx([1.0, 1.0])
-    assert seen[-1].total_reward == pytest.approx(2.0)
-
-
-def test_the_manager_reward_scale_undoes_isaac_labs_step_dt():
-    class Manager:
-        reward_manager, step_dt = object(), 0.1
-
-    class Direct:
-        step_dt = 0.1
-
-    class Wrapped:
-        unwrapped = Manager()
-
-    assert manager_reward_scale(Manager()) == pytest.approx(10.0)
-    assert manager_reward_scale(Wrapped()) == pytest.approx(10.0)
-    assert manager_reward_scale(Direct()) == 1.0  # a direct env's reward is its own
+    assert [s.reward for s in seen] == pytest.approx([0.1, 0.1])
+    assert seen[-1].total_reward == pytest.approx(0.2)
 
 
 def test_a_whole_episode_overlay_sees_every_step_before_drawing_the_raw_frames(tmp_path, clean_registry):

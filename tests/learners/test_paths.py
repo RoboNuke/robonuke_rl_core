@@ -101,6 +101,45 @@ def test_cosine_lr_decays_and_constant_does_not(learner_name):
             assert end == start, f"{learner_name}: constant LR changed"
 
 
+def test_ppo_lr_warmup_is_linear_and_per_optimizer():
+    """ResiP: 5 warm-up iterations for the actor, none for the critic. The first update runs
+    at LR 0, so the policy's weights do not move while the value net's do."""
+    learner = build_learner(
+        "ppo", num_agents=2, envs_per_agent=2, policy_lr_warmup=4, value_lr_warmup=0,
+        policy_lr=1.0e-3, value_lr=5.0e-3, lr_schedule="cosine", lr_end=0.0,
+    )
+    fill_memory(learner)
+    policy_before = params_of(learner.policy).clone()
+    value_before = params_of(learner.value).clone()
+    seen = []
+    for _ in range(5):
+        torch.manual_seed(3)
+        learner.update(timestep=0, timesteps=100)  # 100 // 4 rollouts = 25 updates in all
+        seen.append((float(learner.policy_optimizer.lr[0]), float(learner.value_optimizer.lr[0])))
+        if len(seen) == 1:
+            assert torch.equal(policy_before, params_of(learner.policy))  # LR 0: not moved
+            assert not torch.equal(value_before, params_of(learner.value))
+    assert [p for p, _ in seen] == pytest.approx([0.0, 0.25e-3, 0.5e-3, 0.75e-3, 1.0e-3])
+    values = [v for _, v in seen]  # no warm-up: the cosine from the first update on
+    assert values[0] == pytest.approx(5.0e-3) and values == sorted(values, reverse=True)
+    learner.update(timestep=0, timesteps=100)
+    assert float(learner.policy_optimizer.lr[0]) < 1.0e-3  # past the peak, the cosine decays
+
+
+def test_sac_lr_warmup_counts_gradient_steps_and_works_with_a_constant_schedule():
+    learner = build_learner(
+        "sac", num_agents=2, envs_per_agent=2, actor_lr_warmup=3, critic_lr_warmup=0,
+        actor_lr=1.0e-3, critic_lr=2.0e-3, gradient_steps=1,
+    )
+    fill_memory(learner)
+    seen = []
+    for _ in range(4):
+        learner.update(timestep=0, timesteps=100)
+        seen.append((float(learner.policy_optimizer.lr[0]), float(learner.critic_optimizer.lr[0])))
+    assert [a for a, _ in seen] == pytest.approx([0.0, 1.0e-3 / 3, 2.0e-3 / 3, 1.0e-3])
+    assert [c for _, c in seen] == pytest.approx([2.0e-3] * 4)
+
+
 # ------------------------------------------------------------------ reward shaper
 def scale_rewards(rewards, timestep, timesteps):
     """A "module:name" shaper, the only way a callable enters a config."""

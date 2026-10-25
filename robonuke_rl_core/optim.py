@@ -254,20 +254,30 @@ class BlockAdamW:
         )
 
 
-def lr_at(update: int, total_updates: int, lr: float, lr_end: float, schedule: str) -> float:
+def lr_at(
+    update: int, total_updates: int, lr: float, lr_end: float, schedule: str, warmup: int = 0
+) -> float:
     """The learning rate for update ``update``, from the global update count only.
 
     ``constant`` returns ``lr``; ``cosine`` anneals ``lr -> lr_end`` over ``total_updates``,
-    matching ``CosineAnnealingLR``'s closed form. The schedule never reads the data, so it
-    cannot couple the agents.
+    matching ``CosineAnnealingLR``'s closed form. ``warmup`` > 0 prepends a linear warm-up of
+    that many updates, ``lr * update / warmup`` (so the first update runs at 0, as diffusers'
+    ``get_cosine_schedule_with_warmup`` does, which is what ResiP trains with), and the
+    schedule proper then runs over the ``total_updates - warmup`` updates that follow. The
+    schedule never reads the data, so it cannot couple the agents.
     """
+    if schedule not in ("constant", "cosine"):
+        raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {schedule!r}")
+    if warmup < 0:
+        raise ValueError(f"lr warmup must be >= 0 updates, got {warmup}")
+    if warmup > 0 and update < warmup:
+        return float(lr) * max(update, 0) / warmup
     if schedule == "constant":
         return float(lr)
-    if schedule != "cosine":
-        raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {schedule!r}")
     if total_updates < 1:
         raise ValueError(f"total_updates must be >= 1 for a cosine schedule, got {total_updates}")
-    progress = min(max(update, 0), total_updates) / total_updates
+    remaining = max(1, total_updates - warmup)
+    progress = min(max(update - warmup, 0), remaining) / remaining
     return float(lr_end + 0.5 * (lr - lr_end) * (1.0 + math.cos(math.pi * progress)))
 
 

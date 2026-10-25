@@ -14,7 +14,8 @@ from typing import Any, Callable, Dict
 from skrl.models.torch import Model
 
 from .simba import EnsembleActor, EnsembleQCritic, EnsembleValueCritic
-from .cfg import SimbaModelCfg
+from .mlp import MlpActor, MlpQCritic, MlpValueCritic
+from .cfg import MlpModelCfg, SimbaModelCfg
 
 __all__ = ["MODEL_BUILDERS", "build_models", "actor_kwargs"]
 
@@ -133,10 +134,87 @@ def _critic_kwargs(model_cfg: SimbaModelCfg) -> dict:
     }
 
 
+def _build_mlp_sac(
+    model_cfg: MlpModelCfg,
+    obs_space,
+    state_space,
+    action_space,
+    num_agents,
+    device,
+    actor,
+    num_critics: int = 2,
+):
+    """``architecture: mlp`` for SAC: a squashed-Gaussian MLP actor + ``num_critics`` MLP Q
+    critics stacked in one module and their targets, laid out exactly as :func:`_build_sac`."""
+    if num_critics < 2:
+        raise ValueError(f"SAC needs at least 2 critics (sac.num_critics), got {num_critics}")
+    if not actor.get("squash", True):
+        raise ValueError("SAC's actor is tanh-squashed: model.actor.squash must be true for trainer.learner: sac")
+    critic_space = state_space if state_space is not None else obs_space
+
+    def make_q():
+        return MlpQCritic(
+            observation_space=critic_space,
+            action_space=action_space,
+            device=device,
+            num_agents=num_agents,
+            members=num_critics,
+            **_kwargs(model_cfg.critic),
+        )
+
+    models = {
+        "policy": MlpActor(
+            observation_space=obs_space,
+            action_space=action_space,
+            device=device,
+            num_agents=num_agents,
+            **actor,
+        ),
+    }
+    models["critics"] = make_q()
+    models["target_critics"] = make_q()
+    return models
+
+
+def _build_mlp_ppo(
+    model_cfg: MlpModelCfg,
+    obs_space,
+    state_space,
+    action_space,
+    num_agents,
+    device,
+    actor,
+    num_critics: int = 2,
+):
+    """``architecture: mlp`` for PPO: a Gaussian MLP actor (squashed or plain) + one MLP value
+    critic."""
+    if num_critics != 2:
+        raise ValueError(f"num_critics is a SAC option; PPO builds one value critic (got {num_critics})")
+    critic_space = state_space if state_space is not None else obs_space
+    return {
+        "policy": MlpActor(
+            observation_space=obs_space,
+            action_space=action_space,
+            device=device,
+            num_agents=num_agents,
+            **actor,
+        ),
+        "value": MlpValueCritic(
+            observation_space=critic_space,
+            action_space=action_space,
+            device=device,
+            num_agents=num_agents,
+            **_kwargs(model_cfg.critic),
+        ),
+    }
+
+
 #: (architecture, learner) -> builder. A new architecture or learner adds its pairs here.
 MODEL_BUILDERS: Dict[tuple, Callable[..., Dict[str, Model]]] = {
     ("simba", "sac"): _build_sac,
     ("simba", "ppo"): _build_ppo,
+    ("mlp", "sac"): _build_mlp_sac,
+    ("mlp", "ppo"): _build_mlp_ppo,
 }
 
 

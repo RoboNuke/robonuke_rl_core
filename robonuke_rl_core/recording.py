@@ -44,7 +44,6 @@ __all__ = [
     "HudOverlay",
     "EvalRecorder",
     "VideoWriter",
-    "manager_reward_scale",
     "render_resets",
 ]
 
@@ -346,7 +345,8 @@ def build_overlays(names: Sequence[str]) -> List[Overlay]:
 @register_overlay
 class HudOverlay(Overlay):
     """Step, reward and return in a banner across the top; the outcome when it ends. The reward
-    is the recorder's (``reward_scale``: Isaac Lab's manager-based step_dt scaling undone)."""
+    is the env's as the agent sees it (``envs.build.wrap_for_skrl`` divides Isaac Lab's step_dt
+    out of a manager-based env's)."""
 
     name = "hud"
     #: rows the banner owns; nothing outside it is touched
@@ -389,16 +389,13 @@ class EvalRecorder:
         pad_to: Optional[int] = None,
         causes: Any = None,
         substeps: int = 1,
-        reward_scale: float = 1.0,
     ) -> None:
         """``pad_to``: frames every video is padded to (the episode limit), by holding an env's
         last frame with the cause of its end written across it. ``causes``: a callable
         returning, after a step, one label per env for why its episode ended
         (:func:`termination_causes`); without it the label is the outcome (``terminal`` /
         ``timeout``). ``substeps``: frames per control step; above 1 they are grabbed inside
-        the step, one per ``sim.render()`` (:class:`SubstepFrames`, ``eval.render_every``).
-        ``reward_scale``: the overlays' reward and return are the env's times this
-        (:func:`manager_reward_scale` undoes Isaac Lab's manager-based step_dt scaling)."""
+        the step, one per ``sim.render()`` (:class:`SubstepFrames`, ``eval.render_every``)."""
         from pathlib import Path
 
         self.env = env
@@ -423,7 +420,6 @@ class EvalRecorder:
         if self.substeps < 1:
             raise ValueError(f"substeps must be >= 1, got {substeps}")
         self._grabber = SubstepFrames(env, self.camera) if self.substeps > 1 else None
-        self.reward_scale = float(reward_scale)
         #: draw after the round: some overlay needs the whole episode
         self.deferred = any(overlay.whole_episode for overlay in self.overlays)
         #: per env this round, when deferred: its lossless raw writer and its steps
@@ -492,7 +488,7 @@ class EvalRecorder:
             numpy_steps = [f.numpy() for f in per_step]
             labels = None
             for env in keep:
-                reward = float(rewards_list[env]) * self.reward_scale if rewards_list else 0.0
+                reward = float(rewards_list[env]) if rewards_list else 0.0
                 self._returns[env] = self._returns.get(env, 0.0) + reward
                 step = StepData(
                     env=env,
@@ -598,16 +594,6 @@ class EvalRecorder:
             self._writers[env] = VideoWriter(path, self.fps)
             self.paths[(self._round, env)] = path
         return self._writers[env]
-
-
-def manager_reward_scale(env: Any) -> float:
-    """``1 / step_dt`` for an Isaac Lab manager-based RL env, whose reward manager multiplies every
-    term by its weight and ``step_dt``, so a weight-1 term of 1 arrives as ``step_dt``; else 1.0
-    (a direct env's reward is whatever it computes)."""
-    unwrapped = getattr(env, "unwrapped", env)
-    if getattr(unwrapped, "reward_manager", None) is None:
-        return 1.0
-    return 1.0 / float(unwrapped.step_dt)
 
 
 def end_card(frame: Any, label: str) -> Any:

@@ -907,39 +907,83 @@ def _download(run: Any, name: str, directory: Any, spec: str) -> "Path":
     return path
 
 
-def upload_eval_results(
-    spec: str, out_dir: Any, root: Any, *, api: Any = None
-) -> List[str]:
-    """Attach an eval's output files to the ORIGINAL training run, as plain run files.
+#: what a resumed run must not add to the training run it uploads into: its metadata, git state,
+#: code, requirements, system stats and console log stay the training process's own
+QUIET_RESUME_SETTINGS = {
+    "x_disable_meta": True,
+    "x_disable_machine_info": True,
+    "x_disable_stats": True,
+    "disable_git": True,
+    "save_code": False,
+    "disable_code": True,
+    "x_save_requirements": False,
+    "console": "off",
+    "silent": True,
+}
 
-    Stored under the path ``out_dir`` has relative to ``root`` — which is
-    ``videos/<eval-config-stem>_<timestamp>/...`` or ``eval/...`` (:func:`eval_output_dir`),
-    so repeated evals never overwrite each other. Nothing is logged as a wandb metric: the per-step trace is the data, and any
-    aggregate can be re-derived from it offline.
+
+def upload_eval_results(
+    spec: str, out_dir: Any, root: Any, *, api: Any = None, init: Any = None,
+    checks: int = 24, check_interval: float = 5.0,
+) -> List[str]:
+    """Attach an eval's per-step trace to the ORIGINAL training run: its ``*.parquet`` files only.
+
+    Videos, the summary and the config stay on disk; nothing else is ever uploaded. Each parquet
+    is stored under the path it has relative to ``root`` — ``videos/<eval-config-stem>_<timestamp>/``
+    or ``eval/...`` (:func:`eval_output_dir`) — so repeated evals never overwrite each other.
+    Nothing is logged as a wandb metric: the per-step trace is the data, and any aggregate can be
+    re-derived from it offline.
+
+    The upload goes through the training run resumed (``wandb.init(id=..., resume="must")`` with
+    :data:`QUIET_RESUME_SETTINGS`), which leaves the run finished. ``Api`` ``Run.upload_file`` is
+    not used: on a finished or crashed run it stores the bytes but never registers the file (wandb
+    0.27: a 0-byte stub, reported as uploaded). A run still running is refused, since resuming it
+    would write beside the live process. Every parquet is then checked on wandb, size for size;
+    one that does not register within ``checks * check_interval`` seconds raises.
 
     Returns the names the files were stored under.
     """
+    import time
     from pathlib import Path
 
     parts = [piece for piece in str(spec).split("/") if piece]
     if len(parts) != 3:
         raise ValueError(f"expected 'entity/project/run', got {spec!r}")
     entity, project, wanted = parts
-    if api is None:
+    if api is None or init is None:
         import wandb  # lazy
 
-        api = wandb.Api()
+        api = api if api is not None else wandb.Api()
+        init = init if init is not None else wandb.init
     run = _wandb_run(api, entity, project, wanted)
 
     out_dir, root = Path(out_dir), Path(root)
-    stored: List[str] = []
-    for path in sorted(p for p in out_dir.rglob("*") if p.is_file()):
-        name = str(path.relative_to(root))
-        run.upload_file(str(path), root=str(root))
-        stored.append(name)
-    if not stored:
-        raise FileNotFoundError(f"nothing to upload: {out_dir} holds no files")
-    return stored
+    parquets = sorted(p for p in out_dir.rglob("*.parquet") if p.is_file())
+    if not parquets:
+        raise FileNotFoundError(f"nothing to upload: {out_dir} holds no .parquet trace")
+    if getattr(run, "state", None) == "running":
+        raise RuntimeError(
+            f"wandb run {spec} is still running: its eval trace stays in {out_dir} (upload it once "
+            "the run has finished; resuming a live run would write beside its process)"
+        )
+    resumed = init(entity=entity, project=project, id=run.id, resume="must", settings=dict(QUIET_RESUME_SETTINGS))
+    names = [str(path.relative_to(root)) for path in parquets]
+    for path in parquets:
+        resumed.save(str(path), base_path=str(root), policy="now")
+    resumed.finish()
+
+    want = {name: path.stat().st_size for name, path in zip(names, parquets)}
+    for attempt in range(checks):
+        fresh = api.run(f"{entity}/{project}/{run.id}")
+        missing = {name: size for name, size in want.items() if getattr(fresh.file(name), "size", 0) != size}
+        if not missing:
+            return names
+        if attempt < checks - 1:
+            time.sleep(check_interval)
+    raise RuntimeError(
+        f"wandb run {spec} did not register {sorted(missing)} (sizes {missing}) after the upload; the "
+        f"trace is still in {out_dir}"
+    )
 
 
 #: project learners' eval policies: ``trainer.learner`` -> ``fn(cfg, env, checkpoint,

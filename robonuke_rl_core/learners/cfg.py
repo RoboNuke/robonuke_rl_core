@@ -97,13 +97,30 @@ class _CommonCfg:
     normalizer_clip: float = 5.0
     #: ``"module:name"`` of a ``f(rewards, timestep, timesteps) -> rewards`` shaper
     rewards_shaper: Optional[str] = None
+    #: scale the stored reward by its per-agent running std (ResiP's ``RunningMeanStdClip``:
+    #: ``r / sqrt(var + 1e-8)``, no mean subtraction, the variance updated from every env
+    #: step's batch of rewards), after the shaper; episode returns and ``reward/step`` keep
+    #: the raw reward
+    normalize_rewards: bool = False
+    #: the scaled reward is clipped to +-this
+    reward_clip: float = 5.0
+
+    def _validate_common(self, name: str) -> None:
+        if self.reward_clip <= 0.0:
+            raise ValueError(f"{name}.reward_clip must be > 0, got {self.reward_clip}")
 
 
 @dataclass
 class SACCfg(_CommonCfg):
     """Soft Actor-Critic."""
 
+    #: gradient steps per update round
     gradient_steps: int = 1
+    #: env steps between update rounds, once ``learning_starts`` is passed: a round of
+    #: ``gradient_steps`` runs at every env step ``t >= learning_starts`` with
+    #: ``(t - learning_starts) % update_every == 0``, so the update-to-data ratio is
+    #: ``gradient_steps / (update_every * num_envs)`` (Policy Decorator: 16 steps every 4)
+    update_every: int = 1
     #: transitions sampled **per agent** per gradient step
     batch_size: int = 64
     polyak: float = 0.005
@@ -113,6 +130,10 @@ class SACCfg(_CommonCfg):
     #: "constant" or "cosine" (cosine decays actor and critic LR to ``lr_end``)
     lr_schedule: str = "constant"
     lr_end: float = 1.5e-4
+    #: linear LR warm-up, in gradient steps, before the schedule proper (``optim.lr_at``);
+    #: separately for the actor and the critics. 0 is none
+    actor_lr_warmup: int = 0
+    critic_lr_warmup: int = 0
     learn_entropy: bool = True
     initial_entropy_value: float = 0.2
     #: target entropy; None means -|A|
@@ -161,15 +182,34 @@ class SACCfg(_CommonCfg):
     #: batch sizes. CUDA only (ignored on CPU); updates with aux losses, and mixed batches
     #: while the memory holds under half a batch, stay eager
     cuda_graph: bool = False
+    #: Policy Decorator's progressive exploration over this many env steps (its H): while
+    #: training, each env runs this step on the policy's actions with probability
+    #: ``min(timestep / H, 1)`` (one draw per env, every env step) and on zeros otherwise (for
+    #: a residual policy: the base alone); the zeros are what is executed and stored.
+    #: ``random_timesteps`` actions too. 0 is off
+    progressive_exploration_steps: int = 0
+    #: n-step TD targets: each critic target sums the next ``n_step`` rewards (fewer where the
+    #: episode ends first) and bootstraps ``gamma ** m * Q`` that many steps later
+    #: (``learners/n_step.py``); online rows and demo rows alike, uncorrected. 1 is classic
+    #: 1-step SAC
+    n_step: int = 1
 
     ACTOR_Q_REDUCTIONS = ("min", "mean")
     ENTROPY_OBSERVATIONS = ("current", "next")
 
     def validate(self, cfg: Any) -> None:
+        self._validate_common(self._name())
         if self.lr_schedule not in ("constant", "cosine"):
             raise ValueError(
                 f"{self._name()}.lr_schedule must be 'constant' or 'cosine', got {self.lr_schedule!r}"
             )
+        if self.actor_lr_warmup < 0 or self.critic_lr_warmup < 0:
+            raise ValueError(
+                f"{self._name()}.actor_lr_warmup and critic_lr_warmup must be >= 0 gradient steps, "
+                f"got {self.actor_lr_warmup} and {self.critic_lr_warmup}"
+            )
+        if self.update_every < 1:
+            raise ValueError(f"{self._name()}.update_every must be >= 1 env step, got {self.update_every}")
         if self.entropy_loss_form not in ("log_alpha", "alpha"):
             raise ValueError(
                 f"{self._name()}.entropy_loss_form must be 'log_alpha' or 'alpha', got "
@@ -243,6 +283,13 @@ class SACCfg(_CommonCfg):
                 f"{self._name()}.batch_size must be >= 2 to split a batch between demo and "
                 f"online rows, got {self.batch_size}"
             )
+        if self.n_step < 1:
+            raise ValueError(f"{self._name()}.n_step must be >= 1 (1 is 1-step TD), got {self.n_step}")
+        if self.progressive_exploration_steps < 0:
+            raise ValueError(
+                f"{self._name()}.progressive_exploration_steps must be >= 0 (0 is off), got "
+                f"{self.progressive_exploration_steps}"
+            )
 
     def _name(self) -> str:
         return "sac"
@@ -261,6 +308,11 @@ class PPOCfg(_CommonCfg):
     value_lr: float = 3.0e-4
     lr_schedule: str = "constant"
     lr_end: float = 1.5e-4
+    #: linear LR warm-up, in updates (rollouts), before the schedule proper (``optim.lr_at``);
+    #: separately for the policy and the value net (ResiP: 5 for the actor, 0 for the critic).
+    #: 0 is none
+    policy_lr_warmup: int = 0
+    value_lr_warmup: int = 0
     ratio_clip: float = 0.2
     value_clip: float = 0.2
     entropy_loss_scale: float = 0.0
@@ -273,11 +325,23 @@ class PPOCfg(_CommonCfg):
     normalize_values: bool = True
     #: extra value-only updates per minibatch after the combined update (1 = none)
     value_update_ratio: int = 1
+    #: reset EVERY env right after each update, so each rollout starts from fresh initial
+    #: conditions (ResiP's ``reset_every_iteration``). Needs the package's trainer
+    #: (``learners/trainer.py``, what ``train.py`` runs): it performs the reset and hands the
+    #: fresh observations to the next rollout. The episodes cut by the reset are not counted
+    #: in the episode statistics
+    reset_every_iteration: bool = False
 
     def validate(self, cfg: Any) -> None:
+        self._validate_common("ppo")
         if self.lr_schedule not in ("constant", "cosine"):
             raise ValueError(
                 f"ppo.lr_schedule must be 'constant' or 'cosine', got {self.lr_schedule!r}"
+            )
+        if self.policy_lr_warmup < 0 or self.value_lr_warmup < 0:
+            raise ValueError(
+                "ppo.policy_lr_warmup and value_lr_warmup must be >= 0 updates, got "
+                f"{self.policy_lr_warmup} and {self.value_lr_warmup}"
             )
         if self.rollouts < 1 or self.learning_epochs < 1 or self.mini_batches < 1:
             raise ValueError(

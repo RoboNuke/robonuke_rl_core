@@ -1,6 +1,7 @@
-"""SAC beyond the classic twin: the Q ensemble, the delayed / late-starting actor, and demo
-transitions mixed into the critic's batches. Each is off by default; the default path's
-equivalence with the old twin is what every other SAC test already pins.
+"""SAC beyond the classic twin: the Q ensemble, the delayed / late-starting actor, demo
+transitions mixed into the critic's batches, the critic-action transform, and Policy Decorator's
+progressive exploration. Each is off by default; the default path's equivalence
+with the old twin is what every other SAC test already pins.
 """
 
 from __future__ import annotations
@@ -57,6 +58,11 @@ def changed(before, module, agent: int = 0) -> bool:
         ({"demo_transitions": "x.pt"}, "window"),
         ({"demo_transitions": "x.pt", "demo_sampling_end": 10, "batch_size": 1}, "batch_size"),
         ({"entropy_observations": "previous"}, "entropy_observations"),
+        ({"progressive_exploration_steps": -1}, "progressive_exploration_steps"),
+        ({"update_every": 0}, "update_every"),
+        ({"actor_lr_warmup": -1}, "actor_lr_warmup"),
+        ({"critic_lr_warmup": -1}, "critic_lr_warmup"),
+        ({"reward_clip": 0.0}, "reward_clip"),
     ],
 )
 def test_each_rule_rejects_a_bad_value(fields, match):
@@ -77,6 +83,10 @@ def test_the_defaults_and_a_full_setup_pass():
         demo_transitions="demos.pt",
         demo_sampling_start=0,
         demo_sampling_end=22400,
+        progressive_exploration_steps=30000,
+        update_every=4,
+        actor_lr_warmup=100,
+        normalize_rewards=True,
     ).validate(None)
 
 
@@ -351,14 +361,19 @@ def test_a_learner_without_memory_never_reads_the_demo_file():
         {"num_critics": 4, "critic_subset": 2, "actor_q_reduction": "mean", "gradient_steps": 2, "policy_delay": 2},
         {"demo": True},
         {"demo": True, "num_critics": 3, "critic_subset": 2, "gradient_steps": 2, "policy_delay": 2},
+        {"n_step": 3},
+        {"demo": True, "n_step": 3},
     ],
 )
 def test_one_agents_data_cannot_change_another_agents_update(tmp_path, overrides):
     overrides = dict(overrides)
     if overrides.pop("demo", False):
+        obs = torch.randn(33, OBS_DIM)
+        # n-step folds demo rows within episodes: one 32-step episode, each row handing on its state
+        chained = {"observations": obs[:-1], "next_observations": obs[1:]} if overrides.get("n_step", 1) > 1 else {}
         overrides.update(
             batch_size=8,
-            demo_transitions=write_demos(tmp_path / "demos.pt"),
+            demo_transitions=write_demos(tmp_path / "demos.pt", **chained),
             demo_sampling_start=0,
             demo_sampling_end=50,
         )
@@ -450,3 +465,363 @@ def test_the_graph_safe_sampler_only_draws_written_rows():
         written = memory.get_tensor_by_name("rewards")[agent, : memory.size].reshape(-1)
         assert torch.isin(sampled[agent], written).all()  # its own rows, never an unwritten (NaN) one
         assert len(torch.unique(sampled[agent])) == memory.size  # and every written row is reachable
+
+
+# ------------------------------------------------------------------ the critics' action input
+def _transform_step(learner, transform):
+    """One critic + actor gradient step with ``transform`` on, recording what the critics got."""
+    from helpers import fill_memory
+
+    fill_memory(learner)
+    learner.critic_action_transform = transform
+    taken, batches = [], []
+    for name in ("critics", "target_critics"):
+        model = getattr(learner, name)
+        original = model.act
+
+        def act(inputs, role="", _original=original, _name=name):
+            taken.append((_name, inputs["taken_actions"].detach().clone()))
+            return _original(inputs, role=role)
+
+        model.act = act
+    sample = learner._sample
+
+    def recorded_sample(rows, graph):
+        batches.append(sample(rows, graph))
+        return batches[-1]
+
+    learner._sample = recorded_sample
+    learner._gradient_step((False, True, True), learner.cfg.batch_size, 10, graph=False)
+    return taken, batches
+
+
+def test_a_critic_action_transform_feeds_every_critic_call_with_the_raw_observations():
+    learner = build_learner("sac", num_agents=1, gradient_steps=1, policy_delay=1)
+    seen = []
+
+    def transform(observations, actions):
+        seen.append(observations)
+        return actions + 100.0
+
+    taken, batches = _transform_step(learner, transform)
+    # the critic loss, its target, and the actor's Q: every one sees the transformed action
+    assert sorted(name for name, _ in taken) == ["critics", "critics", "target_critics"]
+    assert all(actions.min() > 50.0 for _, actions in taken)
+    raw = {id(batches[0]["observations"]), id(batches[0]["next_observations"])}
+    assert len(seen) == 3 and all(id(obs) in raw for obs in seen)  # before any normalizer
+
+
+def test_an_asymmetric_learner_hands_the_transform_the_critic_states_not_the_observations():
+    """A state space exists: the transform must see what the critic sees (``states`` for the
+    critic loss and the actor's Q, ``next_states`` for the target), never the actor's
+    observations, so it can read what is in the state alone."""
+    from helpers import STATE_DIM
+
+    learner = build_learner("sac", num_agents=1, asymmetric=True, gradient_steps=1, policy_delay=1)
+    seen = []
+
+    def transform(critic_inputs, actions):
+        seen.append(critic_inputs)
+        return actions + 100.0
+
+    taken, batches = _transform_step(learner, transform)
+    assert len(seen) == 3 and all(actions.min() > 50.0 for _, actions in taken)
+    batch = batches[0]
+    assert all(inputs.shape[-1] == STATE_DIM for inputs in seen)
+    # the target's call takes next_states, the critic loss and the actor's Q the states: the raw
+    # sampled tensors themselves, before any normalizer
+    ids = [id(inputs) for inputs in seen]
+    assert ids.count(id(batch["next_states"])) == 1 and ids.count(id(batch["states"])) == 2
+    assert not any(i in (id(batch["observations"]), id(batch["next_observations"])) for i in ids)
+
+
+def test_the_transform_sees_the_states_of_demo_rows_too(tmp_path):
+    """Inside the demo window the critic's batch is half demo rows; asymmetric demos carry
+    states / next_states, and that is what reaches the transform (widths tell them apart)."""
+    from helpers import STATE_DIM, fill_memory
+
+    rows = 32
+    path = write_demos(
+        tmp_path / "demos.pt", rows=rows,
+        states=torch.full((rows, STATE_DIM), 7.0), next_states=torch.full((rows, STATE_DIM), 8.0),
+    )
+    learner = build_learner(
+        "sac", num_agents=1, asymmetric=True, gradient_steps=1, policy_delay=1,
+        demo_transitions=path, demo_sampling_start=0, demo_sampling_end=100,
+    )
+    fill_memory(learner)
+    seen = []
+
+    def transform(critic_inputs, actions):
+        seen.append(critic_inputs.detach().clone())
+        return actions
+
+    learner.critic_action_transform = transform
+    mixed = {}
+    original = learner._mixed_batch
+    learner._mixed_batch = lambda rows, graph=False: mixed.setdefault("batch", original(rows, graph))
+    learner._gradient_step((True, True, True), learner.cfg.batch_size, 10, graph=False)
+    assert len(seen) == 3 and all(inputs.shape[-1] == STATE_DIM for inputs in seen)
+    batch = mixed["batch"]
+    # the critic step's two calls: the target on the mixed batch's next_states, the loss on its
+    # states; demo rows are recognizable by their constant values in the second half
+    assert torch.equal(seen[0], batch["next_states"]) and torch.equal(seen[1], batch["states"])
+    half = learner.cfg.batch_size // 2
+    assert torch.all(seen[0][half:] == 8.0) and torch.all(seen[1][half:] == 7.0)
+    assert seen[2].shape[0] == learner.cfg.batch_size  # the actor's Q on its online batch's states
+
+
+def test_without_a_transform_the_critics_take_the_agents_action():
+    learner = build_learner("sac", num_agents=1, gradient_steps=1, policy_delay=1)
+    taken, _ = _transform_step(learner, None)
+    assert all(actions.abs().max() <= 1.0 for _, actions in taken)  # the squashed policy's own
+
+
+def test_a_transform_that_changes_the_action_shape_is_refused():
+    learner = build_learner("sac", num_agents=1, gradient_steps=1, policy_delay=1)
+    with pytest.raises(ValueError, match="critic action transform"):
+        _transform_step(learner, lambda observations, actions: actions[..., :1])
+
+
+def test_at_most_one_registered_builder_may_answer(monkeypatch):
+    from robonuke_rl_core.learners import sac
+
+    monkeypatch.setattr(sac, "CRITIC_ACTION_BUILDERS", [])
+    assert sac.critic_action_transform(None, None) is None
+    sac.register_critic_action(lambda cfg, env: None)
+    sac.register_critic_action(lambda cfg, env: (lambda obs, act: act))
+    assert sac.critic_action_transform(None, None) is not None
+    sac.register_critic_action(lambda cfg, env: (lambda obs, act: act))
+    with pytest.raises(ValueError, match="at most one"):
+        sac.critic_action_transform(None, None)
+
+
+# ---------------------------------------------------------------------- progressive exploration (Policy Decorator)
+def _fixed_policy(learner, value: float = 0.5):
+    """The policy's act replaced by constant actions, so a kept row is recognizable."""
+    learner.policy.act = lambda inputs, role="": (
+        torch.full((inputs["observations"].shape[0], ACT_DIM), value), {}
+    )
+
+
+def _shares(learner):
+    shares = []
+    learner.on_log.append(
+        lambda agent, metrics, step: shares.append((agent, float(metrics["exploration/policy_share"])))
+        if "exploration/policy_share" in metrics else None
+    )
+    return shares
+
+
+def _record(learner, ended, timestep: int) -> None:
+    """One env-step into the learner, the envs in ``ended`` timing out."""
+    n = learner.num_envs
+    learner.record_transition(
+        observations=torch.randn(n, OBS_DIM), states=None, actions=torch.zeros(n, ACT_DIM),
+        rewards=torch.zeros(n, 1), next_observations=torch.randn(n, OBS_DIM), next_states=None,
+        terminated=torch.zeros(n, 1, dtype=torch.bool), truncated=ended.view(-1, 1), infos={},
+        timestep=timestep, timesteps=10000,
+    )
+
+
+def test_progressive_exploration_draws_each_env_every_step_with_probability_t_over_h():
+    learner = build_learner("sac", num_agents=2, envs_per_agent=500, progressive_exploration_steps=1000)
+    _fixed_policy(learner)
+    shares = _shares(learner)
+    observations = torch.randn(1000, OBS_DIM)
+    actions, _ = learner.act(observations, None, timestep=250, timesteps=10000)
+    kept = (actions == 0.5).all(dim=1)
+    assert torch.equal(kept | (actions == 0.0).all(dim=1), torch.ones(1000, dtype=torch.bool))  # whole rows
+    per_agent = kept.float().view(2, 500).mean(dim=1)
+    assert all(abs(share - 0.25) < 0.08 for share in per_agent.tolist())
+    assert shares == [(0, float(per_agent[0])), (1, float(per_agent[1]))]  # the realized share
+    # a fresh draw EVERY env step, mid-episode too (Policy Decorator's per-step mask): the next
+    # step's mask is another sample at the same share, not the last one held
+    _record(learner, torch.zeros(1000, dtype=torch.bool), timestep=250)
+    again, _ = learner.act(observations, None, timestep=251, timesteps=10000)
+    again_kept = (again == 0.5).all(dim=1)
+    assert not torch.equal(again_kept, kept)
+    assert abs(float(again_kept.float().mean()) - 0.25) < 0.08
+    # the share follows the step count, and from H on every env runs the policy every step
+    later, _ = learner.act(observations, None, timestep=750, timesteps=10000)
+    assert abs(float((later == 0.5).all(dim=1).float().mean()) - 0.75) < 0.08
+    for timestep in (1000, 5000):
+        after, _ = learner.act(observations, None, timestep=timestep, timesteps=10000)
+        assert torch.all(after == 0.5)
+
+
+def test_one_uniform_per_env_per_step_and_the_first_step_runs_the_base_alone():
+    learner = build_learner("sac", num_agents=1, envs_per_agent=8, progressive_exploration_steps=1000)
+    _fixed_policy(learner)
+    start, _ = learner.act(torch.randn(8, OBS_DIM), None, timestep=0, timesteps=10000)
+    assert torch.equal(start, torch.zeros_like(start))
+    # the draw is rand(num_envs, 1) < t / H and nothing else, so it depends on the step alone
+    torch.manual_seed(7)
+    actions, _ = learner.act(torch.randn(8, OBS_DIM), None, timestep=500, timesteps=10000)
+    torch.manual_seed(7)
+    torch.randn(8, OBS_DIM)  # the observations drawn above
+    expected = torch.rand(8, 1) < 0.5
+    assert torch.equal((actions == 0.5).all(dim=1, keepdim=True), expected)
+
+
+# ---------------------------------------------------------------------- update cadence (update_every)
+def test_update_every_runs_a_round_of_gradient_steps_every_so_many_env_steps_after_learning_starts():
+    learner = build_learner("sac", num_agents=1, envs_per_agent=4, learning_starts=2, update_every=3, gradient_steps=2)
+    rounds = []
+    learner.update = lambda timestep, timesteps: rounds.append(timestep)
+    for timestep in range(12):
+        learner._update_if_ready(timestep=timestep, timesteps=12)
+    assert rounds == [2, 5, 8, 11]
+    assert learner._update_rounds(12) == 4 and learner._update_rounds(2) == 0  # what the LR schedule spans
+
+    default = build_learner("sac", num_agents=1, envs_per_agent=4)
+    rounds = []
+    default.update = lambda timestep, timesteps: rounds.append(timestep)
+    for timestep in range(5):
+        default._update_if_ready(timestep=timestep, timesteps=5)
+    assert rounds == [0, 1, 2, 3, 4]  # update_every 1: every env step, as before
+
+
+def test_update_every_composes_with_gradient_steps_and_policy_delay():
+    """16 gradient steps every 4 env steps on 16 envs (Policy Decorator) is UTD 0.25; here 2
+    every 3, the actor on every 2nd gradient step: two rounds give 4 gradient steps and 2 actor
+    steps, and the metrics come once per round."""
+    learner = build_learner("sac", num_agents=1, envs_per_agent=4, update_every=3, gradient_steps=2, policy_delay=2)
+    fill_memory(learner)
+    emitted = []
+    learner.on_log.append(lambda agent, metrics, step: emitted.append(set(metrics)))
+    before = weights(learner.policy)
+    for timestep in range(6):
+        learner._update_if_ready(timestep=timestep, timesteps=6)
+    assert learner._updates == 4
+    assert sum("lr/critic" in keys for keys in emitted) == 2  # one point per round
+    assert sum("grad_norm/policy" in keys for keys in emitted) == 2  # the actor stepped in each round
+    assert changed(before, learner.policy)
+
+
+def test_progressive_exploration_masks_the_random_warmup_actions_too():
+    learner = build_learner("sac", num_agents=1, envs_per_agent=8, random_timesteps=10, progressive_exploration_steps=1000)
+    actions, _ = learner.act(torch.randn(8, OBS_DIM), None, timestep=0, timesteps=100)
+    assert torch.equal(actions, torch.zeros_like(actions))
+
+
+@pytest.mark.parametrize("steps, training", [(0, True), (1000, False)])
+def test_off_or_outside_training_the_policys_actions_pass_and_nothing_is_drawn(steps, training):
+    learner = build_learner("sac", num_agents=1, envs_per_agent=8, progressive_exploration_steps=steps)
+    learner.enable_training_mode(training)
+    _fixed_policy(learner)
+    shares = _shares(learner)
+    observations = torch.randn(8, OBS_DIM)
+    state = torch.random.get_rng_state()
+    actions, _ = learner.act(observations, None, timestep=10, timesteps=100)
+    assert torch.equal(actions, torch.full_like(actions, 0.5))
+    assert torch.equal(torch.random.get_rng_state(), state)
+    assert shares == []
+
+
+# ---------------------------------------------------------------------- n-step TD targets
+def _step(rewards, terminated=None, truncated=None, obs=None):
+    """One env-step of two envs: ``obs`` marks the step (observations = obs, next = obs + 1)."""
+    rows = len(rewards)
+    obs = torch.zeros(rows, 1) if obs is None else torch.full((rows, 1), float(obs))
+    flag = lambda v: torch.tensor(v or [False] * rows).view(-1, 1)  # noqa: E731
+    return {
+        "observations": obs, "next_observations": obs + 1, "actions": obs * 10,
+        "rewards": torch.tensor(rewards, dtype=torch.float32).view(-1, 1),
+        "terminated": flag(terminated), "truncated": flag(truncated),
+    }
+
+
+def test_an_n_step_row_sums_the_discounted_rewards_and_bootstraps_n_steps_on():
+    from robonuke_rl_core.learners.n_step import NStepWindow
+
+    window = NStepWindow(3, 0.5)
+    assert window.push(_step([1.0, 1.0], obs=0)) is None
+    assert window.push(_step([2.0, 2.0], obs=1)) is None
+    row = window.push(_step([4.0, 4.0], obs=2))
+    assert row["rewards"].flatten().tolist() == [1 + 0.5 * 2 + 0.25 * 4] * 2
+    assert row["discounts"].flatten().tolist() == [0.125] * 2
+    assert row["observations"].flatten().tolist() == [0.0, 0.0] and row["actions"].flatten().tolist() == [0.0, 0.0]
+    assert row["next_observations"].flatten().tolist() == [3.0, 3.0]  # the state 3 steps on
+    row = window.push(_step([8.0, 8.0], obs=3))  # the next row: the step after, one row per env each step
+    assert row["observations"].flatten().tolist() == [1.0, 1.0] and row["rewards"].flatten().tolist() == [2 + 2 + 2] * 2
+
+
+def test_a_window_stops_at_the_episode_end_and_keeps_its_flags():
+    """Env 0 terminates on the window's 2nd step, env 1 times out on its 1st: neither window reaches
+    into the next episode, each bootstraps (or not) from where it stopped."""
+    from robonuke_rl_core.learners.n_step import NStepWindow
+
+    window = NStepWindow(3, 0.5)
+    window.push(_step([1.0, 1.0], truncated=[False, True], obs=0))
+    window.push(_step([2.0, 100.0], terminated=[True, False], obs=1))
+    row = window.push(_step([100.0, 100.0], obs=2))
+    assert row["rewards"].flatten().tolist() == [1 + 0.5 * 2, 1.0]
+    assert row["discounts"].flatten().tolist() == [0.25, 0.5]
+    assert row["next_observations"].flatten().tolist() == [2.0, 1.0]
+    assert row["terminated"].flatten().tolist() == [True, False]
+    assert row["truncated"].flatten().tolist() == [False, True]
+
+
+def test_demo_rows_fold_within_their_episodes_and_an_unmarked_end_is_refused():
+    from robonuke_rl_core.learners.n_step import n_step_rows
+
+    obs = torch.tensor([[0.0], [1.0], [2.0], [10.0], [11.0]])
+    demo = {
+        "observations": obs,
+        "next_observations": torch.tensor([[1.0], [2.0], [3.0], [11.0], [12.0]]),
+        "actions": obs,
+        "rewards": torch.tensor([[0.0], [0.0], [1.0], [0.0], [0.0]]),
+        "terminated": torch.tensor([[False], [False], [True], [False], [False]]),  # episode 1: rows 0-2
+        "truncated": torch.zeros(5, 1, dtype=torch.bool),  # episode 2: rows 3-4, the file's end
+    }
+    out = n_step_rows(demo, 2, 0.5)
+    assert out["rewards"].flatten().tolist() == [0.0, 0.5, 1.0, 0.0, 0.0]
+    assert out["discounts"].flatten().tolist() == [0.25, 0.25, 0.5, 0.25, 0.5]
+    assert out["next_observations"].flatten().tolist() == [2.0, 3.0, 3.0, 12.0, 12.0]
+    assert out["terminated"].flatten().tolist() == [False, True, True, False, False]
+    unmarked = dict(demo, terminated=torch.zeros(5, 1, dtype=torch.bool))
+    with pytest.raises(ValueError, match="demo row 2 ends no episode"):
+        n_step_rows(unmarked, 2, 0.5)
+
+
+def test_with_n_step_the_memory_gets_one_folded_row_per_env_per_step_and_the_target_its_discount():
+    learner = build_learner("sac", num_agents=2, n_step=3, normalize_observations=False)
+    stored = []
+    add = learner.memory.add_samples
+    learner.memory.add_samples = lambda **values: (stored.append(values), add(**values))[1]
+    fill_memory(learner, steps=6)
+    assert len(stored) == 6 - 2 and all(v["rewards"].shape[0] == learner.num_envs for v in stored)
+    assert "discounts" in learner._tensors_names
+    sampled = dict(zip(learner._tensors_names, learner.memory.sample(names=learner._tensors_names, batch_size=4)[0]))
+    sampled["discounts"] = torch.full_like(sampled["discounts"], 0.25)
+    inputs, next_inputs = {"observations": sampled["observations"]}, {"observations": sampled["next_observations"]}
+    learner.cfg.backup_entropy = False
+    torch.manual_seed(0)
+    _, _, _, target, _ = learner._compute_critic_loss(
+        sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=inputs, critic_next_inputs=next_inputs, rows=4,
+    )
+    sampled["rewards"] = torch.zeros_like(sampled["rewards"])
+    torch.manual_seed(0)
+    _, _, _, bootstrap, _ = learner._compute_critic_loss(
+        sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=inputs, critic_next_inputs=next_inputs, rows=4,
+    )
+    sampled["discounts"] = torch.full_like(sampled["discounts"], 0.5)
+    torch.manual_seed(0)
+    _, _, _, doubled, _ = learner._compute_critic_loss(
+        sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=inputs, critic_next_inputs=next_inputs, rows=4,
+    )
+    assert torch.allclose(doubled, 2 * bootstrap) and not torch.allclose(target, bootstrap)
+
+
+def test_with_n_step_the_demo_rows_are_folded_when_loaded(tmp_path):
+    rows = 6
+    obs = torch.randn(rows + 1, OBS_DIM)
+    path = write_demos(
+        tmp_path / "demos.pt", rows=rows, observations=obs[:-1], next_observations=obs[1:],
+        rewards=torch.ones(rows, 1),
+    )
+    learner = build_learner("sac", num_agents=1, n_step=3, demo_transitions=path, demo_sampling_start=0, demo_sampling_end=50,
+                            discount_factor=0.5)
+    assert learner._demo["rewards"].flatten().tolist() == [1.75, 1.75, 1.75, 1.75, 1.5, 1.0]
+    assert learner._demo["discounts"].flatten().tolist() == [0.125, 0.125, 0.125, 0.125, 0.25, 0.5]

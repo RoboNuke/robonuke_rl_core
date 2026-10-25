@@ -129,6 +129,9 @@ def test_unknown_learner_raises(tmp_path):
         ("sac.batch_size=0", "batch_size"),
         ("sac.polyak=0.0", "polyak"),
         ("sac.periodic_reset_enabled=true", "periodic_reset_frequency"),
+        ("sac.update_every=0", "update_every"),
+        ("sac.critic_lr_warmup=-1", "critic_lr_warmup"),
+        ("sac.reward_clip=0.0", "reward_clip"),
         ("memory.memory_size=0", "memory.memory_size"),
         ("model.actor.reduction=median", "reduction"),
         ("model.actor.min_log_std=5.0", "min_log_std"),
@@ -147,12 +150,55 @@ def test_each_validate_rule_fails_on_a_bad_value(tmp_path, override, needle):
         (["ppo.value_update_ratio=0"], "value_update_ratio"),
         (["ppo.rollouts=0"], "rollouts"),
         (["ppo.lr_schedule=step"], "lr_schedule"),
+        (["ppo.policy_lr_warmup=-1"], "policy_lr_warmup"),
+        (["ppo.reward_clip=-1.0"], "reward_clip"),
     ],
 )
 def test_ppo_rules(tmp_path, overrides, needle):
     with pytest.raises(ValueError) as err:
         load_config(write(tmp_path), ["trainer.learner=ppo"] + overrides)
     assert needle in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "overrides, needle",
+    [
+        (["model.actor.activation=Swish"], "activation"),
+        (["model.actor.init=xavier"], "init"),
+        (["model.actor.log_std_bound=sigmoid"], "log_std_bound"),
+        (["model.actor.learn_std=false", "model.actor.use_state_dependent_std=true"], "learn_std"),
+        (["model.actor.log_std_bound=tanh", "model.actor.init_log_std=-20.0"], "init_log_std"),
+        (["model.actor.min_log_std=3.0"], "min_log_std"),
+        (["model.actor.squash=false"], "squash"),  # trainer.learner is sac here
+        (["model.critic.num_layers=0"], "num_layers"),
+        (["model.critic.output_init_scale=0.0"], "output_init_scale"),
+    ],
+)
+def test_mlp_rules(tmp_path, overrides, needle):
+    with pytest.raises(ValueError) as err:
+        load_config(write(tmp_path), ["model.architecture=mlp"] + overrides)
+    assert needle in str(err.value)
+
+
+def test_the_two_papers_mlp_setups_load(tmp_path):
+    resip = load_config(
+        write(tmp_path),
+        ["trainer.learner=ppo", "model.architecture=mlp", "model.actor.hidden_size=512",
+         "model.actor.activation=SiLU", "model.actor.init=kaiming", "model.actor.squash=false",
+         "model.actor.init_log_std=-1.0", "model.actor.learn_std=false",
+         "model.critic.hidden_size=512", "model.critic.activation=SiLU", "model.critic.init=kaiming",
+         "ppo.reset_every_iteration=true", "ppo.normalize_rewards=true", "ppo.lr_schedule=cosine",
+         "ppo.policy_lr_warmup=5"],
+    )
+    assert resip.model.actor.squash is False and resip.model.actor.learn_std is False
+    assert resip.ppo.reset_every_iteration and resip.ppo.policy_lr_warmup == 5 and resip.ppo.value_lr_warmup == 0
+    decorator = load_config(
+        write(tmp_path),
+        ["model.architecture=mlp", "model.actor.num_layers=3", "model.actor.use_state_dependent_std=true",
+         "model.actor.log_std_bound=tanh", "model.critic.num_layers=3", "sac.update_every=4",
+         "sac.gradient_steps=16", "sac.progressive_exploration_steps=50000"],
+    )
+    assert decorator.model.actor.log_std_bound == "tanh" and decorator.sac.update_every == 4
 
 
 def test_a_callable_is_a_module_name_string(tmp_path):

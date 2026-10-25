@@ -282,3 +282,35 @@ def test_cosine_matches_torchs_closed_form():
             reference.get_last_lr()[0], rel=1e-9
         )
         reference.step()
+
+
+def test_lr_at_warmup_is_linear_then_the_schedule_runs_over_the_rest():
+    # the first update runs at 0, like diffusers' get_cosine_schedule_with_warmup (ResiP)
+    assert lr_at(0, 100, 1.0e-3, 1.0e-5, "cosine", warmup=5) == 0.0
+    assert lr_at(2, 100, 1.0e-3, 1.0e-5, "cosine", warmup=5) == pytest.approx(0.4e-3)
+    assert lr_at(5, 100, 1.0e-3, 1.0e-5, "cosine", warmup=5) == pytest.approx(1.0e-3)  # the peak
+    assert lr_at(100, 100, 1.0e-3, 1.0e-5, "cosine", warmup=5) == pytest.approx(1.0e-5)
+    after = [lr_at(step, 100, 1.0e-3, 1.0e-5, "cosine", warmup=5) for step in range(5, 101)]
+    assert after == sorted(after, reverse=True)
+    # constant: the warm-up, then flat
+    assert lr_at(3, 100, 1.0e-3, 0.0, "constant", warmup=4) == pytest.approx(0.75e-3)
+    assert lr_at(50, 100, 1.0e-3, 0.0, "constant", warmup=4) == 1.0e-3
+    # no warm-up is exactly the old schedule
+    assert lr_at(7, 100, 1.0e-3, 1.0e-5, "cosine", warmup=0) == lr_at(7, 100, 1.0e-3, 1.0e-5, "cosine")
+    with pytest.raises(ValueError):
+        lr_at(0, 100, 1.0e-3, 1.0e-5, "cosine", warmup=-1)
+
+
+def test_lr_at_with_warmup_matches_diffusers_cosine_schedule_with_warmup():
+    """diffusers.optimization.get_cosine_schedule_with_warmup (what ResiP steps once per
+    iteration): ``step / warmup`` during the warm-up, then ``0.5 (1 + cos(pi * progress))``
+    with ``progress = (step - warmup) / (total - warmup)``, decaying to 0."""
+    import math
+
+    total, warmup = 20, 5
+    for step in range(total + 1):
+        if step < warmup:
+            expected = step / warmup
+        else:
+            expected = 0.5 * (1.0 + math.cos(math.pi * (step - warmup) / (total - warmup)))
+        assert lr_at(step, total, 1.0, 0.0, "cosine", warmup=warmup) == pytest.approx(expected, abs=1e-12)

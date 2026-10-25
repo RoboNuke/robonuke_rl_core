@@ -218,12 +218,38 @@ def wrap_for_skrl(env: Any, seed: int) -> Any:
     its default, every run therefore continued from seed 0 after its first reset, whatever
     ``experiment.seed`` said. Setting the key here makes that first reset seed everything with
     the run's own seed. Every env the package or a project hands to skrl goes through this.
+
+    It is also where the reward gets its scale. Isaac Lab's manager-based reward manager pays every
+    term ``value * weight * step_dt``, so the reward would change with the control rate. For a
+    manager-based env the wrapper divides ``step_dt`` back out, so every consumer (the learners,
+    the logged returns, eval and its videos) sees the weighted sum of the terms as the MDP defines
+    it. A direct env's reward is whatever it computes and is left alone.
     """
     from skrl import config
     from skrl.envs.wrappers.torch import wrap_env
 
     config.torch.key = int(seed)
-    return wrap_env(env, wrapper="isaaclab")
+    unwrapped = getattr(env, "unwrapped", env)
+    if getattr(unwrapped, "reward_manager", None) is None:
+        return wrap_env(env, wrapper="isaaclab")
+    return _manager_reward_wrapper()(env, float(unwrapped.step_dt))
+
+
+def _manager_reward_wrapper():
+    """skrl's single-agent Isaac Lab wrapper with Isaac Lab's ``step_dt`` divided out of the reward
+    (a manager-based env is single-agent). Built on first use: skrl imports torch."""
+    from skrl.envs.wrappers.torch.isaaclab_envs import IsaacLabWrapper
+
+    class ManagerRewardIsaacLabWrapper(IsaacLabWrapper):
+        def __init__(self, env: Any, step_dt: float) -> None:
+            super().__init__(env)
+            self.step_dt = step_dt
+
+        def step(self, actions):
+            observations, reward, terminated, truncated, info = super().step(actions)
+            return observations, reward / self.step_dt, terminated, truncated, info
+
+    return ManagerRewardIsaacLabWrapper
 
 
 def reseed_env(env: Any, seed: int) -> None:

@@ -20,11 +20,11 @@ from robonuke_rl_core.models.factory import build_models
 pytestmark = pytest.mark.gpu
 
 
-def _learner(device) -> SAC:
+def _learner(device, n_step: int = 1) -> SAC:
     box = lambda d: gymnasium.spaces.Box(-np.inf, np.inf, (d,), np.float32)
     obs, state, act = box(6), box(9), box(2)
     cfg = SACCfg(batch_size=16, gradient_steps=2, policy_delay=2, num_critics=4, critic_subset=2,
-                 actor_q_reduction="mean", learning_starts=0)
+                 actor_q_reduction="mean", learning_starts=0, n_step=n_step)
     model = SimbaModelCfg(actor=SimbaActorCfg(actor_n=1, actor_latent=16), critic=SimbaCriticCfg(critic_n=1, critic_latent=16))
     torch.manual_seed(0)
     models = build_models("sac", model, obs, state, act, 2, device, num_critics=4)
@@ -41,11 +41,12 @@ def _learner(device) -> SAC:
     return learner
 
 
-def test_a_replayed_graph_step_equals_the_same_step_run_eagerly():
+@pytest.mark.parametrize("n_step", [1, 3])  # n_step > 1: the target reads the rows' own discounts
+def test_a_replayed_graph_step_equals_the_same_step_run_eagerly(n_step):
     if not torch.cuda.is_available():
         pytest.fail("this GPU test needs CUDA")
     device = torch.device("cuda")
-    eager = _learner(device)
+    eager = _learner(device, n_step)
     graphed = copy.deepcopy(eager)
     graphed._graphs = StepGraphs(warmup=1)
     mode = (False, True, True)  # critic + actor

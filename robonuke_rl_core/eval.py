@@ -25,7 +25,7 @@ FIRST episode of the round. Everything lands in the run's local directory, besid
 (``{trainer.output_dir}/{wandb.project}/{wandb.group}/{run name}``, made if missing). An eval
 that records goes to ``videos/<eval-config-stem>_<timestamp>/`` (the mp4s with its summary,
 trace and config), any other to ``eval/<eval-config-stem>_<timestamp>/``; ``--run`` then
-uploads the folder to the run under that same path.
+uploads the folder's ``.parquet`` trace (only that) to the run under that same path.
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ from robonuke_rl_core.envs.build import build_env, describe, prepare_task  # noq
 from robonuke_rl_core.recording import (  # noqa: E402
     EvalRecorder,
     install_recorder_camera,
-    manager_reward_scale,
     render_substeps,
     termination_causes,
     video_fps,
@@ -168,7 +167,6 @@ def main(argv=None, setup=None) -> int:
     # env discarded any task.cfg value the eval config set (check_env_kept_overrides)
     print(f"[eval] config: {dump(cfg, out_dir, env.unwrapped.cfg)}", flush=True)
     max_episode_length = int(env.unwrapped.max_episode_length)
-    reward_scale = manager_reward_scale(env.unwrapped)
     env = build_env(cfg, env, cfg.task_name)
     if describe(cfg):
         print(f"[eval] env wrappers: {' -> '.join(describe(cfg))}", flush=True)
@@ -201,8 +199,6 @@ def main(argv=None, setup=None) -> int:
             pad_to=max_episode_length * substeps if cfg.eval.video_full_length else None,
             causes=termination_causes(env),
             substeps=substeps,
-            # the video shows the reward as the task defines it, not Isaac Lab's dt-scaled one
-            reward_scale=reward_scale,
         )
         print(
             f"[eval] recording {cfg.eval.video_width}x{cfg.eval.video_height} @ "

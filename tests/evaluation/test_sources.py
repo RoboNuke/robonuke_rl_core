@@ -213,33 +213,93 @@ def test_an_eval_lands_beside_the_runs_checkpoints_in_videos_or_eval(tmp_path):
 
 
 # ------------------------------------------------------------------ results back to the run
-def test_eval_results_upload_under_their_folder_in_the_run(tmp_path):
-    from robonuke_rl_core.evaluation import upload_eval_results
+class FakeResumed:
+    """``wandb.init(resume="must")``'s run: ``save`` registers the file on the FakeRun (or not)."""
 
-    run = a_run()
-    api = FakeApi({"ent/proj/abc123": run})
+    def __init__(self, run: FakeRun, register: bool):
+        self.run, self.register, self.saved, self.finished = run, register, [], False
+
+    def save(self, path: str, base_path: str, policy: str):
+        import os
+
+        name = os.path.relpath(path, base_path)
+        self.saved.append((name, policy))
+        if self.register:
+            self.run._files[name] = FakeFile(name, os.path.getsize(path))
+
+    def finish(self):
+        self.finished = True
+
+
+def fake_init(run: FakeRun, register: bool = True):
+    calls: list = []
+
+    def init(**kwargs):
+        calls.append(kwargs)
+        calls.append(FakeResumed(run, register))
+        return calls[-1]
+
+    return init, calls
+
+
+def an_eval_folder(tmp_path):
     out_dir = tmp_path / "videos" / "quick_20260101-000000"
     out_dir.mkdir(parents=True)
     (out_dir / "summary.yaml").write_text("summary: {}\n")
-    (out_dir / "quick.parquet").write_bytes(b"PAR1")
+    (out_dir / "resolved_config.yaml").write_text("experiment: {}\n")
+    (out_dir / "quick.parquet").write_bytes(b"PAR1" * 8)
     (out_dir / "round0_env0.mp4").write_bytes(b"mp4")
-
-    names = upload_eval_results("ent/proj/abc123", out_dir, tmp_path, api=api)
-
-    # stored paths carry the folder, the eval-config stem and timestamp, so repeat evals never collide
-    assert names == [
-        "videos/quick_20260101-000000/quick.parquet",
-        "videos/quick_20260101-000000/round0_env0.mp4",
-        "videos/quick_20260101-000000/summary.yaml",
-    ]
-    assert [root for _, root in run.uploaded] == [str(tmp_path)] * 3
+    return out_dir
 
 
-def test_uploading_nothing_raises(tmp_path):
+def test_only_the_parquet_trace_is_uploaded_under_its_folder_in_the_training_run(tmp_path):
+    from robonuke_rl_core.evaluation import QUIET_RESUME_SETTINGS, upload_eval_results
+
+    run = a_run()
+    init, calls = fake_init(run)
+    out_dir = an_eval_folder(tmp_path)
+
+    names = upload_eval_results("ent/proj/abc123", out_dir, tmp_path, api=FakeApi({"ent/proj/abc123": run}), init=init)
+
+    # never the videos, summary or config; the stored path keeps the folder, stem and timestamp
+    assert names == ["videos/quick_20260101-000000/quick.parquet"]
+    kwargs, resumed = calls
+    assert kwargs == {"entity": "ent", "project": "proj", "id": "abc123", "resume": "must",
+                      "settings": QUIET_RESUME_SETTINGS}
+    assert resumed.saved == [("videos/quick_20260101-000000/quick.parquet", "now")] and resumed.finished
+    assert run.uploaded == []  # Api Run.upload_file never registers on a finished run
+
+
+def test_a_run_still_training_is_refused_before_anything_is_written(tmp_path):
     from robonuke_rl_core.evaluation import upload_eval_results
 
-    api = FakeApi({"ent/proj/abc123": a_run()})
-    empty = tmp_path / "eval" / "empty"
-    empty.mkdir(parents=True)
-    with pytest.raises(FileNotFoundError):
-        upload_eval_results("ent/proj/abc123", empty, tmp_path, api=api)
+    run = a_run()
+    run.state = "running"
+    init, calls = fake_init(run)
+    with pytest.raises(RuntimeError, match="still running"):
+        upload_eval_results("ent/proj/abc123", an_eval_folder(tmp_path), tmp_path,
+                            api=FakeApi({"ent/proj/abc123": run}), init=init)
+    assert calls == []
+
+
+def test_a_parquet_that_does_not_register_on_wandb_raises(tmp_path):
+    from robonuke_rl_core.evaluation import upload_eval_results
+
+    run = a_run()
+    init, _ = fake_init(run, register=False)  # the bytes went up, the file never appeared
+    with pytest.raises(RuntimeError, match="did not register"):
+        upload_eval_results("ent/proj/abc123", an_eval_folder(tmp_path), tmp_path,
+                            api=FakeApi({"ent/proj/abc123": run}), init=init, checks=2, check_interval=0.0)
+
+
+def test_a_folder_without_a_parquet_uploads_nothing_and_raises(tmp_path):
+    from robonuke_rl_core.evaluation import upload_eval_results
+
+    run = a_run()
+    init, calls = fake_init(run)
+    videos_only = tmp_path / "videos" / "quick"
+    videos_only.mkdir(parents=True)
+    (videos_only / "round0_env0.mp4").write_bytes(b"mp4")
+    with pytest.raises(FileNotFoundError, match="parquet"):
+        upload_eval_results("ent/proj/abc123", videos_only, tmp_path, api=FakeApi({"ent/proj/abc123": run}), init=init)
+    assert calls == []

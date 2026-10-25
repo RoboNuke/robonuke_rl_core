@@ -17,7 +17,10 @@ create a new conda env for this project.
   (default 0), and Isaac Lab's reset then reseeds random / NumPy / torch / Warp / Replicator with
   it: with a bare `wrap_env`, every run continued from seed 0 whatever `experiment.seed` said.
   Reseed an env with `envs.build.reseed_env` (Isaac Sim's set_seed), not `torch.manual_seed`.
-  `tests/envs/test_seeding.py` guards both.
+  `tests/envs/test_seeding.py` guards both. It also divides Isaac Lab's `step_dt` out of a
+  manager-based env's reward (the reward manager pays `value * weight * step_dt`), so every
+  consumer sees the terms' weighted sum as the MDP defines it, whatever the control rate; a
+  direct env's reward is left alone (`tests/envs/test_build.py`).
 * Fail fast and loud. No silent fallbacks. Errors say what is wrong and which file or CLI
   argument caused it.
 * Use OmegaConf (installed with Isaac Lab). Do not use Hydra.
@@ -120,7 +123,14 @@ sampling: each is per agent. Two consequences that are easy to undo by accident:
   denominator is exactly the plain mean, so nothing changes in the common case.
 * **No data-driven learning rate.** `BlockAdamW` could hold one LR per agent, but the
   schedule is deliberately a function of the global update count only (`lr_at`): a KL-adaptive
-  LR would couple the agents. Only `constant` and `cosine` exist.
+  LR would couple the agents. Only `constant` and `cosine` exist, each with an optional linear
+  warm-up (`ppo.policy_lr_warmup` / `value_lr_warmup` in updates, `sac.actor_lr_warmup` /
+  `critic_lr_warmup` in gradient steps) that is itself a function of the count only.
+* **Reward scaling is per agent too.** `normalize_rewards` (`sac` and `ppo`) runs the stored
+  reward through `BlockRewardScaler` (`models/normalizer.py`: ResiP's `RunningMeanStdClip`,
+  `r / sqrt(var + 1e-8)` clipped to `reward_clip`, no mean subtraction) in
+  `LearnerBase.shape_rewards`, after the `rewards_shaper`; agent `i`'s envs update agent `i`'s
+  variance only, and the episode statistics see the raw reward.
 * **A dropped agent is frozen, policy and critic.** PPO's KL early stop masks the agent's
   policy loss *and* passes the keep mask to both optimizers: `BlockAdamW.step(keep)` computes
   the update and writes it only where `keep` is true, so a frozen agent comes out
@@ -165,7 +175,19 @@ per-critic modules only up to rounding, not bit for bit; old `critic_k` checkpoi
 through `_upgrade_checkpoint_models` (weights only). Two independence details: the target's
 critic subset is drawn per agent (`(num_agents, num_critics)` uniforms), and a mixed batch's
 online/demo split depends only on the step count, never on the data. The demo file is loaded in
-`_create_memory_tensors`, so eval (no memory) never reads it. Tests:
+`_create_memory_tensors`, so eval (no memory) never reads it. Policy Decorator's progressive
+exploration (`progressive_exploration_steps`) is off by default too: it masks actions in `act`
+(`_explore_progressively`), so the zeros are what the env executes and the memory stores; one
+uniform per env is drawn EVERY env step (`rand(num_envs, 1) < min(t / H, 1)`, Policy Decorator's
+per-step mask), so a draw depends on the step count alone and nothing else can change it;
+nothing is drawn when it is off. `update_every` (default 1) spaces the update rounds: a round of
+`gradient_steps` at every env step `t >= learning_starts` with `(t - learning_starts) %
+update_every == 0`, for an update-to-data ratio under one gradient step per env step
+(`policy_delay` keeps counting gradient steps). `n_step` (default 1) folds the online stream in
+`record_transition` (`learners/n_step.NStepWindow`: one n-step row per env per step, `n - 1` steps
+late, a window never crossing an episode end) and the demo rows when they load (`n_step_rows`,
+which refuses rows not in episode order); the rows carry `discounts` (`gamma ** m`), which the
+target uses in place of `gamma`. With n_step 1 nothing of it runs. Tests:
 `tests/learners/test_sac_extensions.py`.
 
 **The update is launch-bound at small batches**, so three things keep it on the GPU in few
@@ -202,8 +224,24 @@ no foreach/fused plumbing — add a feature with a test when something needs it.
 `rtol=1e-6` (float32) and `1e-12` (float64), with and without an agent frozen for part of the
 run. If it fails, the optimizer is wrong — fix it rather than loosening the tolerance.
 
-The LR schedule is `lr_at(update, total_updates, lr, lr_end, schedule)`: `constant` or
-`cosine`, from the update count alone.
+The LR schedule is `lr_at(update, total_updates, lr, lr_end, schedule, warmup=0)`: `constant`
+or `cosine`, from the update count alone; `warmup` > 0 prepends `lr * update / warmup` (the
+first update at 0, diffusers' `get_cosine_schedule_with_warmup`, which ResiP steps once per
+iteration) and the schedule proper runs over the remaining `total_updates - warmup`.
+
+### The loop
+
+`train.py` drives the learner with `learners/trainer.py: Trainer`, skrl's `SequentialTrainer`
+with its single-agent loop reproduced step for step plus one hook: after `post_interaction`, a
+learner that set `env_reset_requested` gets every env reset (`evaluation.force_env_reset`, which
+clears skrl's one-shot `_reset_once` guard and checks the clocks went to zero), the fresh
+observations and states become the next step's inputs, and `LearnerBase.forced_env_reset` clears
+the flag and the per-env episode accumulators (a cut episode is no outcome). PPO raises the
+flag after each update when `ppo.reset_every_iteration` is set (ResiP): the update has already
+bootstrapped from the pre-reset next observations and the next rollout fills the buffer from
+scratch, so no GAE chain crosses the reset. A loop that steps on without resetting (skrl's own
+trainer) is refused by `record_transition`. With no request the loop is skrl's.
+`tests/learners/test_trainer.py` drives it on CPU against a fake vectorized env.
 
 ### Add a learner
 
@@ -226,6 +264,15 @@ Eval and debug load its checkpoints once `setup()` also calls
 A project adds env wrappers to every env the package builds (train, eval, debug) with
 `envs.build.register_env_wrapper(fn)` in `setup()`; `build_env` applies them outside all
 package wrappers, as `fn(cfg, env, task_name) -> env`.
+A project gives SAC's critics another action input than the agent's own (a residual agent's
+executed action) with `learners.sac.register_critic_action(fn)` in its training script's
+`setup()`: `train.main` calls `fn(cfg, env)` once the env is built, and a returned
+`transform(critic_inputs, actions) -> actions` (same shape, device ops only, so a CUDA graph
+captures it) is applied to every critic call: the critic loss, its target and the actor's Q.
+`critic_inputs` is the batch's raw critic input, before any normalizer: the policy observations
+when the learner is symmetric, the critic's `states` (`next_states` for the target) when a state
+space exists — online and demo rows alike (`SAC._critic_actions`). At most one builder may
+answer; None means the critics take the agent's action.
 `run_eval` calls `policy.reset()` after each round's reset when the policy has one, for a
 policy that keeps state across steps (an action-chunking queue).
 
@@ -252,7 +299,13 @@ policy that keeps state across steps (an action-chunking queue).
    `register_architecture("<arch>", <Arch>ModelCfg)`. Experiments select it with
    `model.architecture: <arch>`; the YAML keys stay `model.actor.*` / `model.critic.*`,
    and struct mode rejects another architecture's fields. SimBa is the default
-   (`SimbaModelCfg`, https://arxiv.org/abs/2410.09754). Add the README rows under a
+   (`SimbaModelCfg`, https://arxiv.org/abs/2410.09754); `mlp` (`MlpModelCfg`, `models/mlp.py`)
+   is the plain Linear -> activation stack ResiP and Policy Decorator train — kaiming or
+   orthogonal hidden layers, an orthogonal output head with a configurable gain, a log std
+   that is state dependent or a per-dim parameter or (`learn_std: false`) a frozen buffer,
+   bounded by a hard clip or the soft tanh map or not at all, squashed or plain (PPO only).
+   It has no selection head: a controller with a selection block needs SimBa, and the actor
+   refuses the layout kwargs the factory passes. Add the README rows under a
    "Fields for `architecture: <arch>`" table, and a config test like
    `tests/config/test_model_architecture.py`'s swap test.
 6. Copy the tests: the slot-vs-plain-module equivalence in `tests/models/test_ensemble.py`
@@ -450,9 +503,11 @@ wrapper that taps the env's own hooks. Nothing re-derives another component's nu
   hook, `checkpoint` is the `on_checkpoint` hook and `close()` finishes the runs.
 * **Files go up as plain run files, never as Artifacts.** `resolved_config.yaml` once and each
   checkpoint as it is written, stored under their base names (`run.save(..., policy="now")`),
-  because eval downloads them back by name. An eval launched with `--run` pushes its own
-  outputs back to the *same* training run under `videos/<eval-config-stem>_<timestamp>/` (it
-  recorded) or `eval/<eval-config-stem>_<timestamp>/`, and
+  because eval downloads them back by name. An eval launched with `--run` pushes its `.parquet`
+  trace (only that: never the videos, summary or config) back to the *same* training run under `videos/<eval-config-stem>_<timestamp>/` (it
+  recorded) or `eval/<eval-config-stem>_<timestamp>/`, through the run resumed with
+  `QUIET_RESUME_SETTINGS` (Api `Run.upload_file` never registers a file on a finished or crashed run;
+  each parquet is checked on wandb after, size for size, and a running run is refused), and
   logs no metrics: the parquet trace is the data. `wandb` is imported lazily, so the package imports
   without it. Runs are created with `reinit="create_new"` and logged through their own
   `run.log(data, step=...)` — never the global `wandb.log`, which with several live runs would
@@ -675,8 +730,8 @@ restate it, while inviting the reading that a 0.89 success rate with a 0.31 "std
 something about spread between episodes), `<stem>.parquet` (the per-step trace: one row per valid (round, env, step),
 vector signals expanded to `name_0..k`, NaN back-fill so it stays rectangular),
 `resolved_config.yaml` (the eval's own, so it reproduces like a run), and the mp4s
-(`round<r>_env<e>.mp4`) when recording. With `--run`, those same files go back to the training
-run under the same `videos/...` or `eval/...` path; nothing is ever logged as a wandb metric.
+(`round<r>_env<e>.mp4`) when recording. With `--run`, the parquet alone goes back to the training
+run under the same `videos/...` or `eval/...` path (the videos never leave the disk); nothing is ever logged as a wandb metric.
 
 ### Capture an env signal in eval
 
@@ -693,9 +748,8 @@ Subclass `Overlay` in the project, set `name`, implement `apply(frame, step) -> 
 the done flags, that env's metric values and its `eval_state` entries as `step.state`), decorate with `@register_overlay` at import time,
 and list the name in `eval.overlays`. The package ships `hud`; an unknown name raises when
 the config loads, not when the camera starts rolling. The reward and return an overlay sees are
-the env's times the recorder's `reward_scale`: eval passes `manager_reward_scale(env)`, which
-undoes Isaac Lab's manager-based `weight * step_dt` scaling (a success of 1 shows as 1, not
-0.1); the parquet and summary keep the env's own values. An overlay that needs the whole
+the agent's (`envs.build.wrap_for_skrl` divides Isaac Lab's manager-based `step_dt` out of the
+reward, so a success of weight 1 shows as 1, not 0.1), the same values the parquet and summary keep. An overlay that needs the whole
 episode before its first frame (a timeline marking phases still to come) sets
 `whole_episode = True` and implements `start_episode(steps)`: the recorder then writes each
 env's raw frames to a lossless scratch mp4 while the round runs and draws every overlay at

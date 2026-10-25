@@ -14,12 +14,17 @@ Beyond classic SAC, all off by default:
   ``target_critics`` likewise.
 * **A delayed actor** (``policy_delay``): the actor and temperature step once every so many
   gradient steps, so ``gradient_steps`` raises the critic's update-to-data ratio alone.
+* **A sparser update cadence** (``update_every``): a round of ``gradient_steps`` every so many
+  env steps, for an update-to-data ratio below one gradient step per env step.
 * **A critic-only start** (``policy_learning_starts``).
 * **Demo transitions in the critic's batches** (``demo_transitions`` with the
   ``demo_sampling_*`` window): half demo, half online, RLPD's symmetric sampling — for the
   critic only; the actor's batch is always online.
 * **CUDA graphs** (``cuda_graph``): each kind of gradient step is captured once and replayed
   as one launch (:class:`~robonuke_rl_core.learners.cuda_graph.StepGraphs`).
+* **n-step TD targets** (``n_step``, :mod:`~robonuke_rl_core.learners.n_step`): the memory
+  stores n-step rows (summed rewards, the bootstrap state ``m`` steps on, ``discounts``
+  ``gamma ** m``) and the demo rows are folded the same way when loaded.
 
 Every tensor op either keeps the rows separate (the block networks reduce within a block) or
 reduces with a constant factor, so agent ``i``'s update never depends on agent ``j``'s data.
@@ -40,8 +45,31 @@ from ..models.normalizer import BlockRunningNorm
 from ..losses.losses import LossContext
 from .base import LearnerBase
 from .cuda_graph import StepGraphs
+from .n_step import NStepWindow, n_step_rows
 
-__all__ = ["SAC"]
+__all__ = ["SAC", "register_critic_action", "critic_action_transform"]
+
+#: ``fn(cfg, env) -> transform | None``, registered by a project in its training script's
+#: ``setup()``. A transform ``(critic_inputs, actions) -> actions`` gives the critics another action
+#: input than the agent's own (a residual agent's executed action, say); ``critic_inputs`` is the
+#: batch's RAW critic input, before any normalizer: the policy observations when the learner is
+#: symmetric, the critic ``states`` (``next_states`` for the target) when a state space exists.
+#: At most one builder may answer.
+CRITIC_ACTION_BUILDERS: List[Any] = []
+
+
+def register_critic_action(fn: Any) -> None:
+    """Add a :data:`CRITIC_ACTION_BUILDERS` entry; ``scripts/train.py`` asks each once its env is built."""
+    CRITIC_ACTION_BUILDERS.append(fn)
+
+
+def critic_action_transform(cfg: Any, env: Any) -> Any:
+    """The one transform a registered builder returns for this run, or None (the critics take the
+    agent's action). Two builders answering is a configuration error, not a choice to guess."""
+    found = [t for t in (fn(cfg, env) for fn in CRITIC_ACTION_BUILDERS) if t is not None]
+    if len(found) > 1:
+        raise ValueError(f"{len(found)} registered critic-action builders answered for this run; at most one may")
+    return found[0] if found else None
 
 
 class SAC(LearnerBase):
@@ -52,6 +80,10 @@ class SAC(LearnerBase):
         super().__init__(**kwargs)
         self._model_cfg = model_cfg
         self._controller_cfg = controller_cfg
+        #: ``(raw critic inputs, actions) -> critic actions`` (:func:`critic_action_transform`): the
+        #: observations, or the states when asymmetric; or None: the critics take the agent's
+        #: action as it is
+        self.critic_action_transform: Optional[Any] = None
 
         self._num_critics = int(self.cfg.num_critics)
         required = ("policy", "critics", "target_critics")
@@ -107,6 +139,8 @@ class SAC(LearnerBase):
         # loaded with the replay memory (``_create_memory_tensors``): eval builds this learner
         # with no memory and never needs the demos
         self._demo: Optional[Dict[str, torch.Tensor]] = None
+        #: n_step > 1: the online stream's n-step folding (a new one with every memory)
+        self._n_step_window: Optional[NStepWindow] = None
 
     # ------------------------------------------------------------------ setup helpers
     def _bind_critics(self) -> None:
@@ -136,6 +170,9 @@ class SAC(LearnerBase):
         if self._asymmetric:
             names += ["states", "next_states"]
         return names
+
+    def _n_step(self) -> int:
+        return int(self.cfg.n_step)
 
     def _load_demo_transitions(self) -> Dict[str, torch.Tensor]:
         """The demo file's tensors on the device, checked against the agent's spaces."""
@@ -184,6 +221,8 @@ class SAC(LearnerBase):
             out[name] = tensor.to(device=self.device, dtype=dtype)
         if not rows:
             raise ValueError(f"sac.demo_transitions ({path}) holds no transitions")
+        if self._n_step() > 1:
+            out = n_step_rows(out, self._n_step(), float(self.cfg.discount_factor))
         # actions may lie beyond the squashed policy's [-1, 1]: only the critic sees demo rows,
         # and it takes the action as an input, so the value of a correction the actor cannot
         # reach is still a true value. They must be finite.
@@ -214,7 +253,7 @@ class SAC(LearnerBase):
         the data, and each agent draws its own demo rows, so agents stay independent."""
         n_online = min(rows // 2, int(self.memory.size))
         n_demo = rows - n_online
-        names = self._demo_names()
+        names = self._demo_names() + (["discounts"] if self._n_step() > 1 else [])
         demo_rows = next(iter(self._demo.values())).shape[0]
         index = torch.randint(0, demo_rows, (self.num_agents, n_demo), device=self.device)
         online = self._sample(n_online, graph) if n_online else None
@@ -256,16 +295,23 @@ class SAC(LearnerBase):
         if getattr(self, "_graphs", None) is not None:
             self._graphs.clear()  # captured against the replaced optimizers
 
+    def _update_rounds(self, timesteps: int) -> int:
+        """How many update rounds a run of ``timesteps`` env steps holds: one at every env step
+        ``t >= learning_starts`` with ``(t - learning_starts) % update_every == 0``."""
+        steps = max(0, int(timesteps) - int(self.cfg.learning_starts))
+        return -(-steps // int(self.cfg.update_every))  # ceil
+
     def _set_learning_rates(self, timesteps: int) -> None:
         """The LR for this gradient step, from the update count alone (never from the data)."""
-        if self.cfg.lr_schedule == "constant":
+        cfg = self.cfg
+        if cfg.lr_schedule == "constant" and not (cfg.actor_lr_warmup or cfg.critic_lr_warmup):
             return
-        total = max(1, (int(timesteps) - int(self.cfg.learning_starts)) * int(self.cfg.gradient_steps))
+        total = max(1, self._update_rounds(timesteps) * int(cfg.gradient_steps))
         self.policy_optimizer.set_lr(
-            lr_at(self._updates, total, self.cfg.actor_lr, self.cfg.lr_end, self.cfg.lr_schedule)
+            lr_at(self._updates, total, cfg.actor_lr, cfg.lr_end, cfg.lr_schedule, warmup=cfg.actor_lr_warmup)
         )
         self.critic_optimizer.set_lr(
-            lr_at(self._updates, total, self.cfg.critic_lr, self.cfg.lr_end, self.cfg.lr_schedule)
+            lr_at(self._updates, total, cfg.critic_lr, cfg.lr_end, cfg.lr_schedule, warmup=cfg.critic_lr_warmup)
         )
 
     def _create_memory_tensors(self) -> None:
@@ -282,6 +328,11 @@ class SAC(LearnerBase):
         self._tensors_names = [
             "observations", "actions", "rewards", "next_observations", "terminated", "truncated",
         ]
+        if self._n_step() > 1:
+            # gamma ** m of each n-step row; the demo rows get theirs when they are loaded
+            self.memory.create_tensor(name="discounts", size=1, dtype=torch.float32)
+            self._tensors_names.append("discounts")
+            self._n_step_window = NStepWindow(self._n_step(), float(self.cfg.discount_factor))
         if self._asymmetric:
             self.memory.create_tensor(name="states", size=self.state_space, dtype=torch.float32)
             self.memory.create_tensor(name="next_states", size=self.state_space, dtype=torch.float32)
@@ -310,14 +361,34 @@ class SAC(LearnerBase):
     # ------------------------------------------------------------------ interaction
     def act(self, observations, states, *, timestep: int, timesteps: int):
         if self.training and timestep < self.cfg.random_timesteps:
-            return self.random_actions(observations.shape[0]), {}
+            return self._explore_progressively(self.random_actions(observations.shape[0]), timestep), {}
         inputs = {"observations": self.normalize_observations(observations)}
         # no_grad: these actions only drive the env; the update re-runs the policy on replay
         # batches. A live graph here would be spliced into the env's action buffers and grow.
         with torch.no_grad():
             actions, outputs = self.policy.act(inputs, role="policy")
         self.emit_selection(outputs, timestep)
-        return actions, outputs
+        return self._explore_progressively(actions, timestep), outputs
+
+    def _explore_share(self, timestep: int) -> float:
+        """``min(timestep / H, 1)``: the chance an env runs the policy this step."""
+        return min(timestep / int(self.cfg.progressive_exploration_steps), 1.0)
+
+    def _explore_progressively(self, actions: torch.Tensor, timestep: int) -> torch.Tensor:
+        """``progressive_exploration_steps`` H (Policy Decorator): while training, each env runs
+        this step on its actions with probability ``min(timestep / H, 1)`` and on zeros
+        otherwise, one uniform per env drawn EVERY env step (Policy Decorator's
+        ``mask = rand(num_envs) < min(step / H, 1)`` inside its step loop), so an env's draw
+        depends on nothing but the step count. What this returns is what the env executes and
+        the memory stores. Off (H = 0) or outside training it draws nothing.
+        ``exploration/policy_share``: the agent's envs on their policy this step."""
+        if not self.training or int(self.cfg.progressive_exploration_steps) <= 0:
+            return actions
+        keep = torch.rand(actions.shape[0], 1, device=actions.device) < self._explore_share(timestep)
+        self.emit_per_agent(
+            {"exploration/policy_share": keep.float().view(self.num_agents, -1).mean(dim=1)}, timestep
+        )
+        return torch.where(keep, actions, torch.zeros_like(actions))
 
     def record_transition(
         self,
@@ -354,7 +425,7 @@ class SAC(LearnerBase):
             extra["states"] = states
             extra["next_states"] = next_states
         extra.update(self.aux_memory_values(infos))
-        self.memory.add_samples(
+        row = dict(
             observations=observations,
             actions=actions,
             rewards=self.shape_rewards(rewards, timestep, timesteps),
@@ -363,11 +434,19 @@ class SAC(LearnerBase):
             truncated=truncated,
             **extra,
         )
+        if self._n_step_window is not None:
+            # the n-step row of the step n - 1 back, once the window holds n steps
+            row = self._n_step_window.push(row)
+            if row is None:
+                return
+        self.memory.add_samples(**row)
 
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
         # learning_starts is the first update of anything (the critics); the actor joins at
-        # policy_learning_starts
-        if timestep >= self.cfg.learning_starts:
+        # policy_learning_starts. From there one round of gradient_steps every update_every
+        # env steps (policy_delay keeps counting gradient steps)
+        since_start = timestep - int(self.cfg.learning_starts)
+        if since_start >= 0 and since_start % int(self.cfg.update_every) == 0:
             self.enable_models_training_mode(True)
             self.update(timestep=timestep, timesteps=timesteps)
             self.enable_models_training_mode(False)
@@ -392,7 +471,8 @@ class SAC(LearnerBase):
         with torch.no_grad():
             next_actions, outputs = self.policy.act(next_inputs, role="policy")
             target_qs, _ = self.target_critics.act(
-                {**critic_next_inputs, "taken_actions": next_actions}, role="target_critics"
+                {**critic_next_inputs, "taken_actions": self._critic_actions(sampled, "next_observations", next_actions)},
+                role="target_critics",
             )
             target_q = self._target_min(target_qs, rows)
             if self.cfg.backup_entropy:
@@ -405,13 +485,16 @@ class SAC(LearnerBase):
             # at the limit (``_get_dones`` returns one ``time_out`` tensor twice), so reading
             # ``terminated`` alone would do exactly that to every episode.
             terminal = sampled["terminated"] & sampled["truncated"].logical_not()
+            # an n-step row bootstraps gamma ** m later (its own discounts), a 1-step row gamma
+            discount = sampled["discounts"] if self._n_step() > 1 else self.cfg.discount_factor
             target_values = (
                 sampled["rewards"]
-                + self.cfg.discount_factor * terminal.logical_not() * target_q
+                + discount * terminal.logical_not() * target_q
             )
 
         values, _ = self.critics.act(
-            {**critic_inputs, "taken_actions": sampled["actions"]}, role="critics"
+            {**critic_inputs, "taken_actions": self._critic_actions(sampled, "observations", sampled["actions"])},
+            role="critics",
         )
         # the mean over critics of each critic's MSE (they share the target)
         critic_loss = (values - target_values.unsqueeze(0)).pow(2).mean(dim=(1, 2)).mean()
@@ -422,11 +505,32 @@ class SAC(LearnerBase):
         critics."""
         actions, outputs = self.policy.act(inputs, role="policy")
         log_prob = outputs["log_prob"]
-        q_pi, _ = self.critics.act({**critic_inputs, "taken_actions": actions}, role="critics")
+        q_pi, _ = self.critics.act(
+            {**critic_inputs, "taken_actions": self._critic_actions(sampled, "observations", actions)}, role="critics"
+        )
         q = q_pi.mean(dim=0) if self.cfg.actor_q_reduction == "mean" else q_pi.min(dim=0).values
         entropy = self.expand_per_agent(self._entropy_coefficient, rows)
         policy_loss = (entropy * log_prob - q).mean()
         return policy_loss, actions, log_prob, q, outputs
+
+    #: the critic's own input for each actor-side key, when the learner is asymmetric
+    _CRITIC_INPUT_KEYS = {"observations": "states", "next_observations": "next_states"}
+
+    def _critic_actions(self, sampled, key: str, actions: torch.Tensor) -> torch.Tensor:
+        """What the critics take as the action: the agent's own, or :attr:`critic_action_transform`
+        of it with the batch's raw critic input (device ops only, so a CUDA graph captures it).
+        ``key`` names the actor-side tensor (``observations`` / ``next_observations``); an
+        asymmetric learner hands the transform the critic's ``states`` / ``next_states`` of the
+        same rows instead, online and demo rows alike, so it can read what is in the critic state
+        and not in the actor's observation. ``sampled`` is read only when there is a transform."""
+        if self.critic_action_transform is None:
+            return actions
+        if self._asymmetric:
+            key = self._CRITIC_INPUT_KEYS[key]
+        out = self.critic_action_transform(sampled[key], actions)
+        if out.shape != actions.shape:
+            raise ValueError(f"the critic action transform returned {tuple(out.shape)} for actions {tuple(actions.shape)}")
+        return out
 
     # ------------------------------------------------------------------ update
     def update(self, *, timestep: int, timesteps: int) -> None:
@@ -784,6 +888,8 @@ class SAC(LearnerBase):
             normalizers["observations"] = self.observation_normalizer
         if self.state_normalizer is not None:
             normalizers["states"] = self.state_normalizer
+        if self.reward_normalizer is not None:
+            normalizers["rewards"] = self.reward_normalizer
         return normalizers
 
     def _checkpoint_extras(self, agent: int) -> Dict[str, Any]:

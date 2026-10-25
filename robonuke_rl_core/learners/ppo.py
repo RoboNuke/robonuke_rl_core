@@ -133,14 +133,15 @@ class PPO(LearnerBase):
 
     def _set_learning_rates(self, timesteps: int) -> None:
         """The LR for this update, from the update count alone (never from the data)."""
-        if self.cfg.lr_schedule == "constant":
+        cfg = self.cfg
+        if cfg.lr_schedule == "constant" and not (cfg.policy_lr_warmup or cfg.value_lr_warmup):
             return
-        total = max(1, (int(timesteps) - int(self.cfg.learning_starts)) // max(1, self.cfg.rollouts))
+        total = max(1, (int(timesteps) - int(cfg.learning_starts)) // max(1, cfg.rollouts))
         self.policy_optimizer.set_lr(
-            lr_at(self._updates, total, self.cfg.policy_lr, self.cfg.lr_end, self.cfg.lr_schedule)
+            lr_at(self._updates, total, cfg.policy_lr, cfg.lr_end, cfg.lr_schedule, warmup=cfg.policy_lr_warmup)
         )
         self.value_optimizer.set_lr(
-            lr_at(self._updates, total, self.cfg.value_lr, self.cfg.lr_end, self.cfg.lr_schedule)
+            lr_at(self._updates, total, cfg.value_lr, cfg.lr_end, cfg.lr_schedule, warmup=cfg.value_lr_warmup)
         )
 
     # ------------------------------------------------------------------ normalization
@@ -219,6 +220,13 @@ class PPO(LearnerBase):
 
         if not self.training:
             return
+        if self.env_reset_requested:
+            raise RuntimeError(
+                "ppo.reset_every_iteration asked for every env to be reset after the last update, "
+                "but the env was stepped without one: this learner has to be driven by "
+                "robonuke_rl_core.learners.trainer.Trainer (what train.py runs), not skrl's "
+                "SequentialTrainer, which cannot reset between steps"
+            )
         self._next_observations = next_observations
         self._next_states = next_states
 
@@ -253,6 +261,11 @@ class PPO(LearnerBase):
             self.enable_models_training_mode(True)
             self.update(timestep=timestep, timesteps=timesteps)
             self.enable_models_training_mode(False)
+            if self.cfg.reset_every_iteration:
+                # the update bootstrapped from the pre-reset next observations above, and
+                # the next rollout fills the buffer from scratch, so nothing stitches across
+                # the reset; the trainer performs it before the next act
+                self.env_reset_requested = True
 
     # ------------------------------------------------------------------ update
     def update(self, *, timestep: int, timesteps: int) -> None:
@@ -463,6 +476,8 @@ class PPO(LearnerBase):
             normalizers["states"] = self.state_normalizer
         if self.value_normalizer is not None:
             normalizers["values"] = self.value_normalizer
+        if self.reward_normalizer is not None:
+            normalizers["rewards"] = self.reward_normalizer
         return normalizers
 
     def _checkpoint_extras(self, agent: int) -> Dict[str, Any]:

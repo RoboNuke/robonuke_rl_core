@@ -71,7 +71,7 @@ def build_learner(cfg, env, learner_name: str, dirs):
 
 @pytest.mark.parametrize("learner_name", LEARNERS)
 def test_train_loop_and_checkpoints(gpu_cfg, gpu_env, tmp_path, learner_name):
-    from skrl.trainers.torch import SequentialTrainer, SequentialTrainerCfg
+    from robonuke_rl_core.learners.trainer import SequentialTrainerCfg, Trainer
 
     cfg, env = gpu_cfg, gpu_env
     num_agents = cfg.experiment.num_agents
@@ -81,7 +81,7 @@ def test_train_loop_and_checkpoints(gpu_cfg, gpu_env, tmp_path, learner_name):
     logged: list[tuple[int, dict, int]] = []
     learner.on_log.append(lambda agent, metrics, step: logged.append((agent, metrics, step)))
 
-    SequentialTrainer(
+    Trainer(
         env=env,
         agents=learner,
         cfg=SequentialTrainerCfg(

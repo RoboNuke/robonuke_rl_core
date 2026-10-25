@@ -11,7 +11,14 @@ import pytest
 import torch
 
 from robonuke_rl_core.optim import BlockAdamW
-from robonuke_rl_core.models.cfg import SimbaActorCfg, SimbaCriticCfg, SimbaModelCfg
+from robonuke_rl_core.models.cfg import (
+    MlpActorCfg,
+    MlpCriticCfg,
+    MlpModelCfg,
+    SimbaActorCfg,
+    SimbaCriticCfg,
+    SimbaModelCfg,
+)
 from robonuke_rl_core.models.factory import MODEL_BUILDERS, build_models
 
 NUM_AGENTS = 3
@@ -20,6 +27,8 @@ STATE_DIM = 6
 ACT_DIM = 2
 ROWS = 5
 LEARNERS = sorted({learner for _, learner in MODEL_BUILDERS})
+ARCHITECTURES = sorted({architecture for architecture, _ in MODEL_BUILDERS})
+CASES = [(architecture, learner) for architecture in ARCHITECTURES for learner in LEARNERS]
 
 
 def box(dim: int) -> gymnasium.spaces.Box:
@@ -33,11 +42,18 @@ def tiny_cfg() -> SimbaModelCfg:
     )
 
 
-def make(learner: str, num_agents: int = NUM_AGENTS, asymmetric: bool = False) -> dict:
+def tiny_mlp_cfg() -> MlpModelCfg:
+    return MlpModelCfg(
+        actor=MlpActorCfg(hidden_size=8, num_layers=1),
+        critic=MlpCriticCfg(hidden_size=8, num_layers=1),
+    )
+
+
+def make(architecture: str, learner: str, num_agents: int = NUM_AGENTS, asymmetric: bool = False) -> dict:
     torch.manual_seed(0)
     return build_models(
         learner,
-        tiny_cfg(),
+        {"simba": tiny_cfg, "mlp": tiny_mlp_cfg}[architecture](),
         box(OBS_DIM),
         box(STATE_DIM) if asymmetric else None,
         box(ACT_DIM),
@@ -63,20 +79,20 @@ def forward(model, observations: torch.Tensor, actions: torch.Tensor, training: 
 
 
 # ------------------------------------------------------------------ 1. stacked parameters only
-@pytest.mark.parametrize("learner", LEARNERS)
-def test_every_parameter_is_stacked_across_agents(learner):
-    for name, model in make(learner).items():
+@pytest.mark.parametrize("architecture, learner", CASES)
+def test_every_parameter_is_stacked_across_agents(architecture, learner):
+    for name, model in make(architecture, learner).items():
         for param_name, param in model.named_parameters():
             assert param.dim() >= 1 and param.shape[0] == NUM_AGENTS, (
-                f"{learner}/{name}.{param_name} has shape {tuple(param.shape)}: every parameter "
+                f"{architecture}/{learner}/{name}.{param_name} has shape {tuple(param.shape)}: every parameter "
                 f"needs a leading agent dimension of {NUM_AGENTS}, or it couples the agents"
             )
-            assert not param.is_meta, f"{learner}/{name}.{param_name} is a meta tensor"
+            assert not param.is_meta, f"{architecture}/{learner}/{name}.{param_name} is a meta tensor"
 
 
 # ------------------------------------------------------------------ 2. independence
-@pytest.mark.parametrize("learner", LEARNERS)
-def test_one_agents_rows_cannot_change_another_agents_output(learner):
+@pytest.mark.parametrize("architecture, learner", CASES)
+def test_one_agents_rows_cannot_change_another_agents_output(architecture, learner):
     """Agent 1's rows only; the other agents' outputs must be untouched."""
     torch.manual_seed(1)
     observations = torch.randn(NUM_AGENTS * ROWS, OBS_DIM)
@@ -87,7 +103,7 @@ def test_one_agents_rows_cannot_change_another_agents_output(learner):
     extreme_actions = actions.clone()
     extreme_actions[ROWS : 2 * ROWS] = 1.0
 
-    for name, model in make(learner).items():
+    for name, model in make(architecture, learner).items():
         model.enable_training_mode(False)
         torch.manual_seed(2)
         plain = forward(model, observations, actions, training=True)
@@ -95,16 +111,16 @@ def test_one_agents_rows_cannot_change_another_agents_output(learner):
         changed = forward(model, extreme_obs, extreme_actions, training=True)
         for agent in (0, 2):
             rows = slice(agent * ROWS, (agent + 1) * ROWS)
-            assert torch.equal(plain[rows], changed[rows]), f"{learner}/{name}, agent {agent}"
+            assert torch.equal(plain[rows], changed[rows]), f"{architecture}/{learner}/{name}, agent {agent}"
         rows = slice(ROWS, 2 * ROWS)
-        assert not torch.equal(plain[rows], changed[rows]), f"{learner}/{name}, agent 1"
+        assert not torch.equal(plain[rows], changed[rows]), f"{architecture}/{learner}/{name}, agent 1"
 
 
 # ------------------------------------------------------------------ 3. checkpoint slicing
-@pytest.mark.parametrize("learner", LEARNERS)
-def test_slicing_one_agent_into_a_single_agent_model(learner):
-    source = make(learner)
-    target = make(learner, num_agents=1)
+@pytest.mark.parametrize("architecture, learner", CASES)
+def test_slicing_one_agent_into_a_single_agent_model(architecture, learner):
+    source = make(architecture, learner)
+    target = make(architecture, learner, num_agents=1)
     torch.manual_seed(3)
     observations = torch.randn(ROWS, OBS_DIM)
     actions = torch.rand(ROWS, ACT_DIM) * 2.0 - 1.0
@@ -122,19 +138,19 @@ def test_slicing_one_agent_into_a_single_agent_model(learner):
                 torch.cat([padding[1], actions]),
             )
             single = forward(target[name], observations, actions)
-        assert torch.allclose(full[2 * ROWS :], single, atol=1e-6), f"{learner}/{name}"
+        assert torch.allclose(full[2 * ROWS :], single, atol=1e-6), f"{architecture}/{learner}/{name}"
 
 
-@pytest.mark.parametrize("learner", LEARNERS)
-def test_optimizer_state_slices_per_agent(learner):
+@pytest.mark.parametrize("architecture, learner", CASES)
+def test_optimizer_state_slices_per_agent(architecture, learner):
     """One agent's optimizer slice loads into one slot of another optimizer."""
-    for name, model in make(learner).items():
+    for name, model in make(architecture, learner).items():
         source = BlockAdamW(model.parameters(), NUM_AGENTS, lr=0.1)
         for param in model.parameters():
             param.grad = torch.randn_like(param)
         source.step()
 
-        target_model = make(learner, num_agents=1)[name]
+        target_model = make(architecture, learner, num_agents=1)[name]
         target = BlockAdamW(target_model.parameters(), 1, lr=0.1)
         target.load_agent_state_dict(0, source.agent_state_dict(2))
         for index in range(len(source.params)):
@@ -146,16 +162,16 @@ def test_optimizer_state_slices_per_agent(learner):
 # ------------------------------------------------------------------ 4. unknown learner
 def test_build_models_raises_on_an_unknown_learner():
     with pytest.raises(ValueError) as err:
-        make("dqn")
+        make("simba", "dqn")
     message = str(err.value)
     assert "dqn" in message
     for learner in LEARNERS:
         assert learner in message
 
 
-@pytest.mark.parametrize("learner", LEARNERS)
-def test_asymmetric_critics_take_the_state_space(learner):
-    models = make(learner, asymmetric=True)
+@pytest.mark.parametrize("architecture, learner", CASES)
+def test_asymmetric_critics_take_the_state_space(architecture, learner):
+    models = make(architecture, learner, asymmetric=True)
     assert models["policy"].num_observations == OBS_DIM
     critics = [name for name in models if name != "policy"]
     assert critics

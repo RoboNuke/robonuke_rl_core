@@ -68,8 +68,10 @@ from that run's files; `--local` takes a run directory instead. `--checkpoint` a
 run's local directory beside its `checkpoints/` -- `--local`'s, or for `--run` where training
 writes that run (`{trainer.output_dir}/{wandb.project}/{wandb.group}/{run name}`, made if
 missing): `videos/<eval-config-stem>_<timestamp>/` when it records, else
-`eval/<eval-config-stem>_<timestamp>/`. With `--run` it mirrors the folder back to the training
-run under the same path. See `CLAUDE.md` for the episode accounting rule and the debug keys.
+`eval/<eval-config-stem>_<timestamp>/`. With `--run` it uploads the `.parquet` trace (only that: never the
+videos, summary or config) to the training run under the same path, through the run resumed with its
+metadata, stats and console off; a run still running is refused, and a file wandb does not register
+raises. See `CLAUDE.md` for the episode accounting rule and the debug keys.
 
 ## Tests
 
@@ -105,6 +107,12 @@ experiment:
   seed: 10
 ```
 
+**Rewards.** A manager-based Isaac Lab env's reward manager pays every term `value * weight *
+step_dt`; the package divides `step_dt` back out where the env enters skrl
+(`envs.build.wrap_for_skrl`), so the learners, the logged returns and eval all see the weighted
+sum of the terms as the task's reward config defines it (a weight-1 success pays 1 at any control
+rate). A direct env's reward is its own.
+
 ## experiment
 
 | field | type | default | what it does |
@@ -127,8 +135,8 @@ run-name field.
 
 Each run's Files tab gets `resolved_config.yaml` and every checkpoint (`ckpt_{step}.ckpt`,
 `ckpt_best.ckpt`) as ordinary run files — the Artifacts API is never used. That is what
-`scripts/eval.py --run entity/project/run` downloads, and an eval pushes its own results back
-to the same run under `videos/<eval-config-stem>_<timestamp>/` (an eval that records) or
+`scripts/eval.py --run entity/project/run` downloads, and an eval pushes its `.parquet` trace (only
+that) back to the same run under `videos/<eval-config-stem>_<timestamp>/` (an eval that records) or
 `eval/<eval-config-stem>_<timestamp>/`.
 
 ## trainer
@@ -157,14 +165,19 @@ Soft Actor-Critic. `batch_size` and the memory are per agent.
 | `normalize_observations` | bool | `True` | per-agent running normalization of observations (and states, when asymmetric) |
 | `normalizer_clip` | float | `5.0` | normalized values are clipped to +-this |
 | `rewards_shaper` | str or null | `null` | `"module:name"` of `f(rewards, timestep, timesteps) -> rewards`; applied to stored rewards, not to episode stats |
-| `gradient_steps` | int | `1` | update steps per env step, once `learning_starts` is passed |
+| `normalize_rewards` | bool | `False` | scale the stored reward by its **per-agent** running std (ResiP's `RunningMeanStdClip`: `r / sqrt(var + 1e-8)`, no mean subtraction; the variance is updated from every env step's batch of rewards), after the shaper and before the n-step fold. `episode/return` and `reward/step` keep the raw reward. The scaler's stats ride the checkpoint (`normalizers.rewards`) |
+| `reward_clip` | float | `5.0` | the scaled reward is clipped to +-this (only with `normalize_rewards`) |
+| `gradient_steps` | int | `1` | gradient steps per update round (one round every `update_every` env steps, once `learning_starts` is passed) |
+| `update_every` | int | `1` | env steps between update rounds: a round of `gradient_steps` runs at every env step `t >= learning_starts` with `(t - learning_starts) % update_every == 0`, so the update-to-data ratio is `gradient_steps / (update_every * num_envs)` — Policy Decorator's 16 gradient steps every 4 env steps on 16 envs is `gradient_steps: 16, update_every: 4`. `policy_delay` keeps counting gradient steps; the LR schedule spans the rounds that fit in the run; the CUDA graph is unaffected |
 | `batch_size` | int | `64` | transitions sampled **per agent** per gradient step |
 | `polyak` | float | `0.005` | target-critic update rate, in (0, 1] |
 | `actor_lr` | float | `1.0e-3` | policy learning rate |
 | `critic_lr` | float | `1.0e-3` | critic learning rate |
 | `entropy_lr` | float | `1.0e-3` | temperature learning rate |
-| `lr_schedule` | str | `"constant"` | `constant` or `cosine` (cosine decays actor and critic to `lr_end`). No data-driven schedule: one optimizer over block parameters holds one LR, which would couple the agents |
+| `lr_schedule` | str | `"constant"` | `constant` or `cosine` (cosine decays actor and critic to `lr_end`), after the warm-up below if any. No data-driven schedule: one optimizer over block parameters holds one LR, which would couple the agents |
 | `lr_end` | float | `1.5e-4` | floor of the cosine schedule |
+| `actor_lr_warmup` | int | `0` | linear LR warm-up of the actor over this many **gradient steps** (`lr * step / warmup`, so the first runs at 0, as diffusers' cosine-with-warmup does); the schedule proper then runs over the remaining steps. 0 is none |
+| `critic_lr_warmup` | int | `0` | the same for the critics |
 | `learn_entropy` | bool | `True` | learn the temperature per agent |
 | `initial_entropy_value` | float | `0.2` | starting temperature |
 | `target_entropy` | float or null | `null` | target entropy; `null` means `-|A|` |
@@ -183,6 +196,16 @@ Soft Actor-Critic. `batch_size` and the memory are per agent.
 | `demo_sampling_start` | int | `0` | first env step of the demo window |
 | `demo_sampling_end` | int | `0` | end (exclusive) of the demo window. Inside it each agent's critic batch holds `min(batch_size // 2, rows stored)` online rows and demo rows for the rest (symmetric sampling, filling with demos while the memory is short); the actor's batch is always online only. A non-empty window needs `demo_transitions`, and `demo_transitions` needs a non-empty window |
 | `cuda_graph` | bool | `False` | capture each kind of gradient step (critic only / with the actor, with or without demo rows) as a CUDA graph and replay it as one launch (`learners/cuda_graph.py`). Same math in full FP32; the replay memory is then sampled from a device-side size (`sample_graph_safe`). CUDA only (ignored on CPU); updates with aux losses, and mixed batches while the memory holds under half a batch, stay eager |
+| `progressive_exploration_steps` | int | `0` | Policy Decorator's progressive exploration over this many env steps (its H): while training, each env runs **this step** on the policy's actions with probability `min(timestep / H, 1)` and on zeros otherwise (for a residual policy: the base alone), one uniform per env drawn every env step — its `mask = rand(num_envs) < min(step / H, 1)` inside the step loop — so step 0 runs on zeros and from H on every step is the policy's; the zeros are what is executed and what the memory stores. Masks `random_timesteps` actions too; eval is never masked. `exploration/policy_share`: the share of the agent's envs on their policy this step. `0` is off |
+| `n_step` | int | `1` | n-step TD targets (`learners/n_step.py`): each critic target sums the next `n_step` rewards, `gamma^k` weighted, and bootstraps `gamma^m * Q` from the state `m` steps on, `m < n_step` only where the episode ends first (a terminated or truncated step stops the window). Uncorrected (the later rewards are the behaviour policy's). Online rows enter the memory `n_step - 1` steps late, one per env per step; demo rows are folded when loaded and must be in episode order with each episode's last row terminated or truncated (refused otherwise). `1` is 1-step SAC |
+
+The critics take the agent's action unless a project registered a critic-action transform
+(`learners.sac.register_critic_action`, see `CLAUDE.md`): then every critic call (loss, target,
+the actor's Q) takes `transform(critic_inputs, actions)` instead, where `critic_inputs` is the
+batch's **raw critic input**, before any normalizer: the policy observations when the learner is
+symmetric, and when a state space exists (asymmetric actor-critic) the critic's own `states`
+(`next_states` for the bootstrap target), for online and demo rows alike — so the transform can
+read what the critic state carries and the actor's observation does not.
 
 ## ppo
 
@@ -199,14 +222,18 @@ Proximal Policy Optimization. The rollout buffer is `rollouts` steps per env;
 | `normalize_observations` | bool | `True` | per-agent running normalization of observations (and states, when asymmetric) |
 | `normalizer_clip` | float | `5.0` | normalized values are clipped to +-this |
 | `rewards_shaper` | str or null | `null` | `"module:name"` of `f(rewards, timestep, timesteps) -> rewards` |
+| `normalize_rewards` | bool | `False` | scale the stored reward by its **per-agent** running std (ResiP's `RunningMeanStdClip`: `r / sqrt(var + 1e-8)`, no mean subtraction; the variance is updated from every env step's batch of rewards), after the shaper and before the `time_limit_bootstrap` term is added. `episode/return` and `reward/step` keep the raw reward. The scaler's stats ride the checkpoint (`normalizers.rewards`) |
+| `reward_clip` | float | `5.0` | the scaled reward is clipped to +-this (only with `normalize_rewards`) |
 | `rollouts` | int | `16` | rollout length per env; an update runs every `rollouts` steps |
 | `learning_epochs` | int | `8` | passes over each rollout |
 | `mini_batches` | int | `2` | minibatches per epoch; each holds the same number of rows per agent |
 | `gae_lambda` | float | `0.95` | GAE lambda. Advantages are normalized **per agent** |
 | `policy_lr` | float | `3.0e-4` | policy learning rate |
 | `value_lr` | float | `3.0e-4` | value learning rate |
-| `lr_schedule` | str | `"constant"` | `constant` or `cosine` |
+| `lr_schedule` | str | `"constant"` | `constant` or `cosine`, after the warm-up below if any |
 | `lr_end` | float | `1.5e-4` | floor of the cosine schedule |
+| `policy_lr_warmup` | int | `0` | linear LR warm-up of the policy over this many **updates** (`lr * update / warmup`, so the first update runs at 0, as diffusers' cosine-with-warmup does; ResiP: 5); the schedule proper then runs over the remaining updates. 0 is none |
+| `value_lr_warmup` | int | `0` | the same for the value net (ResiP: 0) |
 | `ratio_clip` | float | `0.2` | PPO surrogate clip |
 | `value_clip` | float | `0.2` | value clip around the stored value (0 disables) |
 | `entropy_loss_scale` | float | `0.0` | entropy bonus weight (0 disables the term) |
@@ -215,18 +242,21 @@ Proximal Policy Optimization. The rollout buffer is `rollouts` steps per env;
 | `time_limit_bootstrap` | bool | `False` | add `discount_factor * V(next)` to the reward on truncation. **Set this True on Factory/Forge-style tasks**, which raise `terminated` and `truncated` together at the time limit; left False, every timeout is treated as a terminal state. SAC needs no flag: it bootstraps unless `terminated & ~truncated` |
 | `normalize_values` | bool | `True` | per-agent running normalization of values and returns |
 | `value_update_ratio` | int | `1` | extra value-only updates per minibatch after the combined update (1 = none) |
+| `reset_every_iteration` | bool | `False` | reset **every** env right after each update, so each rollout starts from fresh initial conditions (ResiP's `reset_every_iteration`). The update has already bootstrapped from the pre-reset next observations and the next rollout fills the buffer from scratch, so no GAE chain crosses the reset; the episodes the reset cuts short are not counted in `episode/*`. Performed by the package's trainer (`learners/trainer.py`, what `train.py` runs), which feeds the fresh observations to the next step; a loop that steps on without resetting (skrl's own trainer) is refused at the next transition |
 
 ## model
 
 The networks: plain single-agent modules, stacked across agents with `torch.vmap`. The keys
 are always `actor.*` and `critic.*`; `architecture` picks which architecture's fields sit
 behind them (the way `task.name` picks the env cfg), and another architecture's fields are
-rejected loudly. The only architecture today is **SimBa**
-([Lee et al., 2025](https://arxiv.org/abs/2410.09754)) — residual MLP blocks with LayerNorm.
+rejected loudly. Two architectures ship: **SimBa**
+([Lee et al., 2025](https://arxiv.org/abs/2410.09754)) — residual MLP blocks with LayerNorm, the
+default — and **mlp**, a plain Linear -> activation stack (the networks of ResiP and Policy
+Decorator; see its table for the two recipes).
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |
-| `architecture` | str | `"simba"` | which registered architecture's dataclasses back `actor` / `critic`; the last layer that sets it wins |
+| `architecture` | str | `"simba"` | which registered architecture's dataclasses back `actor` / `critic`: `simba` or `mlp`; the last layer that sets it wins |
 
 Fields for `architecture: simba`:
 
@@ -252,6 +282,34 @@ Fields for `architecture: simba`:
 | `critic.critic_latent` | int | `512` | critic hidden width |
 | `critic.critic_output_init_mean` | float | `0.0` | initial critic output bias |
 | `critic.clip_actions` | bool | `False` | clip actions to the action space inside the critic |
+
+Fields for `architecture: mlp` (`models/mlp.py`). Continuous actions only: a controller with a
+selection block (Bernoulli dims, `match`) needs `simba`. ResiP's residual is `actor: {hidden_size:
+512, num_layers: 2, activation: SiLU, init: kaiming, output_init_scale: 0.01, init_log_std: -1.0,
+learn_std: false, squash: false}` with the same `critic` (`output_init_scale: 1.0`); Policy
+Decorator's SAC nets are `actor: {hidden_size: 256, num_layers: 3, activation: ReLU,
+use_state_dependent_std: true, log_std_bound: tanh}` and `critic: {hidden_size: 256, num_layers: 3,
+activation: ReLU}`:
+
+| field | type | default | what it does |
+| --- | --- | --- | --- |
+| `actor.hidden_size` | int | `256` | width of every hidden layer |
+| `actor.num_layers` | int | `2` | hidden layers (each `Linear -> activation`) |
+| `actor.activation` | str | `"ReLU"` | a `torch.nn` activation class name: `ReLU`, `SiLU`, `Tanh`, `ELU`, `GELU`, ... (checked at load) |
+| `actor.init` | str | `"orthogonal"` | hidden-layer init: `orthogonal` (gain `sqrt(2)`, the CleanRL / Policy Decorator convention) or `kaiming` (`kaiming_normal_` fan-in, ResiP's `layer_init`); biases zero. The output heads are orthogonal either way |
+| `actor.output_init_scale` | float | `0.01` | orthogonal gain of the mean head (and of the log-std head when state dependent): ResiP's and Policy Decorator's 0.01 starts the policy near zero action |
+| `actor.init_log_std` | float | `0.0` | the log std every action dim starts at, whatever the bound (ResiP: `-1.0`) |
+| `actor.learn_std` | bool | `True` | `false` freezes the state-independent log std at `init_log_std` (ResiP): it is a buffer, not a parameter, so no optimizer touches it, though the checkpoint carries it. Needs `use_state_dependent_std: false` |
+| `actor.use_state_dependent_std` | bool | `False` | a second head predicts the log std from the state (classic SAC) instead of one learned value per dim |
+| `actor.log_std_bound` | str | `"clip"` | how the log std is kept in `[min_log_std, max_log_std]`: `clip` (hard clamp, SimBa's `clip_log_std`), `tanh` (soft: `min + 0.5 (max - min) (tanh(x) + 1)`, Policy Decorator's SAC) or `none`. `init_log_std` must lie inside the range for `clip` and strictly inside for `tanh` |
+| `actor.min_log_std` | float | `-20.0` | lower log_std bound; must be below `max_log_std` unless the bound is `none` |
+| `actor.max_log_std` | float | `2.0` | upper log_std bound |
+| `actor.squash` | bool | `True` | tanh-squash the Gaussian (actions in [-1, 1], the tanh-corrected log-probability; what SAC needs). `false` is a plain Gaussian (ResiP's residual, unbounded actions, `mean_actions` is the mean): PPO only — `trainer.learner: sac` refuses it |
+| `critic.hidden_size` | int | `256` | width of every hidden layer of the Q critics (SAC) or the value net (PPO) |
+| `critic.num_layers` | int | `2` | hidden layers |
+| `critic.activation` | str | `"ReLU"` | a `torch.nn` activation class name |
+| `critic.init` | str | `"orthogonal"` | `orthogonal` or `kaiming`, as the actor's |
+| `critic.output_init_scale` | float | `1.0` | orthogonal gain of the value head (ResiP: 1.0) |
 
 ## memory
 

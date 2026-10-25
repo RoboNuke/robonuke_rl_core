@@ -24,6 +24,45 @@ class FakeCfg:
         self.wrappers = wrappers or WrappersCfg()
 
 
+class FakeIsaacEnv:
+    """An Isaac Lab env's surface for skrl's wrapper: two envs, a 3-wide policy observation, and a
+    reward of ``paid`` per env. ``manager`` gives it a reward manager (a manager-based env, whose
+    reward manager pays ``value * weight * step_dt``)."""
+
+    num_envs, device, step_dt = 2, "cpu", 0.1
+
+    def __init__(self, manager: bool, paid: float):
+        import gymnasium
+
+        self.reward_manager = object() if manager else None
+        self.paid = paid
+        self.single_observation_space = {"policy": gymnasium.spaces.Box(-1.0, 1.0, (3,))}
+        self.single_action_space = gymnasium.spaces.Box(-1.0, 1.0, (1,))
+
+    @property
+    def unwrapped(self):
+        return self
+
+    def reset(self, seed=None):
+        return {"policy": torch.zeros(2, 3)}, {}
+
+    def step(self, actions):
+        done = torch.zeros(2, dtype=torch.bool)
+        return {"policy": torch.zeros(2, 3)}, torch.full((2,), self.paid), done, done, {}
+
+
+@pytest.mark.parametrize("manager, paid, seen", [(True, 0.1, 1.0), (False, 0.1, 0.1)])
+def test_skrl_sees_a_manager_based_reward_with_step_dt_divided_out(manager, paid, seen):
+    """A weight-1 success of 1 pays 1 * step_dt = 0.1 from Isaac Lab's reward manager; the agent
+    gets the 1 the MDP defines. A direct env's reward is its own."""
+    from robonuke_rl_core.envs.build import wrap_for_skrl
+
+    env = wrap_for_skrl(FakeIsaacEnv(manager, paid), seed=3)
+    env.reset()
+    _, reward, _, _, _ = env.step(torch.zeros(2, 1))
+    assert torch.allclose(reward, torch.full((2, 1), seen))
+
+
 # ------------------------------------------------------------------ composition
 def test_nothing_enabled_returns_the_env_untouched():
     env = object()

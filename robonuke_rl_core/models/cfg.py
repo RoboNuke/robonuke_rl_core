@@ -6,9 +6,10 @@ behind them is picked by ``model.architecture`` (last layer that sets it wins, d
 then rejects another architecture's fields, so a SimBa option under a future architecture
 fails loudly instead of being silently accepted.
 
-The only architecture shipped today is **SimBa** (Lee et al., 2025,
-https://arxiv.org/abs/2410.09754) — residual MLP blocks with LayerNorm, scaled for RL
-(``models/simba.py``). A new architecture registers its own ``<Arch>ModelCfg`` with
+Two architectures ship: **SimBa** (Lee et al., 2025, https://arxiv.org/abs/2410.09754) —
+residual MLP blocks with LayerNorm, scaled for RL (``models/simba.py``), the default — and a
+plain **MLP** (``models/mlp.py``: Linear -> activation stacks, the nets ResiP and Policy
+Decorator train). A new architecture registers its own ``<Arch>ModelCfg`` with
 :func:`register_architecture`; it never mixes extra fields into another architecture's
 groups. OmegaConf-supported types only.
 """
@@ -23,6 +24,9 @@ __all__ = [
     "SimbaActorCfg",
     "SimbaCriticCfg",
     "SimbaModelCfg",
+    "MlpActorCfg",
+    "MlpCriticCfg",
+    "MlpModelCfg",
     "MODEL_ARCHITECTURES",
     "register_architecture",
     "model_cfg_class",
@@ -141,6 +145,80 @@ class SimbaModelCfg:
             )
 
 
+@dataclass
+class MlpActorCfg:
+    """Plain MLP policy (``models/mlp.py``): Linear -> activation stacks and a Gaussian head."""
+
+    #: width of every hidden layer
+    hidden_size: int = 256
+    #: hidden layers (ResiP: 2 x 512 SiLU; Policy Decorator: 3 x 256 ReLU)
+    num_layers: int = 2
+    #: a ``torch.nn`` activation class name: ReLU, SiLU, Tanh, ELU, GELU, ...
+    activation: str = "ReLU"
+    #: hidden-layer init: "orthogonal" (gain sqrt(2)) or "kaiming" (fan-in normal, ResiP);
+    #: biases zero. The output layers are orthogonal either way
+    init: str = "orthogonal"
+    #: orthogonal gain of the mean head (ResiP and Policy Decorator: 0.01, a near-zero
+    #: initial action)
+    output_init_scale: float = 0.01
+    #: the log std every dim starts at (ResiP's residual: -1.0)
+    init_log_std: float = 0.0
+    #: false freezes the state-independent log std at ``init_log_std`` (ResiP): a buffer, not
+    #: a parameter, so no optimizer ever touches it. Needs ``use_state_dependent_std: false``
+    learn_std: bool = True
+    #: a second head predicts the log std from the state (classic SAC) instead of one learned
+    #: value per dim
+    use_state_dependent_std: bool = False
+    #: how the log std is kept in [min_log_std, max_log_std]: "clip" (hard clamp, SimBa's
+    #: ``clip_log_std``), "tanh" (soft: ``min + 0.5 (max - min) (tanh(x) + 1)``, Policy
+    #: Decorator) or "none"
+    log_std_bound: str = "clip"
+    min_log_std: float = -20.0
+    max_log_std: float = 2.0
+    #: tanh-squash the Gaussian (SAC; actions in [-1, 1]). false is a plain Gaussian (ResiP's
+    #: residual), PPO only
+    squash: bool = True
+
+
+@dataclass
+class MlpCriticCfg:
+    """Plain MLP critic(s): Q(s, a) for SAC, V(s) for PPO."""
+
+    hidden_size: int = 256
+    num_layers: int = 2
+    activation: str = "ReLU"
+    #: "orthogonal" or "kaiming", as the actor's
+    init: str = "orthogonal"
+    #: orthogonal gain of the value head (ResiP: 1.0)
+    output_init_scale: float = 1.0
+
+
+@dataclass
+class MlpModelCfg:
+    """The `model` section when ``architecture`` is ``mlp``."""
+
+    architecture: str = "mlp"
+    actor: MlpActorCfg = field(default_factory=MlpActorCfg)
+    critic: MlpCriticCfg = field(default_factory=MlpCriticCfg)
+
+    def validate(self, cfg: Any) -> None:
+        from .mlp import check_mlp_actor_fields, check_mlp_critic_fields
+
+        check_mlp_actor_fields("model.actor", **dataclasses.asdict(self.actor))
+        critic = self.critic
+        check_mlp_critic_fields(
+            "model.critic", critic.hidden_size, critic.num_layers, critic.activation, critic.init,
+            critic.output_init_scale,
+        )
+        trainer = getattr(cfg, "trainer", None) if cfg is not None else None
+        if trainer is not None and getattr(trainer, "learner", None) == "sac" and not self.actor.squash:
+            raise ValueError(
+                "model.actor.squash: false is a plain Gaussian, which only PPO trains; SAC's "
+                "actor is tanh-squashed (its actions and log-probabilities assume [-1, 1]), so "
+                "trainer.learner: sac needs model.actor.squash: true"
+            )
+
+
 #: registered architectures: ``model.architecture`` value -> the section dataclass
 MODEL_ARCHITECTURES: Dict[str, type] = {}
 
@@ -179,3 +257,4 @@ def model_cfg_class(architecture: str) -> type:
 
 
 register_architecture("simba", SimbaModelCfg)
+register_architecture("mlp", MlpModelCfg)

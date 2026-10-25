@@ -17,7 +17,14 @@ from robonuke_rl_core.learners.cfg import PPOCfg, SACCfg, TrainerCfg
 from robonuke_rl_core.learners.ppo import PPO
 from robonuke_rl_core.learners.sac import SAC
 from robonuke_rl_core.memory.multi_random import MultiRandomMemory
-from robonuke_rl_core.models.cfg import SimbaActorCfg, SimbaCriticCfg, SimbaModelCfg
+from robonuke_rl_core.models.cfg import (
+    MlpActorCfg,
+    MlpCriticCfg,
+    MlpModelCfg,
+    SimbaActorCfg,
+    SimbaCriticCfg,
+    SimbaModelCfg,
+)
 from robonuke_rl_core.models.factory import build_models
 
 OBS_DIM = 4
@@ -30,6 +37,13 @@ def tiny_model_cfg() -> SimbaModelCfg:
     return SimbaModelCfg(
         actor=SimbaActorCfg(actor_n=1, actor_latent=8),
         critic=SimbaCriticCfg(critic_n=1, critic_latent=8),
+    )
+
+
+def tiny_mlp_cfg() -> MlpModelCfg:
+    return MlpModelCfg(
+        actor=MlpActorCfg(hidden_size=8, num_layers=1),
+        critic=MlpCriticCfg(hidden_size=8, num_layers=1),
     )
 
 
@@ -65,11 +79,13 @@ def build_learner(
     controller_cfg: Any = None,
     action_dim: int = ACT_DIM,
     aux_loss=None,
+    architecture: str = "simba",
     **cfg_overrides,
 ):
     """A learner with tiny networks and an empty memory of depth ``rollout``.
 
-    ``model_overrides`` sets fields on the actor cfg (e.g. ``bernoulli_action_dims``);
+    ``architecture`` picks the model section (``simba`` or ``mlp``);
+    ``model_overrides`` sets fields on its actor cfg (e.g. ``bernoulli_action_dims``);
     ``controller_cfg`` is what the model factory derives the MATCH pairs and the selection
     axis names from. ``aux_loss`` hooks are appended **before** ``init()``, which is the only
     point at which their ``memory_keys`` can still become memory tensors.
@@ -89,7 +105,12 @@ def build_learner(
     observation_space = box(OBS_DIM)
     state_space = box(STATE_DIM) if asymmetric else None
     action_space = box(action_dim)
-    model_cfg = tiny_model_cfg()
+    if architecture == "simba":
+        model_cfg = tiny_model_cfg()
+    elif architecture == "mlp":
+        model_cfg = tiny_mlp_cfg()
+    else:
+        raise ValueError(f"unknown architecture {architecture!r}")
     for key, value in (model_overrides or {}).items():
         if not hasattr(model_cfg.actor, key):
             raise AttributeError(f"actor cfg has no field '{key}'")

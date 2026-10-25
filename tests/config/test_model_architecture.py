@@ -14,6 +14,7 @@ from robonuke_rl_core import config as cfgmod
 from robonuke_rl_core.config import load_config
 from robonuke_rl_core.models.cfg import (
     MODEL_ARCHITECTURES,
+    MlpModelCfg,
     SimbaModelCfg,
     register_architecture,
 )
@@ -115,3 +116,17 @@ def test_registering_a_bad_architecture_raises():
 
     with pytest.raises(ValueError):
         register_architecture("simba", SimbaModelCfg)  # duplicate
+
+
+def test_mlp_is_a_registered_architecture_with_its_own_fields():
+    cfg = load_config(MINIMAL, ["model.architecture=mlp", "model.actor.hidden_size=512", "model.actor.activation=SiLU"])
+    assert isinstance(cfg.model, MlpModelCfg)
+    assert cfg.model.actor.hidden_size == 512 and cfg.model.actor.activation == "SiLU"
+    assert cfg.model.critic.output_init_scale == 1.0 and cfg.model.actor.output_init_scale == 0.01
+
+    with pytest.raises(ValueError) as err:  # SimBa's fields are another schema
+        load_config(MINIMAL, ["model.architecture=mlp", "model.actor.actor_latent=256"])
+    assert "actor_latent" in str(err.value)
+    with pytest.raises(ValueError) as err:
+        load_config(MINIMAL, ["model.actor.hidden_size=512"])  # simba is the default
+    assert "hidden_size" in str(err.value)

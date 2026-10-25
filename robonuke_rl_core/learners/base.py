@@ -27,7 +27,7 @@ from skrl.models.torch import Model
 
 from ..losses.losses import LossContext
 from ..memory.multi_random import MultiRandomMemory
-from ..models.normalizer import BlockRunningNorm
+from ..models.normalizer import BlockRewardScaler, BlockRunningNorm
 from .cfg import TrainerCfg
 
 __all__ = [
@@ -189,6 +189,20 @@ class LearnerBase(Agent):
         self._new_best: List[bool] = [False] * num_agents
 
         self._rewards_shaper = self._resolve_rewards_shaper()
+        #: ``normalize_rewards``: the per-agent running reward scaler every stored reward goes
+        #: through, after the shaper (:meth:`shape_rewards`); None when off
+        self.reward_normalizer: Optional[BlockRewardScaler] = (
+            BlockRewardScaler(
+                num_agents, clip_threshold=float(cfg.reward_clip), device=self.device
+            )
+            if getattr(cfg, "normalize_rewards", False)
+            else None
+        )
+        #: raised by a learner that wants EVERY env reset before the next env step (PPO's
+        #: ``reset_every_iteration``). The package trainer (``learners/trainer.py``) performs
+        #: the reset, feeds the fresh observations to the next ``act`` and calls
+        #: :meth:`forced_env_reset`, which clears it.
+        self.env_reset_requested = False
         #: wall-clock ms of the last update, filled by :meth:`update_timer`
         self.update_ms = 0.0
 
@@ -657,9 +671,24 @@ class LearnerBase(Agent):
         return torch.rand(rows, *self.action_space.shape, device=self.device) * 2.0 - 1.0
 
     def shape_rewards(self, rewards: torch.Tensor, timestep: int, timesteps: int) -> torch.Tensor:
-        if self._rewards_shaper is None:
-            return rewards
-        return self._rewards_shaper(rewards, timestep, timesteps)
+        """The reward the memory stores: the ``rewards_shaper``'s, then (``normalize_rewards``)
+        scaled by the per-agent running std and clipped. Called once per env step with the
+        step's ``(num_envs, 1)`` rewards, which is the batch the running variance is updated
+        from. The episode statistics (:meth:`observe_step`) never see this."""
+        if self._rewards_shaper is not None:
+            rewards = self._rewards_shaper(rewards, timestep, timesteps)
+        if self.reward_normalizer is not None:
+            rewards = self.reward_normalizer(rewards, train=self.training)
+        return rewards
+
+    def forced_env_reset(self) -> None:
+        """What the trainer calls right after it reset every env on this learner's request
+        (:attr:`env_reset_requested`). The per-env episode accumulators restart, and the
+        episodes the reset cut short count for nothing: an episode that did not end is not an
+        outcome, so ``episode/*`` only ever reports whole episodes."""
+        self.env_reset_requested = False
+        self._episode_return.zero_()
+        self._episode_length.zero_()
 
     # ------------------------------------------------------------------ checkpoints
     def _checkpoint_model_keys(self) -> List[str]:

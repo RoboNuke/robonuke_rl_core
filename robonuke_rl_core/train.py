@@ -34,7 +34,7 @@ def main(argv=None, setup=None) -> int:
     import gymnasium as gym
     import torch
     from .envs.build import wrap_for_skrl
-    from skrl.trainers.torch import SequentialTrainer, SequentialTrainerCfg
+    from .learners.trainer import SequentialTrainerCfg, Trainer
 
     from omegaconf import OmegaConf
 
@@ -123,6 +123,14 @@ def main(argv=None, setup=None) -> int:
         **extra,
     )
 
+    if learner_name == "sac":
+        from robonuke_rl_core.learners.sac import critic_action_transform
+
+        # a project's register_critic_action: the critics take another action than the agent's
+        learner.critic_action_transform = critic_action_transform(cfg, env)
+        if learner.critic_action_transform is not None:
+            print("[train] critics take a registered action transform (register_critic_action)", flush=True)
+
     aux = build_aux_losses(cfg.losses, num_agents)
     if aux is not None:
         learner.aux_loss.append(aux)
@@ -143,7 +151,8 @@ def main(argv=None, setup=None) -> int:
     print(f"[train] runs: {', '.join(str(d) for d in dirs)}")
     print(f"[train] wandb: mode={cfg.wandb.mode} group={cfg.wandb.group}", flush=True)
 
-    trainer = SequentialTrainer(
+    # skrl's sequential loop, plus the env reset a learner may ask for (ppo.reset_every_iteration)
+    trainer = Trainer(
         env=env,
         agents=learner,
         cfg=SequentialTrainerCfg(timesteps=cfg.trainer.total_timesteps, headless=True),
