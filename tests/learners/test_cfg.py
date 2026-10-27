@@ -180,6 +180,14 @@ def test_mlp_rules(tmp_path, overrides, needle):
     assert needle in str(err.value)
 
 
+def test_sac_takes_an_unsquashed_actor_only_when_asked(tmp_path):
+    cfg = load_config(write(tmp_path), ["model.architecture=mlp", "model.actor.squash=false", "sac.unsquashed_actor=true"])
+    assert cfg.model.actor.squash is False and cfg.sac.unsquashed_actor is True
+    with pytest.raises(ValueError) as err:
+        load_config(write(tmp_path), ["model.architecture=mlp", "sac.unsquashed_actor=true"])
+    assert "squash: false" in str(err.value)
+
+
 def test_the_two_papers_mlp_setups_load(tmp_path):
     resip = load_config(
         write(tmp_path),

@@ -107,3 +107,18 @@ def test_agents_stay_independent(learner_name):
         assert_same(snapshot(learner, agent), snapshot(extreme, agent), f"agent {agent}")
     with pytest.raises(AssertionError):
         assert_same(snapshot(learner, AGENT_UNDER_TEST), snapshot(extreme, AGENT_UNDER_TEST))
+
+
+def test_sac_trains_an_unsquashed_actor_whose_actions_are_unbounded():
+    """sac.unsquashed_actor: the plain Gaussian, its samples taken as they are."""
+    learner = build_learner(
+        "sac", architecture="mlp", unsquashed_actor=True,
+        model_overrides={"squash": False, "init_log_std": 1.0, "log_std_bound": "clip"},
+    )
+    fill_memory(learner)
+    torch.manual_seed(0)
+    many = torch.cat([learner.act(torch.randn(learner.num_envs, OBS_DIM), None, timestep=0, timesteps=10)[0] for _ in range(50)])
+    assert many.abs().max() > 1.0
+    before = [p.detach().clone() for p in learner.policy.parameters()]
+    learner.update(timestep=1, timesteps=100)
+    assert any(not torch.equal(a, b) for a, b in zip(before, learner.policy.parameters()))

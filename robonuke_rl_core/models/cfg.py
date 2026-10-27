@@ -17,6 +17,7 @@ groups. OmegaConf-supported types only.
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -176,7 +177,7 @@ class MlpActorCfg:
     min_log_std: float = -20.0
     max_log_std: float = 2.0
     #: tanh-squash the Gaussian (SAC; actions in [-1, 1]). false is a plain Gaussian (ResiP's
-    #: residual), PPO only
+    #: residual): PPO, or SAC with ``sac.unsquashed_actor``
     squash: bool = True
 
 
@@ -211,12 +212,16 @@ class MlpModelCfg:
             critic.output_init_scale,
         )
         trainer = getattr(cfg, "trainer", None) if cfg is not None else None
-        if trainer is not None and getattr(trainer, "learner", None) == "sac" and not self.actor.squash:
+        sac = getattr(cfg, "sac", None) if cfg is not None else None
+        unsquashed_ok = bool(getattr(sac, "unsquashed_actor", False))
+        if trainer is not None and getattr(trainer, "learner", None) == "sac" and not self.actor.squash and not unsquashed_ok:
             raise ValueError(
-                "model.actor.squash: false is a plain Gaussian, which only PPO trains; SAC's "
-                "actor is tanh-squashed (its actions and log-probabilities assume [-1, 1]), so "
-                "trainer.learner: sac needs model.actor.squash: true"
+                "model.actor.squash: false is a plain Gaussian; SAC's actor is tanh-squashed (its "
+                "actions and log-probabilities assume [-1, 1]), so trainer.learner: sac needs "
+                "model.actor.squash: true, or sac.unsquashed_actor: true to train the plain Gaussian"
             )
+        if unsquashed_ok and self.actor.squash:
+            raise ValueError("sac.unsquashed_actor: true trains a plain Gaussian; set model.actor.squash: false")
 
 
 #: registered architectures: ``model.architecture`` value -> the section dataclass
@@ -256,5 +261,70 @@ def model_cfg_class(architecture: str) -> type:
     return MODEL_ARCHITECTURES[architecture]
 
 
+@dataclass
+class FlashSACActorCfg:
+    """FlashSAC's actor (``models/flashsac.py``; arXiv:2604.04539 Table 9): 2 blocks of hidden 128."""
+
+    hidden_size: int = 128
+    num_blocks: int = 2
+    #: the inverted residual block's expansion of the hidden width
+    expansion: int = 4
+    #: the log std's tanh bound, ``min + 0.5 (max - min) (1 + tanh(raw))``
+    min_log_std: float = -10.0
+    max_log_std: float = 2.0
+    #: the mean head's orthogonal init gain. 1.0 is FlashSAC's (unit rows, kept so by weight normalization);
+    #: below 1 (a residual's near-zero start, Policy Decorator's 0.01) the head starts that small and is left
+    #: out of weight normalization, which would set its rows back to unit length
+    mean_init_scale: float = 1.0
+    #: the std every state starts at (None: FlashSAC's own init, the log std head's unit rows, so the initial std
+    #: varies by state over most of the bound). Set, the state-dependent log std head's weights start at gain 0.01
+    #: (left out of weight normalization) and its bias at the value the tanh bound maps to ``log(init_std)``; the
+    #: head then learns its state dependence from there
+    init_std: Optional[float] = None
+
+
+@dataclass
+class FlashSACCriticCfg:
+    """FlashSAC's critic (Table 9): 2 blocks of hidden 256; its output width is the learner's
+    (``sac.critic_distribution``)."""
+
+    hidden_size: int = 256
+    num_blocks: int = 2
+    expansion: int = 4
+
+
+@dataclass
+class FlashSACModelCfg:
+    """The `model` section when ``architecture`` is ``flashsac``: FlashSAC's BatchNorm inverted-residual
+    network. SAC only."""
+
+    architecture: str = "flashsac"
+    actor: FlashSACActorCfg = field(default_factory=FlashSACActorCfg)
+    critic: FlashSACCriticCfg = field(default_factory=FlashSACCriticCfg)
+
+    def validate(self, cfg: Any) -> None:
+        for name, section in (("actor", self.actor), ("critic", self.critic)):
+            if section.hidden_size < 1 or section.num_blocks < 0 or section.expansion < 1:
+                raise ValueError(
+                    f"model.{name}: hidden_size >= 1, num_blocks >= 0 and expansion >= 1, got "
+                    f"{section.hidden_size}, {section.num_blocks}, {section.expansion}"
+                )
+        if self.actor.init_std is not None and not (
+            math.exp(self.actor.min_log_std) < self.actor.init_std < math.exp(self.actor.max_log_std)
+        ):
+            raise ValueError(
+                f"model.actor.init_std ({self.actor.init_std}) must lie strictly inside the log std bound "
+                f"[exp({self.actor.min_log_std}), exp({self.actor.max_log_std})]"
+            )
+        if self.actor.mean_init_scale <= 0:
+            raise ValueError(f"model.actor.mean_init_scale must be > 0, got {self.actor.mean_init_scale}")
+        if not self.actor.min_log_std < self.actor.max_log_std:
+            raise ValueError(f"model.actor.min_log_std ({self.actor.min_log_std}) must be below max_log_std ({self.actor.max_log_std})")
+        trainer = getattr(cfg, "trainer", None) if cfg is not None else None
+        if trainer is not None and getattr(trainer, "learner", None) not in (None, "sac"):
+            raise ValueError(f"model.architecture: flashsac is a SAC network; trainer.learner is {trainer.learner!r}")
+
+
 register_architecture("simba", SimbaModelCfg)
 register_architecture("mlp", MlpModelCfg)
+register_architecture("flashsac", FlashSACModelCfg)

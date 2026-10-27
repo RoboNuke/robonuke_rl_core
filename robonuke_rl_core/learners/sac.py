@@ -25,6 +25,13 @@ Beyond classic SAC, all off by default:
 * **n-step TD targets** (``n_step``, :mod:`~robonuke_rl_core.learners.n_step`): the memory
   stores n-step rows (summed rewards, the bootstrap state ``m`` steps on, ``discounts``
   ``gamma ** m``) and the demo rows are folded the same way when loaded.
+* **FlashSAC's pieces** (arXiv:2604.04539, ported from github.com/Holiday-Robot/FlashSAC
+  ``agents/flashSAC``; never its mixed precision): a categorical critic
+  (``critic_distribution``) with adaptive reward scaling (``adaptive_reward_scaling``,
+  :class:`~robonuke_rl_core.models.normalizer.BlockReturnScaler`), weight normalization
+  (``weight_normalization``), the unified entropy target (``target_entropy_sigma``),
+  cross-batch value prediction (``cross_batch_value``) and noise repetition
+  (``noise_repeat``). FlashSAC's own network (BatchNorm, RMSNorm) is not part of it.
 
 Every tensor op either keeps the rows separate (the block networks reduce within a block) or
 reduces with a constant factor, so agent ``i``'s update never depends on agent ``j``'s data.
@@ -32,6 +39,7 @@ reduces with a constant factor, so agent ``i``'s update never depends on agent `
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, Dict, List, Optional
 
 import gymnasium
@@ -41,26 +49,45 @@ import torch.nn.functional as F
 
 from ..optim import BlockAdamW, clip_grad_norm_per_agent, lr_at
 from ..models.factory import build_models
-from ..models.normalizer import BlockRunningNorm
+from ..models.normalizer import BlockReturnScaler, BlockRunningNorm
 from ..losses.losses import LossContext
 from .base import LearnerBase
+from .cfg import sac_critic_outputs
 from .cuda_graph import StepGraphs
 from .n_step import NStepWindow, n_step_rows
 
-__all__ = ["SAC", "register_critic_action", "critic_action_transform"]
+__all__ = ["SAC", "register_critic_action", "critic_action_transform", "critic_action_space", "categorical_projection"]
 
 #: ``fn(cfg, env) -> transform | None``, registered by a project in its training script's
 #: ``setup()``. A transform ``(critic_inputs, actions) -> actions`` gives the critics another action
 #: input than the agent's own (a residual agent's executed action, say); ``critic_inputs`` is the
 #: batch's RAW critic input, before any normalizer: the policy observations when the learner is
 #: symmetric, the critic ``states`` (``next_states`` for the target) when a state space exists.
-#: At most one builder may answer.
+#: At most one builder may answer. Two optional attributes on the transform:
+#:
+#: * ``critic_action_width``: the critics' action is that wide instead of the agent's (they are
+#:   built with that action width: :func:`critic_action_space`);
+#: * ``side_inputs``: ``{name: width}`` per-transition tensors the transform reads and the critics
+#:   never see as input (a residual's base action, say). The env publishes ``infos[name]`` (this
+#:   step's, ``(num_envs, width)``) and ``infos["next_" + name]`` (the next observation's) every
+#:   step; the memory stores both and the transform is called ``(critic_inputs, actions, side)``,
+#:   ``side`` the ``{name: tensor}`` of the same rows (``next_`` ones for the target). Not with
+#:   demo transitions, which carry none.
 CRITIC_ACTION_BUILDERS: List[Any] = []
 
 
 def register_critic_action(fn: Any) -> None:
     """Add a :data:`CRITIC_ACTION_BUILDERS` entry; ``scripts/train.py`` asks each once its env is built."""
     CRITIC_ACTION_BUILDERS.append(fn)
+
+
+def critic_action_space(transform: Any, action_space: Any) -> Any:
+    """The space the SAC critics are built with for their action input: the agent's
+    ``action_space``, or a ``critic_action_width``-wide Box when the transform declares one."""
+    width = getattr(transform, "critic_action_width", None)
+    if width is None:
+        return action_space
+    return gymnasium.spaces.Box(low=-np.inf, high=np.inf, shape=(int(width),), dtype=np.float32)
 
 
 def critic_action_transform(cfg: Any, env: Any) -> Any:
@@ -72,14 +99,34 @@ def critic_action_transform(cfg: Any, env: Any) -> Any:
     return found[0] if found else None
 
 
+def categorical_projection(probs: torch.Tensor, atoms: torch.Tensor, min_value: float, max_value: float) -> torch.Tensor:
+    """C51's projection, FlashSAC's ``_compute_categorical_td_target``: the mass ``probs``
+    ``(rows, bins)`` sits at ``atoms`` ``(rows, bins)`` (the target's shifted atoms); clamp them
+    to the support and split each atom's mass between the two support atoms around it, in
+    proportion to the distance. Returns ``(rows, bins)`` probabilities on the support."""
+    bins = probs.shape[-1]
+    width = (max_value - min_value) / (bins - 1)
+    position = (atoms.clamp(min_value, max_value) - min_value) / width
+    lower = torch.floor(position).long()
+    upper = torch.clamp(lower + 1, 0, bins - 1)
+    fraction = position - lower.to(position.dtype)
+    projected = torch.zeros_like(probs)
+    projected.scatter_add_(1, lower, probs * (1.0 - fraction))
+    projected.scatter_add_(1, upper, probs * fraction)
+    return projected
+
+
 class SAC(LearnerBase):
-    def __init__(self, *, model_cfg=None, controller_cfg=None, **kwargs) -> None:
+    def __init__(self, *, model_cfg=None, controller_cfg=None, critic_action_space=None, **kwargs) -> None:
         """``model_cfg`` and ``controller_cfg`` are only needed when
         ``sac.periodic_reset_enabled`` rebuilds models — a rebuild has to reproduce the same
         actor, including the derived MATCH pairs."""
         super().__init__(**kwargs)
         self._model_cfg = model_cfg
         self._controller_cfg = controller_cfg
+        #: what the critics were built with as their action input (:func:`critic_action_space`); None:
+        #: the agent's action space. A periodic reset rebuilds them the same way
+        self._critic_action_space = critic_action_space
         #: ``(raw critic inputs, actions) -> critic actions`` (:func:`critic_action_transform`): the
         #: observations, or the states when asymmetric; or None: the critics take the agent's
         #: action as it is
@@ -99,6 +146,25 @@ class SAC(LearnerBase):
                     f"SAC's '{key}' stacks {members} critics but sac.num_critics is "
                     f"{self._num_critics}; build the models with the same num_critics"
                 )
+        expected = sac_critic_outputs(self.cfg)
+        for key in ("critics", "target_critics"):
+            outputs = getattr(self.models[key], "outputs", 1)
+            if outputs != expected:
+                raise ValueError(
+                    f"SAC's '{key}' emit {outputs} columns but sac.critic_distribution "
+                    f"{self.cfg.critic_distribution!r} needs {expected}; build the models with "
+                    "critic_outputs=sac_critic_outputs(sac)"
+                )
+        self._categorical = self.cfg.critic_distribution == "categorical"
+        #: the categorical critics' support, (bins,)
+        self._atoms = (
+            torch.linspace(
+                float(self.cfg.critic_min_value), float(self.cfg.critic_max_value),
+                int(self.cfg.critic_num_bins), device=self.device,
+            )
+            if self._categorical
+            else None
+        )
         cuda = torch.device(self.device).type == "cuda"
         self._graphs = StepGraphs() if (self.cfg.cuda_graph and cuda) else None
 
@@ -125,7 +191,31 @@ class SAC(LearnerBase):
             )
 
         self._build_optimizers()
+        self._normalize_weights(self.policy, self.critics)
         self._sync_targets()
+
+        #: adaptive_reward_scaling: the per-agent return statistics the critics' rewards are
+        #: divided by (updated in record_transition from every stored step); None when off
+        self.return_scaler: Optional[BlockReturnScaler] = (
+            BlockReturnScaler(
+                self.num_agents,
+                gamma=float(self.cfg.discount_factor),
+                g_max=float(self.cfg.adaptive_reward_g_max),
+                device=self.device,
+            )
+            if self.cfg.adaptive_reward_scaling
+            else None
+        )
+        #: noise_repeat: the held standard-normal draw per env, and per agent the steps it has
+        #: been held and the length drawn for it (count 0: draw at the next step)
+        self._held_noise: Optional[torch.Tensor] = None
+        self._noise_count = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
+        self._noise_length = torch.ones(self.num_agents, dtype=torch.long, device=self.device)
+        if self.cfg.noise_repeat:
+            # FlashSAC's _build_truncated_zeta_cdf: P(k) ~ k^-s on 1..max
+            lengths = torch.arange(1, int(self.cfg.noise_repeat_max) + 1, dtype=torch.float32, device=self.device)
+            pmf = lengths ** (-float(self.cfg.noise_repeat_zeta_s))
+            self._zeta_cdf = torch.cumsum(pmf / pmf.sum(), dim=0)
 
         if self.cfg.normalize_observations:
             self.observation_normalizer = self.make_normalizer(self.observation_space)
@@ -146,6 +236,38 @@ class SAC(LearnerBase):
     def _bind_critics(self) -> None:
         self.critics = self.models["critics"]
         self.target_critics = self.models["target_critics"]
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _batch_mode(model, training: bool):
+        """Run ``model`` in ``training`` mode for one call, then restore its mode: FlashSAC's per-call
+        choice for a network with BatchNorm (``uses_batch_stats``, ``models/flashsac.py``) -- the actor
+        and the critics in training mode on their own loss batches (the target critics too), the actor
+        in eval mode for the bootstrap's next actions, the critics in eval mode for the actor's Q. A
+        network without batch statistics is left as it is."""
+        if not getattr(model, "uses_batch_stats", False):
+            yield
+            return
+        previous = model.training
+        model.train(training)
+        try:
+            yield
+        finally:
+            model.train(previous)
+
+    def _normalize_weights(self, *models) -> None:
+        """``weight_normalization``: project each model's weights (FlashSAC's
+        ``normalize_parameters``); nothing when off."""
+        if not self.cfg.weight_normalization:
+            return
+        for model in models:
+            net = getattr(model, "net", None)
+            if net is None or not hasattr(net, "normalize_weights"):
+                raise TypeError(
+                    f"sac.weight_normalization needs models holding a VmapEnsemble (.net); "
+                    f"{type(model).__name__} does not"
+                )
+            net.normalize_weights()
 
     def _sync_targets(self) -> None:
         self.target_critics.freeze_parameters(True)
@@ -269,6 +391,15 @@ class SAC(LearnerBase):
     def _resolve_target_entropy(self) -> float:
         if self.cfg.target_entropy is not None:
             return float(self.cfg.target_entropy)
+        if self.cfg.target_entropy_sigma is not None:
+            if not isinstance(self.action_space, gymnasium.spaces.Box):
+                raise ValueError(
+                    f"sac.target_entropy_sigma is a Gaussian's entropy per action dim; action space "
+                    f"{self.action_space} is not a Box"
+                )
+            # FlashSAC: 0.5 |A| log(2 pi e sigma^2)
+            sigma = float(self.cfg.target_entropy_sigma)
+            return float(0.5 * np.prod(self.action_space.shape) * np.log(2.0 * np.pi * np.e * sigma**2))
         if isinstance(self.action_space, gymnasium.spaces.Box):
             return float(-np.prod(self.action_space.shape))
         if isinstance(self.action_space, gymnasium.spaces.Discrete):
@@ -339,8 +470,31 @@ class SAC(LearnerBase):
             self._tensors_names += ["states", "next_states"]
         # whatever the configured aux losses need per transition (e.g. contact flags)
         self._tensors_names += self.create_aux_memory_tensors()
+        #: PARTS' actor terms: every stored transition carries its episode's id; the outcomes table holds each
+        #: finished episode's outcome (1 success, 0 failure; -1 while it runs)
+        self._track_outcomes = bool(self.cfg.success_clone_weight or self.cfg.failure_anchor_weight)
+        if self._track_outcomes:
+            self.memory.create_tensor(name="episode_ids", size=1, dtype=torch.float32)
+            self._tensors_names.append("episode_ids")
+            self._env_episode = torch.arange(self.num_envs, device=self.device)
+            self._next_episode = self.num_envs
+            self._outcomes = torch.full((max(4096, 4 * self.num_envs),), -1.0, device=self.device)
+        #: the critic action transform's side_inputs: name -> width, stored as name and next_name
+        self._side_inputs = {
+            str(name): int(width)
+            for name, width in (getattr(self.critic_action_transform, "side_inputs", None) or {}).items()
+        }
+        for name, width in sorted(self._side_inputs.items()):
+            for stored in (name, f"next_{name}"):
+                self.memory.create_tensor(name=stored, size=width, dtype=torch.float32)
+                self._tensors_names.append(stored)
         if self.cfg.demo_transitions:
             self._demo = self._load_demo_transitions()
+        if self._demo is not None and self._side_inputs:
+            raise ValueError(
+                f"sac.demo_transitions cannot be mixed into batches while the critic action transform reads "
+                f"the per-transition side inputs {sorted(self._side_inputs)}: the demos do not carry them"
+            )
         if self._demo is not None and self.aux_memory_keys():
             raise ValueError(
                 "sac.demo_transitions cannot be mixed into batches while aux losses need per-"
@@ -363,16 +517,102 @@ class SAC(LearnerBase):
         if self.training and timestep < self.cfg.random_timesteps:
             return self._explore_progressively(self.random_actions(observations.shape[0]), timestep), {}
         inputs = {"observations": self.normalize_observations(observations)}
+        if self.training and self.cfg.noise_repeat:
+            inputs["noise"] = self._repeated_noise(observations.shape[0])
         # no_grad: these actions only drive the env; the update re-runs the policy on replay
         # batches. A live graph here would be spliced into the env's action buffers and grow.
-        with torch.no_grad():
+        with torch.no_grad(), self._batch_mode(self.policy, False):  # a BatchNorm actor acts on its running stats
             actions, outputs = self.policy.act(inputs, role="policy")
         self.emit_selection(outputs, timestep)
+        self._emit_std_by_label(outputs, timestep)
         return self._explore_progressively(actions, timestep), outputs
 
+    def _repeated_noise(self, rows: int) -> torch.Tensor:
+        """``noise_repeat``: FlashSAC's ``_sample_flashsac_actions`` per agent. Every step a
+        fresh standard-normal draw and a fresh length k ~ truncated Zeta are made; an agent
+        whose held draw has been used k times (or never drawn) takes them, the others keep
+        theirs. The draws' shapes depend on nothing but the env count, and an agent's counter
+        on nothing but its own draws. Episode ends do not cut a hold short (nor in FlashSAC)."""
+        width = int(self.policy.num_continuous)
+        if self._held_noise is None or self._held_noise.shape != (rows, width):
+            self._held_noise = torch.zeros(rows, width, device=self.device)
+            self._noise_count.zero_()
+        redraw = (self._noise_count == 0) | (self._noise_count >= self._noise_length)  # (N,)
+        fresh = torch.randn(rows, width, device=self.device)
+        uniform = torch.rand(self.num_agents, 1, device=self.device)
+        length = torch.argmax((uniform < self._zeta_cdf).to(torch.int32), dim=1) + 1
+        per_row = redraw.repeat_interleave(rows // self.num_agents).unsqueeze(-1)
+        self._held_noise = torch.where(per_row, fresh, self._held_noise)
+        self._noise_length = torch.where(redraw, length, self._noise_length)
+        self._noise_count = torch.where(redraw, torch.zeros_like(self._noise_count), self._noise_count) + 1
+        return self._held_noise
+
+    def _std_labels_from(self, infos: Any) -> Optional[torch.Tensor]:
+        """``std_by_label``'s per-env labels in this step's ``infos`` (long, ``(num_envs,)``), or None."""
+        path = self.cfg.std_by_label
+        if not path or not isinstance(infos, dict):
+            return None
+        value = infos.get(path)
+        if value is None and "/" in path:
+            key, name = path.split("/", 1)
+            channel = infos.get(key)
+            value = channel.get(name) if isinstance(channel, dict) else None
+        if value is None:
+            return None
+        return torch.as_tensor(value, device=self.device).reshape(-1).round().long()
+
+    def _emit_std_by_label(self, outputs: Dict[str, Any], timestep: int) -> None:
+        """``policy/std_<name>``: each env's acting std (mean over its action dims), grouped by the label its env
+        published for this observation (the previous step's ``infos``; :meth:`record_transition` keeps it), one
+        value per env in the group, per agent. Nothing before the first label or for an empty group."""
+        labels = getattr(self, "_std_labels", None)
+        log_std = outputs.get("log_std") if isinstance(outputs, dict) else None
+        if not self.on_log or not self.training or labels is None or log_std is None:
+            return
+        std = log_std.exp().mean(dim=-1)
+        if labels.shape[0] != std.shape[0]:
+            return
+        per_agent = std.shape[0] // self.num_agents
+        for index, name in enumerate(self.cfg.std_label_names):
+            hit = labels == index
+            for agent in range(self.num_agents):
+                rows = slice(agent * per_agent, (agent + 1) * per_agent)
+                values = std[rows][hit[rows]]
+                if values.numel():
+                    self.emit(agent, {f"policy/std_{name}": values}, timestep)
+
+    def _emit_metrics_by_label(self, infos: Any, timestep: int) -> None:
+        """``metrics_by_label``: this step's per-env ``metrics_to_log`` values, per ``std_by_label`` group (the label
+        of the observation acted on), over the envs that ran the policy (all of them without progressive
+        exploration), as ``<name>_<group>``, one value per env, per agent."""
+        labels = getattr(self, "_std_labels", None)
+        channel = infos.get("metrics_to_log") if isinstance(infos, dict) else None
+        if not self.on_log or not self.training or labels is None or not isinstance(channel, dict):
+            return
+        active = getattr(self, "_explore_keep", None)
+        if int(self.cfg.progressive_exploration_steps) <= 0 or active is None or active.shape != labels.shape:
+            active = torch.ones_like(labels, dtype=torch.bool)
+        per_agent = labels.shape[0] // self.num_agents
+        for name in self.cfg.metrics_by_label:
+            value = channel.get(name)
+            if value is None:
+                continue
+            value = torch.as_tensor(value, device=self.device).reshape(-1)
+            if value.shape != labels.shape:
+                continue
+            for index, group in enumerate(self.cfg.std_label_names):
+                hit = (labels == index) & active
+                for agent in range(self.num_agents):
+                    rows = slice(agent * per_agent, (agent + 1) * per_agent)
+                    values = value[rows][hit[rows]]
+                    if values.numel():
+                        self.emit(agent, {f"{name}_{group}": values}, timestep)
+
     def _explore_share(self, timestep: int) -> float:
-        """``min(timestep / H, 1)``: the chance an env runs the policy this step."""
-        return min(timestep / int(self.cfg.progressive_exploration_steps), 1.0)
+        """``min(max(timestep - start, 0) / H, 1)``: the chance an env runs the policy this step, 0 until
+        ``progressive_exploration_start``."""
+        since = max(timestep - int(self.cfg.progressive_exploration_start), 0)
+        return min(since / int(self.cfg.progressive_exploration_steps), 1.0)
 
     def _explore_progressively(self, actions: torch.Tensor, timestep: int) -> torch.Tensor:
         """``progressive_exploration_steps`` H (Policy Decorator): while training, each env runs
@@ -385,6 +625,8 @@ class SAC(LearnerBase):
         if not self.training or int(self.cfg.progressive_exploration_steps) <= 0:
             return actions
         keep = torch.rand(actions.shape[0], 1, device=actions.device) < self._explore_share(timestep)
+        #: the envs that ran the policy this step (metrics_by_label counts only those)
+        self._explore_keep = keep.reshape(-1)
         self.emit_per_agent(
             {"exploration/policy_share": keep.float().view(self.num_agents, -1).mean(dim=1)}, timestep
         )
@@ -412,6 +654,12 @@ class SAC(LearnerBase):
             truncated=truncated,
             step=timestep,
         )
+        #: the label of the observation this transition starts from (store_labels)
+        start_labels = getattr(self, "_std_labels", None)
+        if self.cfg.std_by_label:
+            self._emit_metrics_by_label(infos, timestep)
+            # the label of the observation the next act() sees
+            self._std_labels = self._std_labels_from(infos)
 
         if not self.training:
             return
@@ -425,10 +673,27 @@ class SAC(LearnerBase):
             extra["states"] = states
             extra["next_states"] = next_states
         extra.update(self.aux_memory_values(infos))
+        extra.update(self._side_input_values(infos, observations.shape[0]))
+        if self.cfg.executed_action_mask:
+            actions = actions * self._executed_mask(infos, actions)
+        if getattr(self, "_track_outcomes", False):
+            extra["episode_ids"] = self._env_episode.to(torch.float32).unsqueeze(-1)
+            self._record_outcomes(infos, terminated, truncated)
+        if self.cfg.store_labels:
+            # stored only where the starting observation's label is listed (none before the first label is known)
+            allowed = [self.cfg.std_label_names.index(label) for label in self.cfg.store_labels]
+            if start_labels is None:
+                keep = torch.zeros(observations.shape[0], dtype=torch.bool, device=self.device)
+            else:
+                keep = torch.isin(start_labels, torch.tensor(allowed, device=start_labels.device))
+            extra["_keep"] = keep.to(torch.float32).unsqueeze(-1)
+        stored_rewards = self.shape_rewards(rewards, timestep, timesteps)
+        if self.return_scaler is not None:
+            self.return_scaler.update(stored_rewards, terminated | truncated)
         row = dict(
             observations=observations,
             actions=actions,
-            rewards=self.shape_rewards(rewards, timestep, timesteps),
+            rewards=stored_rewards,
             next_observations=next_observations,
             terminated=terminated,
             truncated=truncated,
@@ -439,7 +704,62 @@ class SAC(LearnerBase):
             row = self._n_step_window.push(row)
             if row is None:
                 return
+        if "_keep" in row:  # store_labels: only the transitions starting in a listed phase
+            keep = row.pop("_keep").reshape(-1) > 0.5
+            self.memory.add_rows(keep, **row)
+            return
         self.memory.add_samples(**row)
+
+    def _executed_mask(self, infos: Any, actions: torch.Tensor) -> torch.Tensor:
+        """``executed_action_mask``: ``(num_envs, 1)`` 1 where the env executed the agent's action this step."""
+        key = self.cfg.executed_action_mask
+        value = infos.get(key) if isinstance(infos, dict) else None
+        if value is None:
+            raise RuntimeError(f"sac.executed_action_mask: the env's infos carry no '{key}' this step")
+        mask = torch.as_tensor(value, device=actions.device, dtype=actions.dtype).reshape(-1, 1)
+        if mask.shape[0] != actions.shape[0]:
+            raise ValueError(f"infos['{key}'] has {mask.shape[0]} rows, the actions {actions.shape[0]}")
+        return mask
+
+    def _record_outcomes(self, infos: Any, terminated: torch.Tensor, truncated: torch.Tensor) -> None:
+        """Record the outcome of every episode that ended this step and give those envs new episode ids."""
+        done = (terminated.reshape(-1) | truncated.reshape(-1)).to(self.device)
+        if not bool(done.any()):
+            return
+        channel = infos.get("episode_metrics_to_log") if isinstance(infos, dict) else None
+        value = channel.get(self.cfg.outcome_metric) if isinstance(channel, dict) else None
+        if value is None:
+            raise RuntimeError(
+                f"sac.success_clone_weight / failure_anchor_weight: an episode ended but infos carry no "
+                f"episode_metrics_to_log['{self.cfg.outcome_metric}']"
+            )
+        outcome = (torch.as_tensor(value, device=self.device).reshape(-1) > 0.5).to(torch.float32)
+        ids = self._env_episode[done]
+        need = int(ids.max()) + 1 + int(done.sum())
+        if need > self._outcomes.numel():
+            grown = torch.full((max(need, 2 * self._outcomes.numel()),), -1.0, device=self.device)
+            grown[: self._outcomes.numel()] = self._outcomes
+            self._outcomes = grown
+        self._outcomes[ids] = outcome[done]
+        fresh = torch.arange(self._next_episode, self._next_episode + int(done.sum()), device=self.device)
+        self._env_episode[done] = fresh
+        self._next_episode += int(done.sum())
+
+    def _side_input_values(self, infos: Any, rows: int) -> Dict[str, torch.Tensor]:
+        """This step's ``side_inputs`` (and their ``next_`` values) from ``infos``, shape-checked."""
+        out: Dict[str, torch.Tensor] = {}
+        for name, width in getattr(self, "_side_inputs", {}).items():
+            for stored in (name, f"next_{name}"):
+                value = infos.get(stored) if isinstance(infos, dict) else None
+                if value is None:
+                    raise RuntimeError(
+                        f"the critic action transform reads the side input '{name}', but the env's infos carry "
+                        f"no '{stored}' this step"
+                    )
+                if tuple(value.shape) != (rows, width):
+                    raise ValueError(f"infos['{stored}'] must be ({rows}, {width}), got {tuple(value.shape)}")
+                out[stored] = value.to(device=self.device, dtype=torch.float32)
+        return out
 
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
         # learning_starts is the first update of anything (the critics); the actor joins at
@@ -466,18 +786,38 @@ class SAC(LearnerBase):
 
     def _compute_critic_loss(self, *, sampled, inputs, next_inputs, critic_inputs, critic_next_inputs, rows):
         """Min-over-targets bootstrapped target (with the entropy bonus unless
-        ``backup_entropy`` is off) + mean MSE over the critics. Also returns the policy's
-        log-prob of its next actions, for ``entropy_observations: next``."""
-        with torch.no_grad():
+        ``backup_entropy`` is off) + mean MSE over the critics; with a categorical critic the
+        projected target distribution of the lowest-Q target critic + mean cross-entropy.
+        Also returns the policy's log-prob of its next actions, for ``entropy_observations:
+        next``, and (categorical) each agent's cross-entropy, else None."""
+        with torch.no_grad(), self._batch_mode(self.policy, False):
             next_actions, outputs = self.policy.act(next_inputs, role="policy")
-            target_qs, _ = self.target_critics.act(
-                {**critic_next_inputs, "taken_actions": self._critic_actions(sampled, "next_observations", next_actions)},
-                role="target_critics",
-            )
-            target_q = self._target_min(target_qs, rows)
-            if self.cfg.backup_entropy:
-                entropy = self.expand_per_agent(self._entropy_coefficient, rows)
-                target_q = target_q - entropy * outputs["log_prob"]
+            next_critic_actions = self._critic_actions(sampled, "next_observations", next_actions)
+        critic_actions = self._critic_actions(sampled, "observations", sampled["actions"])
+        if self.cfg.cross_batch_value:
+            # FlashSAC: [s, a] ++ [s', a'] in one call for both; the target reads the next half,
+            # the critics their current half
+            both = {
+                **critic_inputs,
+                "observations": self._join_halves(critic_inputs["observations"], critic_next_inputs["observations"], rows),
+                "taken_actions": self._join_halves(critic_actions, next_critic_actions, rows),
+            }
+            with torch.no_grad(), self._batch_mode(self.target_critics, True):
+                target_out = self._critic_half(self.target_critics.act(both, role="target_critics")[0], rows, 1)
+            with self._batch_mode(self.critics, True):
+                values = self._critic_half(self.critics.act(both, role="critics")[0], rows, 0)
+        else:
+            with torch.no_grad(), self._batch_mode(self.target_critics, True):
+                target_out, _ = self.target_critics.act(
+                    {**critic_next_inputs, "taken_actions": next_critic_actions}, role="target_critics"
+                )
+            with self._batch_mode(self.critics, True):
+                values, _ = self.critics.act({**critic_inputs, "taken_actions": critic_actions}, role="critics")
+
+        with torch.no_grad():
+            rewards = sampled["rewards"]
+            if self.return_scaler is not None:
+                rewards = rewards / self.expand_per_agent(self.return_scaler.denominator, rows)
             # Bootstrap unless the next state is genuinely terminal. A time limit is not the
             # end of the world: the episode had a future, it just stopped being observed, so
             # dropping gamma*V(next) there would teach the critic that running out the clock
@@ -485,33 +825,126 @@ class SAC(LearnerBase):
             # at the limit (``_get_dones`` returns one ``time_out`` tensor twice), so reading
             # ``terminated`` alone would do exactly that to every episode.
             terminal = sampled["terminated"] & sampled["truncated"].logical_not()
+            if not self.cfg.bootstrap_time_limits:
+                # every episode end is terminal: Isaac Lab's s' after a reset is the next episode's first observation
+                terminal = sampled["terminated"] | sampled["truncated"]
             # an n-step row bootstraps gamma ** m later (its own discounts), a 1-step row gamma
             discount = sampled["discounts"] if self._n_step() > 1 else self.cfg.discount_factor
-            target_values = (
-                sampled["rewards"]
-                + discount * terminal.logical_not() * target_q
+            bonus = (
+                self.expand_per_agent(self._entropy_coefficient, rows) * outputs["log_prob"]
+                if self.cfg.backup_entropy
+                else 0.0
             )
+            if self._categorical:
+                # FlashSAC's _select_min_q_log_probs + _compute_categorical_td_target
+                target_log_probs = F.log_softmax(target_out, dim=-1)  # (critics, R, bins)
+                target_qs = (target_log_probs.exp() * self._atoms).sum(dim=-1)
+                lowest = target_qs.argmin(dim=0)
+                chosen = target_log_probs.gather(
+                    0, lowest[None, :, None].expand(1, -1, target_log_probs.shape[-1])
+                )[0]
+                shifted = rewards + discount * terminal.logical_not() * (self._atoms - bonus)
+                target_probs = categorical_projection(
+                    chosen.exp(), shifted, float(self.cfg.critic_min_value), float(self.cfg.critic_max_value)
+                )
+                target_values = (target_probs * self._atoms).sum(dim=-1, keepdim=True)
+            else:
+                target_q = self._target_min(target_out, rows) - bonus
+                target_values = rewards + discount * terminal.logical_not() * target_q
 
-        values, _ = self.critics.act(
-            {**critic_inputs, "taken_actions": self._critic_actions(sampled, "observations", sampled["actions"])},
-            role="critics",
-        )
+        if self._categorical:
+            log_probs = F.log_softmax(values, dim=-1)
+            cross_entropy = -(target_probs.unsqueeze(0) * log_probs).sum(dim=-1)  # (critics, R)
+            critic_loss = cross_entropy.mean()
+            per_agent = cross_entropy.detach().mean(dim=0).view(self.num_agents, rows).mean(dim=1)
+            values = (log_probs.exp() * self._atoms).sum(dim=-1, keepdim=True)
+            return critic_loss, values[0], values[1], target_values, outputs["log_prob"], per_agent
         # the mean over critics of each critic's MSE (they share the target)
         critic_loss = (values - target_values.unsqueeze(0)).pow(2).mean(dim=(1, 2)).mean()
-        return critic_loss, values[0], values[1], target_values, outputs["log_prob"]
+        return critic_loss, values[0], values[1], target_values, outputs["log_prob"], None
 
-    def _compute_actor_loss(self, *, sampled, inputs, critic_inputs, rows):
+    def _q_values(self, out: torch.Tensor) -> torch.Tensor:
+        """The critics' output as Q values ``(critics, R, 1)``: as is, or a categorical
+        critic's mean over its atoms."""
+        if not self._categorical:
+            return out
+        return (torch.softmax(out, dim=-1) * self._atoms).sum(dim=-1, keepdim=True)
+
+    def _join_halves(self, current: torch.Tensor, following: torch.Tensor, rows: int) -> torch.Tensor:
+        """``cross_batch_value``: two flat ``(N * rows, d)`` batches as one ``(N * 2 rows, d)``,
+        each agent's current rows then its next rows, so each agent's block stays its own."""
+        n = self.num_agents
+        return torch.cat((current.view(n, rows, -1), following.view(n, rows, -1)), dim=1).reshape(n * 2 * rows, -1)
+
+    def _critic_half(self, out: torch.Tensor, rows: int, half: int) -> torch.Tensor:
+        """``(critics, N * 2 rows, C) -> (critics, N * rows, C)``: half 0 (current) or 1 (next)."""
+        members, _, columns = out.shape
+        return out.view(members, self.num_agents, 2, rows, columns)[:, :, half].reshape(members, -1, columns)
+
+    def _actor_half(self, out: torch.Tensor, rows: int) -> torch.Tensor:
+        """``(N * 2 rows, ...) -> (N * rows, ...)``: the current half of a joined actor batch."""
+        return out.view(self.num_agents, 2, rows, *out.shape[1:])[:, 0].reshape(self.num_agents * rows, *out.shape[1:])
+
+    def _compute_actor_loss(self, *, sampled, inputs, critic_inputs, rows, next_inputs=None):
         """``alpha * log_pi - Q``, with Q the min (or mean, ``actor_q_reduction``) over the
-        critics."""
-        actions, outputs = self.policy.act(inputs, role="policy")
+        critics. ``cross_batch_value``: the actor runs on ``s ++ s'`` and the loss reads the
+        current half (FlashSAC's update_actor)."""
+        if self.cfg.cross_batch_value:
+            both = {
+                **inputs,
+                "observations": self._join_halves(inputs["observations"], next_inputs["observations"], rows),
+            }
+            with self._batch_mode(self.policy, True):
+                actions, outputs = self.policy.act(both, role="policy")
+            actions = self._actor_half(actions, rows)
+            outputs = {
+                key: self._actor_half(value, rows)
+                if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == 2 * self.num_agents * rows
+                else value
+                for key, value in outputs.items()
+            }
+        else:
+            with self._batch_mode(self.policy, True):
+                actions, outputs = self.policy.act(inputs, role="policy")
         log_prob = outputs["log_prob"]
-        q_pi, _ = self.critics.act(
-            {**critic_inputs, "taken_actions": self._critic_actions(sampled, "observations", actions)}, role="critics"
-        )
+        with self._batch_mode(self.critics, False):
+            q_out, _ = self.critics.act(
+                {**critic_inputs, "taken_actions": self._critic_actions(sampled, "observations", actions)}, role="critics"
+            )
+        q_pi = self._q_values(q_out)
         q = q_pi.mean(dim=0) if self.cfg.actor_q_reduction == "mean" else q_pi.min(dim=0).values
         entropy = self.expand_per_agent(self._entropy_coefficient, rows)
-        policy_loss = (entropy * log_prob - q).mean()
+        q_term = q
+        if self.cfg.actor_q_scale is not None:
+            # TD3+BC's lambda = scale / mean|Q|, per agent, no gradient through it
+            mean_abs = q.detach().abs().view(self.num_agents, rows).mean(dim=1).clamp(min=1e-6)
+            q_term = q * self.expand_per_agent((float(self.cfg.actor_q_scale) / mean_abs).unsqueeze(-1), rows)
+        policy_loss = (entropy * log_prob - q_term).mean()
+        if getattr(self, "_track_outcomes", False):
+            extra, metrics = self._parts_terms(sampled, outputs["mean_actions"], rows)
+            policy_loss = policy_loss + extra
+            outputs = {**outputs, "parts_metrics": metrics}
         return policy_loss, actions, log_prob, q, outputs
+
+    def _parts_terms(self, sampled, mean_actions: torch.Tensor, rows: int):
+        """PARTS' eq. 4 terms, per agent over its batch rows of finished episodes: ``success_clone_weight *
+        mean_{B+} ||a_mean - a_stored||^2 + failure_anchor_weight * mean_{B-} ||a_mean||^2``, averaged over the
+        agents (as the rest of the actor loss). Returns ``(loss, metrics)``, the metrics per agent ``(N,)``."""
+        outcome = self._outcomes[sampled["episode_ids"].reshape(-1).long()].view(self.num_agents, rows)
+        success = (outcome == 1.0).to(mean_actions.dtype)
+        failure = (outcome == 0.0).to(mean_actions.dtype)
+        clone = (mean_actions - sampled["actions"]).pow(2).sum(dim=-1).view(self.num_agents, rows)
+        anchor = mean_actions.pow(2).sum(dim=-1).view(self.num_agents, rows)
+        clone_mean = (clone * success).sum(dim=1) / success.sum(dim=1).clamp(min=1.0)
+        anchor_mean = (anchor * failure).sum(dim=1) / failure.sum(dim=1).clamp(min=1.0)
+        loss = (float(self.cfg.success_clone_weight) * clone_mean + float(self.cfg.failure_anchor_weight) * anchor_mean).mean()
+        metrics = {
+            "actor/clone_loss": clone_mean.detach(),
+            "actor/anchor_loss": anchor_mean.detach(),
+            "actor/success_rows": success.mean(dim=1).detach(),
+            "actor/failure_rows": failure.mean(dim=1).detach(),
+        }
+        return loss, metrics
 
     #: the critic's own input for each actor-side key, when the learner is asymmetric
     _CRITIC_INPUT_KEYS = {"observations": "states", "next_observations": "next_states"}
@@ -525,11 +958,27 @@ class SAC(LearnerBase):
         and not in the actor's observation. ``sampled`` is read only when there is a transform."""
         if self.critic_action_transform is None:
             return actions
+        side_names = getattr(self, "_side_inputs", {})
+        declared = set(getattr(self.critic_action_transform, "side_inputs", None) or {})
+        if declared != set(side_names):
+            raise RuntimeError(
+                f"the critic action transform reads side inputs {sorted(declared)} but the memory stores "
+                f"{sorted(side_names)}: set learner.critic_action_transform before init()"
+            )
+        prefix = "next_" if key == "next_observations" else ""
         if self._asymmetric:
             key = self._CRITIC_INPUT_KEYS[key]
-        out = self.critic_action_transform(sampled[key], actions)
-        if out.shape != actions.shape:
-            raise ValueError(f"the critic action transform returned {tuple(out.shape)} for actions {tuple(actions.shape)}")
+        if side_names:
+            side = {name: sampled[f"{prefix}{name}"] for name in side_names}
+            out = self.critic_action_transform(sampled[key], actions, side)
+        else:
+            out = self.critic_action_transform(sampled[key], actions)
+        width = int(getattr(self.critic_action_transform, "critic_action_width", None) or actions.shape[-1])
+        if out.shape != (*actions.shape[:-1], width):
+            raise ValueError(
+                f"the critic action transform returned {tuple(out.shape)} for actions {tuple(actions.shape)}; "
+                f"expected width {width}"
+            )
         return out
 
     # ------------------------------------------------------------------ update
@@ -539,6 +988,8 @@ class SAC(LearnerBase):
 
     def _update(self, *, timestep: int, timesteps: int) -> None:
         rows = self.cfg.batch_size  # per agent; the memory returns N * batch_size rows
+        if self.cfg.store_labels and int(self.memory.size) == 0:
+            return  # no transition of a stored phase yet for some agent: nothing to learn from
         policy_on = timestep >= self._policy_learning_starts()
         demo_on = self._demo_active(timestep)
         # a graph replays fixed shapes: a mixed batch's online share is fixed only once the
@@ -546,6 +997,7 @@ class SAC(LearnerBase):
         # (losses.terms[*].graph_safe), the others run eagerly
         graph = (
             self._graphs is not None
+            and not self.cfg.store_labels  # per-agent fills: the plain sampler
             and self.aux_loss_graph_safe()
             and (not demo_on or int(self.memory.size) >= rows // 2)
         )
@@ -590,7 +1042,7 @@ class SAC(LearnerBase):
         sampled = self._mixed_batch(rows, graph) if demo_on else online
         inputs, next_inputs, critic_inputs, critic_next_inputs = self._batch_inputs(sampled)
 
-        critic_loss, critic_1_values, critic_2_values, target_values, next_log_prob = self._compute_critic_loss(
+        critic_loss, critic_1_values, critic_2_values, target_values, next_log_prob, critic_ce = self._compute_critic_loss(
             sampled=sampled,
             inputs=inputs,
             next_inputs=next_inputs,
@@ -618,15 +1070,16 @@ class SAC(LearnerBase):
             self.critics, self.num_agents, self.cfg.grad_norm_clip
         )
         self.critic_optimizer.step()
+        self._normalize_weights(self.critics)
 
         actor = {}
         if actor_step:
             if online is not sampled:
                 # a second batch this step: it must not count twice in the normalizer
-                inputs, _, critic_inputs, _ = self._batch_inputs(online, train=False)
+                inputs, next_inputs, critic_inputs, _ = self._batch_inputs(online, train=False)
             actor = self._actor_step(
                 timestep=timestep, sampled=online, inputs=inputs, critic_inputs=critic_inputs, rows=rows,
-                next_log_prob=next_log_prob,
+                next_log_prob=next_log_prob, next_inputs=next_inputs,
             )
 
         self._polyak()
@@ -635,6 +1088,7 @@ class SAC(LearnerBase):
             critic_2_values=critic_2_values.detach(),
             target_values=target_values,
             critic_grad_norms=critic_grad_norms,
+            critic_loss=critic_ce,
             # the aux terms' raw values: returned like the rest, so a replayed graph's are fresh
             aux_metrics={k: v.detach() for k, v in ctx.aux_metrics.items()},
         )
@@ -656,11 +1110,13 @@ class SAC(LearnerBase):
             critic_inputs, critic_next_inputs = inputs, next_inputs
         return inputs, next_inputs, critic_inputs, critic_next_inputs
 
-    def _actor_step(self, *, timestep: int, sampled, inputs, critic_inputs, rows: int, next_log_prob=None) -> dict:
+    def _actor_step(
+        self, *, timestep: int, sampled, inputs, critic_inputs, rows: int, next_log_prob=None, next_inputs=None
+    ) -> dict:
         """The actor's step, then the temperature's on the entropy ``entropy_observations``
         names: this batch's ``log_prob`` or the critic step's ``next_log_prob``."""
         policy_loss, actions, log_prob, q_pi, outputs = self._compute_actor_loss(
-            sampled=sampled, inputs=inputs, critic_inputs=critic_inputs, rows=rows
+            sampled=sampled, inputs=inputs, critic_inputs=critic_inputs, rows=rows, next_inputs=next_inputs
         )
         ctx = LossContext(
             learner=self,
@@ -682,6 +1138,7 @@ class SAC(LearnerBase):
             self.policy, self.num_agents, self.cfg.grad_norm_clip
         )
         self.policy_optimizer.step()
+        self._normalize_weights(self.policy)
 
         if self.cfg.learn_entropy:
             entropy_log_prob = next_log_prob if self.cfg.entropy_observations == "next" else log_prob
@@ -700,7 +1157,10 @@ class SAC(LearnerBase):
             "policy_loss": per_agent_loss,
             "log_std": outputs["log_std"].detach() if "log_std" in outputs else None,
             "entropy_loss": entropy_loss,
-            "actor_aux_metrics": {k: v.detach() for k, v in ctx.aux_metrics.items()},
+            "actor_aux_metrics": {
+                **{k: v.detach() for k, v in ctx.aux_metrics.items()},
+                **(outputs.get("parts_metrics") or {}),
+            },
         }
 
     def _update_entropy(self, log_prob: torch.Tensor, rows: int) -> torch.Tensor:
@@ -734,6 +1194,7 @@ class SAC(LearnerBase):
         critic_2_values,
         target_values,
         critic_grad_norms,
+        critic_loss=None,
         demo_rows: int = 0,
         policy_grad_norms=None,
         log_prob=None,
@@ -747,7 +1208,8 @@ class SAC(LearnerBase):
         graph-safe aux losses, their terms' raw values too, from the same steps)."""
         with torch.no_grad():
             metrics = {
-                "loss/critic": 0.5
+                # categorical: the cross-entropy it trains on; scalar: the halved MSE sum
+                "loss/critic": critic_loss if critic_loss is not None else 0.5
                 * (
                     F.mse_loss(
                         critic_1_values.view(self.num_agents, rows, -1),
@@ -768,6 +1230,9 @@ class SAC(LearnerBase):
                 "lr/actor": self.policy_optimizer.lr.to(torch.float32),
                 "lr/critic": self.critic_optimizer.lr.to(torch.float32),
             }
+            if self.return_scaler is not None:
+                # what the critics' rewards are divided by (adaptive_reward_scaling)
+                metrics["reward/scale_denominator"] = self.return_scaler.denominator.reshape(-1).clone()
             if self._demo is not None:
                 # demo rows per critic batch, as a fraction: 0 outside the window
                 metrics["sac/demo_fraction"] = torch.full(
@@ -823,11 +1288,14 @@ class SAC(LearnerBase):
             self.device,
             self._controller_cfg,
             num_critics=self._num_critics,
+            critic_outputs=sac_critic_outputs(self.cfg),
+            critic_action_space=self._critic_action_space,
         )
         for key in ("policy", "critics", "target_critics"):
             self.models[key] = fresh[key]
         self.policy = self.models["policy"]
         self._bind_critics()
+        self._normalize_weights(self.policy, self.critics)
         self._sync_targets()
 
         self._build_optimizers()
@@ -890,6 +1358,8 @@ class SAC(LearnerBase):
             normalizers["states"] = self.state_normalizer
         if self.reward_normalizer is not None:
             normalizers["rewards"] = self.reward_normalizer
+        if self.return_scaler is not None:
+            normalizers["returns"] = self.return_scaler
         return normalizers
 
     def _checkpoint_extras(self, agent: int) -> Dict[str, Any]:

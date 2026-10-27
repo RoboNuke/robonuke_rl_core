@@ -13,11 +13,14 @@ import numpy as np
 import torch
 
 from robonuke_rl_core.learners.base import run_dirs  # noqa: F401  (re-exported for tests)
-from robonuke_rl_core.learners.cfg import PPOCfg, SACCfg, TrainerCfg
+from robonuke_rl_core.learners.cfg import PPOCfg, SACCfg, TrainerCfg, sac_critic_outputs
 from robonuke_rl_core.learners.ppo import PPO
-from robonuke_rl_core.learners.sac import SAC
+from robonuke_rl_core.learners.sac import SAC, critic_action_space
 from robonuke_rl_core.memory.multi_random import MultiRandomMemory
 from robonuke_rl_core.models.cfg import (
+    FlashSACActorCfg,
+    FlashSACCriticCfg,
+    FlashSACModelCfg,
     MlpActorCfg,
     MlpCriticCfg,
     MlpModelCfg,
@@ -44,6 +47,13 @@ def tiny_mlp_cfg() -> MlpModelCfg:
     return MlpModelCfg(
         actor=MlpActorCfg(hidden_size=8, num_layers=1),
         critic=MlpCriticCfg(hidden_size=8, num_layers=1),
+    )
+
+
+def tiny_flashsac_cfg() -> FlashSACModelCfg:
+    return FlashSACModelCfg(
+        actor=FlashSACActorCfg(hidden_size=8, num_blocks=1),
+        critic=FlashSACCriticCfg(hidden_size=8, num_blocks=1),
     )
 
 
@@ -80,6 +90,7 @@ def build_learner(
     action_dim: int = ACT_DIM,
     aux_loss=None,
     architecture: str = "simba",
+    critic_action_transform=None,
     **cfg_overrides,
 ):
     """A learner with tiny networks and an empty memory of depth ``rollout``.
@@ -109,6 +120,8 @@ def build_learner(
         model_cfg = tiny_model_cfg()
     elif architecture == "mlp":
         model_cfg = tiny_mlp_cfg()
+    elif architecture == "flashsac":
+        model_cfg = tiny_flashsac_cfg()
     else:
         raise ValueError(f"unknown architecture {architecture!r}")
     for key, value in (model_overrides or {}).items():
@@ -125,6 +138,10 @@ def build_learner(
         "cpu",
         controller_cfg,
         num_critics=cfg.num_critics if learner == "sac" else 2,
+        critic_outputs=sac_critic_outputs(cfg) if learner == "sac" else 1,
+        critic_action_space=(
+            critic_action_space(critic_action_transform, action_space) if critic_action_transform is not None else None
+        ),
     )
     memory = MultiRandomMemory(
         capacity=rollout * envs_per_agent, num_envs=num_envs, num_agents=num_agents, device="cpu"
@@ -148,6 +165,8 @@ def build_learner(
     )
     for hook in aux_loss or []:
         instance.aux_loss.append(hook)
+    if critic_action_transform is not None:  # before init(): the memory stores its side inputs
+        instance.critic_action_transform = critic_action_transform
     instance.init()
     instance.enable_training_mode(True)
     return instance

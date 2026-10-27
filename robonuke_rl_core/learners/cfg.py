@@ -8,12 +8,12 @@ callable is a ``"module:name"`` string, resolved with ``config.resolve_callable`
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
 
 from omegaconf import MISSING
 
-__all__ = ["TrainerCfg", "SACCfg", "PPOCfg", "LEARNERS", "register_learner", "known_learners"]
+__all__ = ["TrainerCfg", "SACCfg", "PPOCfg", "LEARNERS", "register_learner", "known_learners", "sac_critic_outputs"]
 
 #: the package's own learners: ``models/factory`` builds their networks and eval loads them
 LEARNERS = ("sac", "ppo")
@@ -188,14 +188,99 @@ class SACCfg(_CommonCfg):
     #: a residual policy: the base alone); the zeros are what is executed and stored.
     #: ``random_timesteps`` actions too. 0 is off
     progressive_exploration_steps: int = 0
+    #: env step the progressive exploration ramp starts at: before it every env runs on zeros (share 0), from
+    #: it the share is ``min((timestep - start) / progressive_exploration_steps, 1)``. 0 starts the ramp at once
+    progressive_exploration_start: int = 0
     #: n-step TD targets: each critic target sums the next ``n_step`` rewards (fewer where the
     #: episode ends first) and bootstraps ``gamma ** m * Q`` that many steps later
     #: (``learners/n_step.py``); online rows and demo rows alike, uncorrected. 1 is classic
     #: 1-step SAC
     n_step: int = 1
+    #: FlashSAC (arXiv:2604.04539; github.com/Holiday-Robot/FlashSAC), all off by default.
+    #: "scalar" (a Q value, MSE to the target) or "categorical": each critic predicts a
+    #: distribution over ``critic_num_bins`` atoms spread evenly on [critic_min_value,
+    #: critic_max_value], trained by cross-entropy to the target distribution projected onto
+    #: the atoms (C51). Its Q is the distribution's mean; the bootstrap takes the distribution
+    #: of the critic with the lowest Q, row by row
+    critic_distribution: str = "scalar"
+    critic_num_bins: int = 101
+    critic_min_value: float = -5.0
+    critic_max_value: float = 5.0
+    #: FlashSAC's adaptive reward scaling: the critics' rewards (online and demo, at sampling
+    #: time) are divided by ``max(sqrt(var(G) + 1e-8), max|G| / adaptive_reward_g_max)``, with G
+    #: each env's running discounted return of the stored reward, its variance and max
+    #: magnitude kept per agent from every stored env step. The memory keeps the raw reward
+    adaptive_reward_scaling: bool = False
+    adaptive_reward_g_max: float = 5.0
+    #: FlashSAC's weight normalization: after every optimizer step (and once at build) each
+    #: Linear weight row of the policy and the critics is projected onto the unit sphere, and
+    #: each normalization layer's (scale, shift) to norm sqrt(width). Linear biases are left as
+    #: they are; the targets are only normalized at build (their Polyak average is not)
+    weight_normalization: bool = False
+    #: FlashSAC's unified entropy target: ``0.5 |A| log(2 pi e sigma^2)``, the entropy of a
+    #: Gaussian of std sigma on every action dim (FlashSAC: 0.15). None leaves
+    #: ``target_entropy``; setting both is an error
+    target_entropy_sigma: Optional[float] = None
+    #: FlashSAC's cross-batch value prediction: the critics (and the target critics) take the
+    #: current and next rows of a batch in ONE call, ``[s, a] ++ [s', a']`` per agent, and so
+    #: does the actor (``s ++ s'``); each loss reads its own half. Only a layer that uses batch
+    #: statistics (BatchNorm) sees a difference; for SimBa and the MLP it changes nothing but
+    #: the cost
+    cross_batch_value: bool = False
+    #: FlashSAC's noise repetition: while training, each agent's envs hold one Gaussian noise
+    #: draw for k env steps, k drawn from a Zeta(noise_repeat_zeta_s) truncated at
+    #: noise_repeat_max (P(k) ~ k^-s), then draw both afresh; the action is the policy's
+    #: ``tanh(mean + std * noise)``. The uniform ``random_timesteps`` actions are not held
+    noise_repeat: bool = False
+    noise_repeat_zeta_s: float = 2.0
+    noise_repeat_max: int = 16
+    #: train an unsquashed actor (``model.architecture: mlp`` with ``model.actor.squash: false``): a plain
+    #: Gaussian, its samples unbounded (the env gets them as they are) and its log-probability the Gaussian's
+    #: own, no tanh correction. False refuses that actor for SAC, whose actor is otherwise tanh-squashed
+    unsquashed_actor: bool = False
+    #: log the acting policy's std per env group: the ``infos`` channel holding each env's integer label every step,
+    #: ``"<key>/<name>"`` for ``infos[key][name]`` (e.g. ``eval_state/phase/id``, one_leg's task phase), or a plain
+    #: top-level key. Each env's std at an observation (the mean over its action dims) is grouped by the label the
+    #: env published for that observation and logged as ``policy/std_<std_label_names[label]>``; labels outside
+    #: ``std_label_names`` (an episode's end codes) are skipped. None: off
+    std_by_label: Optional[str] = None
+    std_label_names: List[str] = field(default_factory=list)
+    #: per-env ``infos["metrics_to_log"]`` channels to log per ``std_by_label`` group too, as ``<name>_<group>``: each
+    #: env's value for the step goes to the group of the label of the observation it acted on, and only the envs that
+    #: ran the policy that step count (progressive exploration's zeros left out; every env when it is off)
+    metrics_by_label: List[str] = field(default_factory=list)
+    #: PARTS' actor terms (Su et al., arXiv:2609.21788, eq. 4), off at 0. Every stored transition carries its
+    #: episode's id; when an episode ends its outcome (``outcome_metric`` from ``infos["episode_metrics_to_log"]``,
+    #: 1 success / 0 failure) is recorded, and the actor's loss gains, per agent over the batch's rows of finished
+    #: episodes: ``success_clone_weight * mean_{B+} ||a_mean - a_stored||^2`` (clone the residuals executed in
+    #: successful episodes) + ``failure_anchor_weight * mean_{B-} ||a_mean||^2`` (pull the actor toward zero, the base
+    #: alone, on states of failed episodes), ``a_mean`` the actor's deterministic (mean) action. Rows of episodes still
+    #: running count in neither
+    success_clone_weight: float = 0.0
+    failure_anchor_weight: float = 0.0
+    outcome_metric: str = "episode/success"
+    #: PARTS' lambda_Q in TD3+BC's form (Fujimoto & Gu 2021): the actor's Q term is scaled by
+    #: ``actor_q_scale / mean|Q|`` (each agent's batch mean, no gradient), so the clone / anchor terms keep their
+    #: weight whatever the value scale (TD3+BC: 2.5). None leaves the Q term as it is
+    actor_q_scale: Optional[float] = None
+    #: an ``infos`` key holding, per env and step, 1 where the env executed the agent's action and 0 where it ignored
+    #: it (a residual switched off for that step): the stored action is multiplied by it, so the memory and the
+    #: critics see the action that was executed. None: every stored action is the agent's
+    executed_action_mask: Optional[str] = None
+    #: ``std_label_names`` groups whose transitions the memory stores: a transition is added only when the label of
+    #: the observation it starts from (``std_by_label``) is one of these (e.g. one_leg's ``insert`` and ``screw``, a
+    #: residual acting only after the grasp), so the memory holds only what is trained on; the agents then fill at
+    #: their own pace (``MultiRandomMemory.add_rows``). Empty: every transition is stored
+    store_labels: List[str] = field(default_factory=list)
+    #: bootstrap through a time limit (``truncated`` without ``terminated``: ``r + gamma Q(s', a')``), as SB3 does with
+    #: the true final observation. False ends every episode's last transition, ``r`` alone: Isaac Lab resets an env
+    #: inside the step that ends it and returns the next episode's first observation, so ``s'`` there is not the
+    #: state the episode reached
+    bootstrap_time_limits: bool = True
 
     ACTOR_Q_REDUCTIONS = ("min", "mean")
     ENTROPY_OBSERVATIONS = ("current", "next")
+    CRITIC_DISTRIBUTIONS = ("scalar", "categorical")
 
     def validate(self, cfg: Any) -> None:
         self._validate_common(self._name())
@@ -285,14 +370,97 @@ class SACCfg(_CommonCfg):
             )
         if self.n_step < 1:
             raise ValueError(f"{self._name()}.n_step must be >= 1 (1 is 1-step TD), got {self.n_step}")
+        if self.progressive_exploration_start < 0:
+            raise ValueError(
+                f"{self._name()}.progressive_exploration_start must be >= 0, got {self.progressive_exploration_start}"
+            )
+        if self.progressive_exploration_start and self.progressive_exploration_steps <= 0:
+            raise ValueError(
+                f"{self._name()}.progressive_exploration_start ({self.progressive_exploration_start}) delays a ramp "
+                "that is off: set progressive_exploration_steps > 0"
+            )
         if self.progressive_exploration_steps < 0:
             raise ValueError(
                 f"{self._name()}.progressive_exploration_steps must be >= 0 (0 is off), got "
                 f"{self.progressive_exploration_steps}"
             )
+        name = self._name()
+        if self.critic_distribution not in self.CRITIC_DISTRIBUTIONS:
+            raise ValueError(
+                f"{name}.critic_distribution must be one of {self.CRITIC_DISTRIBUTIONS}, got "
+                f"{self.critic_distribution!r}"
+            )
+        if self.critic_distribution == "categorical":
+            if self.critic_num_bins < 2:
+                raise ValueError(f"{name}.critic_num_bins must be >= 2, got {self.critic_num_bins}")
+            if not self.critic_min_value < self.critic_max_value:
+                raise ValueError(
+                    f"{name}.critic_min_value ({self.critic_min_value}) must be below "
+                    f"critic_max_value ({self.critic_max_value})"
+                )
+            if self.critic_subset != self.num_critics:
+                raise ValueError(
+                    f"{name}.critic_distribution: categorical bootstraps from the lowest-Q critic of "
+                    f"all of them; critic_subset ({self.critic_subset}) must equal num_critics "
+                    f"({self.num_critics})"
+                )
+        if self.adaptive_reward_scaling:
+            if self.adaptive_reward_g_max <= 0.0:
+                raise ValueError(
+                    f"{name}.adaptive_reward_g_max must be > 0, got {self.adaptive_reward_g_max}"
+                )
+            if self.normalize_rewards:
+                raise ValueError(
+                    f"{name}.adaptive_reward_scaling and normalize_rewards both scale the reward; "
+                    "use one"
+                )
+        if self.target_entropy_sigma is not None:
+            if self.target_entropy is not None:
+                raise ValueError(
+                    f"{name}.target_entropy ({self.target_entropy}) and target_entropy_sigma "
+                    f"({self.target_entropy_sigma}) both set the target entropy; set one"
+                )
+            if self.target_entropy_sigma <= 0.0:
+                raise ValueError(
+                    f"{name}.target_entropy_sigma must be > 0, got {self.target_entropy_sigma}"
+                )
+        if self.store_labels:
+            if self.std_by_label is None:
+                raise ValueError(f"{name}.store_labels filters by std_by_label's labels; set std_by_label")
+            unknown = [label for label in self.store_labels if label not in self.std_label_names]
+            if unknown:
+                raise ValueError(f"{name}.store_labels {unknown} are not in std_label_names {list(self.std_label_names)}")
+        if self.success_clone_weight < 0 or self.failure_anchor_weight < 0:
+            raise ValueError(
+                f"{name}.success_clone_weight and failure_anchor_weight must be >= 0, got "
+                f"{self.success_clone_weight}, {self.failure_anchor_weight}"
+            )
+        if self.actor_q_scale is not None and self.actor_q_scale <= 0:
+            raise ValueError(f"{name}.actor_q_scale must be > 0, got {self.actor_q_scale}")
+        if (self.success_clone_weight or self.failure_anchor_weight) and self.demo_transitions:
+            raise ValueError(f"{name}.success_clone_weight / failure_anchor_weight need episode outcomes, which demo transitions do not carry")
+        if self.metrics_by_label and self.std_by_label is None:
+            raise ValueError(f"{name}.metrics_by_label groups by std_by_label's labels; set std_by_label")
+        if self.std_by_label is not None and not self.std_label_names:
+            raise ValueError(f"{name}.std_by_label ({self.std_by_label!r}) needs std_label_names, one per label value")
+        if self.noise_repeat:
+            if self.noise_repeat_max < 1:
+                raise ValueError(f"{name}.noise_repeat_max must be >= 1, got {self.noise_repeat_max}")
+            if self.noise_repeat_zeta_s <= 0.0:
+                raise ValueError(
+                    f"{name}.noise_repeat_zeta_s must be > 0, got {self.noise_repeat_zeta_s}"
+                )
 
     def _name(self) -> str:
         return "sac"
+
+
+def sac_critic_outputs(sac_cfg: Any) -> int:
+    """Columns each SAC critic emits: 1 (a Q value) or ``critic_num_bins`` logits
+    (``critic_distribution: categorical``); what the model factory builds the critics with."""
+    if getattr(sac_cfg, "critic_distribution", "scalar") == "categorical":
+        return int(sac_cfg.critic_num_bins)
+    return 1
 
 
 @dataclass

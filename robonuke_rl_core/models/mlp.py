@@ -228,12 +228,12 @@ class MlpActorNet(nn.Module):
 
 
 class MlpQCriticNet(nn.Module):
-    """Q(observation, action) -> scalar."""
+    """Q(observation, action) -> scalar, or ``outputs`` logits of a categorical Q."""
 
-    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int, num_layers: int, activation: str, init: str, output_init_scale: float) -> None:
+    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int, num_layers: int, activation: str, init: str, output_init_scale: float, outputs: int = 1) -> None:
         super().__init__()
         self.trunk = _trunk(obs_dim + action_dim, hidden_size, num_layers, activation, init)
-        self.out = nn.Linear(hidden_size, 1)
+        self.out = nn.Linear(hidden_size, outputs)
         _init_output(self.out, output_init_scale)
 
     def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -299,6 +299,8 @@ class MlpActor(EnsembleModel, GaussianMixin, Model):
         self.squash = bool(squash)
         self.learn_std = bool(learn_std)
         self.use_state_dependent_std = bool(use_state_dependent_std)
+        #: every action dim is a Gaussian one (SimBa's actor has Bernoulli dims beside them)
+        self.num_continuous = self.num_actions
         self._distribution: Optional[Normal] = None
 
         def build() -> nn.Module:
@@ -330,15 +332,20 @@ class MlpActor(EnsembleModel, GaussianMixin, Model):
         distribution = Normal(mean, log_std.exp())
         self._distribution = distribution  # get_entropy reads this
         taken = inputs.get("taken_actions", None)
+        noise = inputs.get("noise", None)
+        # a given standard-normal draw (sac.noise_repeat) takes the place of rsample's own
+        drawn = None
+        if taken is None:
+            drawn = distribution.rsample() if noise is None else mean + log_std.exp() * noise
         if self.squash:
-            u = distribution.rsample() if taken is None else safe_atanh(taken)
+            u = drawn if taken is None else safe_atanh(taken)
             log_prob = (
                 distribution.log_prob(u).sum(dim=-1, keepdim=True)
                 - squash_log_prob_correction(u).unsqueeze(-1)
             )
             actions, mean_actions = torch.tanh(u), torch.tanh(mean)
         else:
-            actions = distribution.rsample() if taken is None else taken
+            actions = drawn if taken is None else taken
             log_prob = distribution.log_prob(actions).sum(dim=-1, keepdim=True)
             mean_actions = mean
         outputs["log_prob"] = log_prob
@@ -354,7 +361,8 @@ class MlpActor(EnsembleModel, GaussianMixin, Model):
 
 class MlpQCritic(EnsembleModel, DeterministicMixin, Model):
     """Q(observation, action) over ``num_agents`` agents, ``members`` critics per agent stacked
-    in one :class:`VmapEnsemble` (``compute`` returns ``(members, num_agents * rows, 1)``)."""
+    in one :class:`VmapEnsemble` (``compute`` returns ``(members, num_agents * rows, outputs)``:
+    the Q value, or a categorical Q's logits)."""
 
     def __init__(
         self,
@@ -368,17 +376,21 @@ class MlpQCritic(EnsembleModel, DeterministicMixin, Model):
         init: str = "orthogonal",
         output_init_scale: float = 1.0,
         members: int = 1,
+        outputs: int = 1,
     ) -> None:
         check_mlp_critic_fields("model.critic", hidden_size, num_layers, activation, init, output_init_scale)
+        if outputs < 1:
+            raise ValueError(f"a Q critic emits >= 1 column, got outputs={outputs}")
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
         DeterministicMixin.__init__(self, clip_actions=False)
         self.num_agents = num_agents
         self.members = members
+        self.outputs = outputs
 
         def build() -> nn.Module:
             return MlpQCriticNet(
                 self.num_observations, self.num_actions, int(hidden_size), int(num_layers),
-                str(activation), str(init), float(output_init_scale),
+                str(activation), str(init), float(output_init_scale), int(outputs),
             )
 
         self.net = VmapEnsemble(build, num_agents, device=device, members=members)

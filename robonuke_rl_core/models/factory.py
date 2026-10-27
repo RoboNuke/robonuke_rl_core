@@ -15,6 +15,7 @@ from skrl.models.torch import Model
 
 from .simba import EnsembleActor, EnsembleQCritic, EnsembleValueCritic
 from .mlp import MlpActor, MlpQCritic, MlpValueCritic
+from .flashsac import FlashSACActor, FlashSACQCritic
 from .cfg import MlpModelCfg, SimbaModelCfg
 
 __all__ = ["MODEL_BUILDERS", "build_models", "actor_kwargs"]
@@ -57,6 +58,8 @@ def _build_sac(
     device,
     actor,
     num_critics: int = 2,
+    critic_outputs: int = 1,
+    critic_action_space=None,
 ):
     """Squashed-Gaussian actor + ``num_critics`` Q critics stacked in one module
     (``critics``, one vmapped call for all of them) and their targets (``target_critics``).
@@ -68,10 +71,11 @@ def _build_sac(
     def make_q():
         return EnsembleQCritic(
             observation_space=critic_space,
-            action_space=action_space,
+            action_space=critic_action_space if critic_action_space is not None else action_space,
             device=device,
             num_agents=num_agents,
             members=num_critics,
+            outputs=critic_outputs,
             **_critic_kwargs(model_cfg),
         )
 
@@ -100,11 +104,17 @@ def _build_ppo(
     device,
     actor,
     num_critics: int = 2,
+    critic_outputs: int = 1,
+    critic_action_space=None,
 ):
     """Squashed-Gaussian actor + one state-value critic. ``num_critics`` is SAC's; PPO has
     one value critic and takes only the default."""
     if num_critics != 2:
         raise ValueError(f"num_critics is a SAC option; PPO builds one value critic (got {num_critics})")
+    if critic_outputs != 1:
+        raise ValueError(f"critic_outputs is a SAC option (a categorical Q); PPO's value critic emits 1 (got {critic_outputs})")
+    if critic_action_space is not None:
+        raise ValueError("critic_action_space is a SAC option (its Q critics' action input); PPO's value critic takes none")
     critic_space = state_space if state_space is not None else obs_space
     return {
         "policy": EnsembleActor(
@@ -143,22 +153,24 @@ def _build_mlp_sac(
     device,
     actor,
     num_critics: int = 2,
+    critic_outputs: int = 1,
+    critic_action_space=None,
 ):
     """``architecture: mlp`` for SAC: a squashed-Gaussian MLP actor + ``num_critics`` MLP Q
     critics stacked in one module and their targets, laid out exactly as :func:`_build_sac`."""
     if num_critics < 2:
         raise ValueError(f"SAC needs at least 2 critics (sac.num_critics), got {num_critics}")
-    if not actor.get("squash", True):
-        raise ValueError("SAC's actor is tanh-squashed: model.actor.squash must be true for trainer.learner: sac")
+    # model.actor.squash: false is refused for SAC by the config unless sac.unsquashed_actor (MlpModelCfg.validate)
     critic_space = state_space if state_space is not None else obs_space
 
     def make_q():
         return MlpQCritic(
             observation_space=critic_space,
-            action_space=action_space,
+            action_space=critic_action_space if critic_action_space is not None else action_space,
             device=device,
             num_agents=num_agents,
             members=num_critics,
+            outputs=critic_outputs,
             **_kwargs(model_cfg.critic),
         )
 
@@ -185,11 +197,17 @@ def _build_mlp_ppo(
     device,
     actor,
     num_critics: int = 2,
+    critic_outputs: int = 1,
+    critic_action_space=None,
 ):
     """``architecture: mlp`` for PPO: a Gaussian MLP actor (squashed or plain) + one MLP value
     critic."""
     if num_critics != 2:
         raise ValueError(f"num_critics is a SAC option; PPO builds one value critic (got {num_critics})")
+    if critic_outputs != 1:
+        raise ValueError(f"critic_outputs is a SAC option (a categorical Q); PPO's value critic emits 1 (got {critic_outputs})")
+    if critic_action_space is not None:
+        raise ValueError("critic_action_space is a SAC option (its Q critics' action input); PPO's value critic takes none")
     critic_space = state_space if state_space is not None else obs_space
     return {
         "policy": MlpActor(
@@ -209,12 +227,50 @@ def _build_mlp_ppo(
     }
 
 
+def _build_flashsac_sac(
+    model_cfg,
+    obs_space,
+    state_space,
+    action_space,
+    num_agents,
+    device,
+    actor,
+    num_critics: int = 2,
+    critic_outputs: int = 1,
+    critic_action_space=None,
+):
+    """``architecture: flashsac``: FlashSAC's actor + ``num_critics`` FlashSAC Q critics stacked in one
+    module and their targets, laid out as :func:`_build_sac`."""
+    if num_critics < 2:
+        raise ValueError(f"SAC needs at least 2 critics (sac.num_critics), got {num_critics}")
+    critic_space = state_space if state_space is not None else obs_space
+
+    def make_q():
+        return FlashSACQCritic(
+            observation_space=critic_space,
+            action_space=critic_action_space if critic_action_space is not None else action_space,
+            device=device,
+            num_agents=num_agents,
+            members=num_critics,
+            outputs=critic_outputs,
+            **_kwargs(model_cfg.critic),
+        )
+
+    models = {
+        "policy": FlashSACActor(observation_space=obs_space, action_space=action_space, device=device, num_agents=num_agents, **actor),
+    }
+    models["critics"] = make_q()
+    models["target_critics"] = make_q()
+    return models
+
+
 #: (architecture, learner) -> builder. A new architecture or learner adds its pairs here.
 MODEL_BUILDERS: Dict[tuple, Callable[..., Dict[str, Model]]] = {
     ("simba", "sac"): _build_sac,
     ("simba", "ppo"): _build_ppo,
     ("mlp", "sac"): _build_mlp_sac,
     ("mlp", "ppo"): _build_mlp_ppo,
+    ("flashsac", "sac"): _build_flashsac_sac,
 }
 
 
@@ -228,6 +284,8 @@ def build_models(
     device,
     controller_cfg=None,
     num_critics: int = 2,
+    critic_outputs: int = 1,
+    critic_action_space=None,
 ) -> Dict[str, Model]:
     """Build the networks ``learner`` needs, for ``model_cfg``'s architecture.
 
@@ -236,7 +294,11 @@ def build_models(
     the state vector while the actor keeps the policy observation. ``controller_cfg`` is the
     loaded `controller` section when there is one: it is where the MATCH pairs and the
     selection axis names come from (see :func:`actor_kwargs`). ``num_critics`` is
-    ``sac.num_critics`` for SAC (the Q ensemble's size) and must stay 2 for PPO.
+    ``sac.num_critics`` for SAC (the Q ensemble's size) and must stay 2 for PPO;
+    ``critic_outputs`` is the columns each SAC critic emits (``learners.cfg.sac_critic_outputs``:
+    1, or a categorical Q's bins) and must stay 1 for PPO; ``critic_action_space`` is what SAC's
+    critics take as their action (``learners.sac.critic_action_space``: a registered critic action
+    transform's width), None the agent's ``action_space``.
     """
     key = (model_cfg.architecture, learner)
     if key not in MODEL_BUILDERS:
@@ -253,4 +315,6 @@ def build_models(
         device,
         actor_kwargs(model_cfg, controller_cfg),
         num_critics=num_critics,
+        critic_outputs=critic_outputs,
+        critic_action_space=critic_action_space,
     )

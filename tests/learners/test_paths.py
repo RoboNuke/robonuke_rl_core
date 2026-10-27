@@ -361,7 +361,7 @@ def test_sac_bootstraps_through_a_timeout_but_not_a_terminal_state():
             truncated=torch.full_like(sampled["truncated"], truncated),
         )
         torch.manual_seed(0)  # the target policy samples next_actions
-        _, _, _, target_values, _ = learner._compute_critic_loss(
+        _, _, _, target_values, _, _ = learner._compute_critic_loss(
             sampled={**sampled, **flags},
             inputs=inputs,
             next_inputs=next_inputs,

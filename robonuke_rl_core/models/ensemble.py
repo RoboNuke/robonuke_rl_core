@@ -157,6 +157,34 @@ class VmapEnsemble(nn.Module):
         # (num_agents, rows, 0) log_std of an all-Bernoulli policy
         return batched.reshape(batched.shape[0] * batched.shape[1], *batched.shape[2:])
 
+    # ------------------------------------------------------------------ weight normalization
+    @torch.no_grad()
+    def normalize_weights(self) -> None:
+        """FlashSAC's weight normalization (``sac.weight_normalization``), in place on the
+        stacked parameters: every ``nn.Linear`` weight row (its input-feature vector) to unit
+        norm, and every normalization layer's affine ``(scale, shift)`` jointly to norm
+        ``sqrt(width)`` (LayerNorm / BatchNorm; RMSNorm's scale alone). Linear biases and
+        anything else (a free log std) are untouched. Row-wise, so each agent and member
+        keeps to its own slice. Device ops only: a CUDA graph can capture it."""
+        params, _ = self._stacked()
+        for name, module in self._meta.named_modules():
+            prefix = f"{name}." if name else ""
+            if isinstance(module, nn.Linear) and not getattr(module, "skip_weight_norm", False):
+                weight = params[f"{prefix}weight"]
+                weight.copy_(torch.nn.functional.normalize(weight, dim=-1, eps=1e-8))
+            elif isinstance(module, (nn.LayerNorm, nn.modules.batchnorm._BatchNorm, nn.RMSNorm)) or getattr(
+                module, "normalize_affine", False
+            ):
+                scale = params.get(f"{prefix}weight")
+                if scale is None:  # no affine parameters
+                    continue
+                shift = params.get(f"{prefix}bias")
+                squares = scale * scale + (shift * shift if shift is not None else 0.0)
+                factor = (scale.shape[-1] ** 0.5) * torch.rsqrt(squares.sum(dim=-1, keepdim=True) + 1e-8)
+                scale.mul_(factor)
+                if shift is not None:
+                    shift.mul_(factor)
+
     # ------------------------------------------------------------------ per-agent state
     def agent_state_dict(self, agent: int) -> Dict[str, torch.Tensor]:
         """Agent ``agent``'s slice, keyed exactly like the plain module's state dict."""

@@ -12,6 +12,9 @@ import torch
 
 from robonuke_rl_core.optim import BlockAdamW
 from robonuke_rl_core.models.cfg import (
+    FlashSACActorCfg,
+    FlashSACCriticCfg,
+    FlashSACModelCfg,
     MlpActorCfg,
     MlpCriticCfg,
     MlpModelCfg,
@@ -28,7 +31,9 @@ ACT_DIM = 2
 ROWS = 5
 LEARNERS = sorted({learner for _, learner in MODEL_BUILDERS})
 ARCHITECTURES = sorted({architecture for architecture, _ in MODEL_BUILDERS})
-CASES = [(architecture, learner) for architecture in ARCHITECTURES for learner in LEARNERS]
+#: architectures that serve one learner only (FlashSAC's network is SAC's)
+SINGLE_LEARNER = {"flashsac": "sac"}
+CASES = sorted(MODEL_BUILDERS)
 
 
 def box(dim: int) -> gymnasium.spaces.Box:
@@ -49,11 +54,18 @@ def tiny_mlp_cfg() -> MlpModelCfg:
     )
 
 
+def tiny_flashsac_cfg() -> FlashSACModelCfg:
+    return FlashSACModelCfg(
+        actor=FlashSACActorCfg(hidden_size=8, num_blocks=1),
+        critic=FlashSACCriticCfg(hidden_size=8, num_blocks=1),
+    )
+
+
 def make(architecture: str, learner: str, num_agents: int = NUM_AGENTS, asymmetric: bool = False) -> dict:
     torch.manual_seed(0)
     return build_models(
         learner,
-        {"simba": tiny_cfg, "mlp": tiny_mlp_cfg}[architecture](),
+        {"simba": tiny_cfg, "mlp": tiny_mlp_cfg, "flashsac": tiny_flashsac_cfg}[architecture](),
         box(OBS_DIM),
         box(STATE_DIM) if asymmetric else None,
         box(ACT_DIM),
@@ -183,8 +195,11 @@ def test_the_builders_cover_the_registered_learners():
     from robonuke_rl_core.learners.cfg import LEARNERS as CONFIGURED
     from robonuke_rl_core.models.cfg import MODEL_ARCHITECTURES
 
-    # every (architecture, learner) pair has a builder
-    expected = {(arch, learner) for arch in MODEL_ARCHITECTURES for learner in CONFIGURED}
+    # every (architecture, learner) pair has a builder, but a single-learner architecture's only its own
+    expected = {
+        (arch, learner) for arch in MODEL_ARCHITECTURES for learner in CONFIGURED
+        if SINGLE_LEARNER.get(arch, learner) == learner
+    }
     assert set(MODEL_BUILDERS) == expected
 
 

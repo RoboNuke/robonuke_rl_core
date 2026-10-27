@@ -185,14 +185,22 @@ class SimbaActorNet(nn.Module):
 
 
 class SimbaQCriticNet(nn.Module):
-    """Q(observation, action) -> scalar."""
+    """Q(observation, action) -> scalar, or ``outputs`` logits of a categorical Q (their bias
+    starts at zero: a uniform distribution)."""
 
     def __init__(
-        self, obs_dim: int, action_dim: int, hidden_dim: int, num_blocks: int, output_init_mean: float
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        num_blocks: int,
+        output_init_mean: float,
+        outputs: int = 1,
     ) -> None:
         super().__init__()
-        self.trunk = SimbaTrunk(obs_dim + action_dim, hidden_dim, 1, num_blocks)
-        nn.init.constant_(self.trunk.fc_out.bias, output_init_mean)
+        self.trunk = SimbaTrunk(obs_dim + action_dim, hidden_dim, outputs, num_blocks)
+        if outputs == 1:
+            nn.init.constant_(self.trunk.fc_out.bias, output_init_mean)
 
     def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         return self.trunk(torch.cat([observations, actions], dim=-1))
@@ -457,10 +465,14 @@ class EnsembleActor(EnsembleModel, GaussianMixin, Model):
             cont_mean = raw_out.index_select(-1, self._cont_out_idx)
             distribution = Normal(cont_mean, log_std.exp())
             self._g_distribution = distribution  # GaussianMixin.get_entropy reads this
-            if taken_actions is None:
-                u = distribution.rsample()
-            else:
+            noise = inputs.get("noise", None)
+            if taken_actions is not None:
                 u = safe_atanh(taken_actions.index_select(-1, self._cont_action_idx))
+            elif noise is not None:
+                # a given standard-normal draw (sac.noise_repeat): u = mean + std * noise
+                u = cont_mean + log_std.exp() * noise
+            else:
+                u = distribution.rsample()
             if match:
                 # the same density, left per dim so the selection can pick a column. Summing
                 # it would NOT reproduce the product path bit for bit (float addition is not
@@ -573,7 +585,8 @@ class EnsembleActor(EnsembleModel, GaussianMixin, Model):
 class EnsembleQCritic(EnsembleModel, DeterministicMixin, Model):
     """Q(observation, action) over ``num_agents`` agents; with ``members > 1``, a Q ensemble
     of that many independent critics per agent, stacked in one :class:`VmapEnsemble` and
-    evaluated in one call: ``compute`` then returns ``(members, num_agents * rows, 1)``."""
+    evaluated in one call: ``compute`` then returns ``(members, num_agents * rows, outputs)``
+    (``outputs`` 1: the Q value; more: a categorical Q's logits, ``sac.critic_distribution``)."""
 
     def __init__(
         self,
@@ -586,6 +599,7 @@ class EnsembleQCritic(EnsembleModel, DeterministicMixin, Model):
         critic_latent: int = 512,
         clip_actions: bool = False,
         members: int = 1,
+        outputs: int = 1,
     ) -> None:
         Model.__init__(
             self, observation_space=observation_space, action_space=action_space, device=device
@@ -593,10 +607,19 @@ class EnsembleQCritic(EnsembleModel, DeterministicMixin, Model):
         DeterministicMixin.__init__(self, clip_actions=clip_actions)
         self.num_agents = num_agents
         self.members = members
+        if outputs < 1:
+            raise ValueError(f"a Q critic emits >= 1 column, got outputs={outputs}")
+        if outputs > 1 and critic_output_init_mean != 0.0:
+            raise ValueError(
+                f"model.critic.critic_output_init_mean ({critic_output_init_mean}) is a scalar Q's "
+                "initial value; a categorical critic's logits start at zero, so it must be 0"
+            )
+        self.outputs = outputs
 
         def build() -> nn.Module:
             return SimbaQCriticNet(
-                self.num_observations, self.num_actions, critic_latent, critic_n, critic_output_init_mean
+                self.num_observations, self.num_actions, critic_latent, critic_n, critic_output_init_mean,
+                outputs,
             )
 
         self.net = VmapEnsemble(build, num_agents, device=device, members=members)

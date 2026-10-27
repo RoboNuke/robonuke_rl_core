@@ -272,7 +272,12 @@ captures it) is applied to every critic call: the critic loss, its target and th
 `critic_inputs` is the batch's raw critic input, before any normalizer: the policy observations
 when the learner is symmetric, the critic's `states` (`next_states` for the target) when a state
 space exists — online and demo rows alike (`SAC._critic_actions`). At most one builder may
-answer; None means the critics take the agent's action.
+answer; None means the critics take the agent's action. Two optional transform attributes: `critic_action_width` (the critics are built at that action width,
+`learners.sac.critic_action_space`; `train.main` and eval build the transform before the models, so an eval
+script registers the builder too) and `side_inputs` `{name: width}`: per-transition tensors the env
+publishes as `infos[name]` and `infos["next_" + name]` every step, stored in the memory and handed to the
+transform as a third argument `{name: tensor}` (the `next_` ones for the target) — never a critic input.
+Not with demo transitions.
 `run_eval` calls `policy.reset()` after each round's reset when the policy has one, for a
 policy that keeps state across steps (an action-chunking queue).
 

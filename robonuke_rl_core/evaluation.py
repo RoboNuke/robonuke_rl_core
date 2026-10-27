@@ -1020,7 +1020,7 @@ def build_eval_policy(
     the checkpoint and never train again — the policy call passes no ``train=True`` anywhere —
     and no optimizer state is loaded.
     """
-    from .learners.cfg import LEARNERS
+    from .learners.cfg import LEARNERS, sac_critic_outputs
     from .learners.ppo import PPO
     from .learners.sac import SAC
     from .models.factory import build_models
@@ -1037,6 +1037,13 @@ def build_eval_policy(
 
     state_space = env.state_space
     controller_cfg = getattr(cfg, "controller", None)
+    # the critics are loaded too, so they are built for the run's critic action (register_critic_action)
+    transform = None
+    if learner_name == "sac":
+        from .learners.sac import critic_action_space, critic_action_transform
+
+        transform = critic_action_transform(cfg, env)
+    critic_space = critic_action_space(transform, env.action_space) if transform is not None else None
     models = build_models(
         learner_name,
         cfg.model,
@@ -1047,9 +1054,11 @@ def build_eval_policy(
         env.device,
         controller_cfg,
         num_critics=int(cfg[learner_name].num_critics) if learner_name == "sac" else 2,
+        critic_outputs=sac_critic_outputs(cfg[learner_name]) if learner_name == "sac" else 1,
+        critic_action_space=critic_space,
     )
     extra = (
-        {"model_cfg": cfg.model, "controller_cfg": controller_cfg}
+        {"model_cfg": cfg.model, "controller_cfg": controller_cfg, "critic_action_space": critic_space}
         if learner_name == "sac"
         else {}
     )
@@ -1068,6 +1077,9 @@ def build_eval_policy(
     )
     metadata = learner.load_agent(checkpoint, slot=0, with_optimizer=False)
     learner.enable_training_mode(False)  # eval mode: no dropout, no stat updates
+    if any(getattr(m, "uses_batch_stats", False) for m in learner.models.values() if m is not None):
+        # a BatchNorm network (model.architecture: flashsac) acts on its running statistics
+        learner.enable_models_training_mode(False)
 
     def policy(observations: torch.Tensor, states: Optional[torch.Tensor]) -> torch.Tensor:
         with torch.no_grad():

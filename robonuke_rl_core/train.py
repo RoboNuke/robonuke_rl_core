@@ -40,6 +40,7 @@ def main(argv=None, setup=None) -> int:
 
     from robonuke_rl_core.envs.build import build_env, describe, prepare_task
     from robonuke_rl_core.learners.base import run_dirs
+    from robonuke_rl_core.learners.cfg import sac_critic_outputs
     from robonuke_rl_core.logging import WandbLogger
     from robonuke_rl_core.losses import build_aux_losses
     from robonuke_rl_core.learners.ppo import PPO
@@ -81,6 +82,13 @@ def main(argv=None, setup=None) -> int:
     # the controller section, when the project registered one: the actor's MATCH pairs and
     # the selection axis names are derived from its action layout, never configured
     controller_cfg = getattr(cfg, "controller", None)
+    # a project's register_critic_action: the critics may take another action than the agent's,
+    # at another width (they are built for it)
+    transform = None
+    if learner_name == "sac":
+        from robonuke_rl_core.learners.sac import critic_action_space, critic_action_transform
+
+        transform = critic_action_transform(cfg, env)
     models = build_models(
         learner_name,
         cfg.model,
@@ -91,6 +99,8 @@ def main(argv=None, setup=None) -> int:
         env.device,
         controller_cfg,
         num_critics=int(learner_cfg.num_critics) if learner_name == "sac" else 2,
+        critic_outputs=sac_critic_outputs(learner_cfg) if learner_name == "sac" else 1,
+        critic_action_space=critic_action_space(transform, env.action_space) if transform is not None else None,
     )
 
     # transitions per agent: PPO holds one rollout, SAC holds what the config asks for
@@ -104,7 +114,11 @@ def main(argv=None, setup=None) -> int:
     )
 
     extra = (
-        {"model_cfg": cfg.model, "controller_cfg": controller_cfg}
+        {
+            "model_cfg": cfg.model,
+            "controller_cfg": controller_cfg,
+            "critic_action_space": critic_action_space(transform, env.action_space) if transform is not None else None,
+        }
         if learner_name == "sac"
         else {}
     )
@@ -124,10 +138,8 @@ def main(argv=None, setup=None) -> int:
     )
 
     if learner_name == "sac":
-        from robonuke_rl_core.learners.sac import critic_action_transform
-
-        # a project's register_critic_action: the critics take another action than the agent's
-        learner.critic_action_transform = critic_action_transform(cfg, env)
+        # set before the trainer's init(): the memory stores the transform's side inputs
+        learner.critic_action_transform = transform
         if learner.critic_action_transform is not None:
             print("[train] critics take a registered action transform (register_critic_action)", flush=True)
 

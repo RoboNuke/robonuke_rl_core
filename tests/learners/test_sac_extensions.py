@@ -157,7 +157,7 @@ def _critic_target(learner, rows: int = 4):
     inputs = {"observations": sampled["observations"]}
     next_inputs = {"observations": sampled["next_observations"]}
     torch.manual_seed(0)  # the policy samples next_actions
-    _, _, _, target, next_log_prob = learner._compute_critic_loss(
+    _, _, _, target, next_log_prob, _ = learner._compute_critic_loss(
         sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=inputs,
         critic_next_inputs=next_inputs, rows=rows,
     )
@@ -798,17 +798,17 @@ def test_with_n_step_the_memory_gets_one_folded_row_per_env_per_step_and_the_tar
     inputs, next_inputs = {"observations": sampled["observations"]}, {"observations": sampled["next_observations"]}
     learner.cfg.backup_entropy = False
     torch.manual_seed(0)
-    _, _, _, target, _ = learner._compute_critic_loss(
+    _, _, _, target, _, _ = learner._compute_critic_loss(
         sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=inputs, critic_next_inputs=next_inputs, rows=4,
     )
     sampled["rewards"] = torch.zeros_like(sampled["rewards"])
     torch.manual_seed(0)
-    _, _, _, bootstrap, _ = learner._compute_critic_loss(
+    _, _, _, bootstrap, _, _ = learner._compute_critic_loss(
         sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=inputs, critic_next_inputs=next_inputs, rows=4,
     )
     sampled["discounts"] = torch.full_like(sampled["discounts"], 0.5)
     torch.manual_seed(0)
-    _, _, _, doubled, _ = learner._compute_critic_loss(
+    _, _, _, doubled, _, _ = learner._compute_critic_loss(
         sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=inputs, critic_next_inputs=next_inputs, rows=4,
     )
     assert torch.allclose(doubled, 2 * bootstrap) and not torch.allclose(target, bootstrap)
@@ -825,3 +825,74 @@ def test_with_n_step_the_demo_rows_are_folded_when_loaded(tmp_path):
                             discount_factor=0.5)
     assert learner._demo["rewards"].flatten().tolist() == [1.75, 1.75, 1.75, 1.75, 1.5, 1.0]
     assert learner._demo["discounts"].flatten().tolist() == [0.125, 0.125, 0.125, 0.125, 0.25, 0.5]
+
+
+def test_a_delayed_progressive_exploration_holds_the_share_at_zero_until_its_start():
+    learner = build_learner("sac", num_agents=1, progressive_exploration_steps=100, progressive_exploration_start=50)
+    assert [learner._explore_share(t) for t in (0, 49, 50, 100, 150, 400)] == [0.0, 0.0, 0.0, 0.5, 1.0, 1.0]
+    actions = torch.ones(learner.num_envs, ACT_DIM)
+    assert torch.equal(learner._explore_progressively(actions, 40), torch.zeros_like(actions))
+    plain = build_learner("sac", num_agents=1, progressive_exploration_steps=100)
+    assert [plain._explore_share(t) for t in (0, 50, 100)] == [0.0, 0.5, 1.0]  # start 0: unchanged
+
+
+def test_a_start_without_a_ramp_is_refused():
+    from robonuke_rl_core.learners.cfg import SACCfg
+
+    with pytest.raises(ValueError, match="progressive_exploration_start"):
+        SACCfg(progressive_exploration_start=10).validate(None)
+
+
+def test_the_acting_std_is_logged_per_label_from_the_previous_steps_infos():
+    learner = build_learner("sac", num_agents=2, envs_per_agent=3, std_by_label="eval_state/phase/id",
+                            std_label_names=["corner", "grasp"])
+    seen = []
+    learner.on_log.append(lambda agent, metrics, step: seen.append((agent, metrics)))
+    n = learner.num_envs
+    obs = torch.randn(n, OBS_DIM)
+    learner.act(obs, None, timestep=0, timesteps=10)  # no label yet: nothing
+    assert not [m for _, m in seen if any(k.startswith("policy/std_") for k in m)]
+    labels = torch.tensor([0, 0, 1, 1, 5, 0], dtype=torch.float32)  # 5: an end code, skipped
+    learner.record_transition(
+        observations=obs, states=None, actions=torch.zeros(n, ACT_DIM), rewards=torch.zeros(n, 1),
+        next_observations=obs, next_states=None, terminated=torch.zeros(n, 1, dtype=torch.bool),
+        truncated=torch.zeros(n, 1, dtype=torch.bool), infos={"eval_state": {"phase/id": labels}}, timestep=0, timesteps=10,
+    )
+    seen.clear()
+    _, outputs = learner.act(obs, None, timestep=1, timesteps=10)
+    std = outputs["log_std"].exp().mean(-1)
+    got = {(agent, k): v for agent, m in seen for k, v in m.items() if k.startswith("policy/std_")}
+    torch.testing.assert_close(got[(0, "policy/std_corner")], std[0:2])
+    torch.testing.assert_close(got[(0, "policy/std_grasp")], std[2:3])
+    torch.testing.assert_close(got[(1, "policy/std_grasp")], std[3:4])
+    torch.testing.assert_close(got[(1, "policy/std_corner")], std[5:6])
+    assert len(got) == 4  # env 4's end code is in no group
+
+
+def test_std_by_label_needs_its_names():
+    from robonuke_rl_core.learners.cfg import SACCfg
+
+    with pytest.raises(ValueError, match="std_label_names"):
+        SACCfg(std_by_label="eval_state/phase/id").validate(None)
+
+
+def test_env_metrics_are_logged_per_label_over_the_envs_that_ran_the_policy():
+    learner = build_learner("sac", num_agents=1, envs_per_agent=4, std_by_label="eval_state/phase/id",
+                            std_label_names=["corner", "grasp"], metrics_by_label=["residual/position_mm"],
+                            progressive_exploration_steps=100)
+    seen = []
+    learner.on_log.append(lambda agent, metrics, step: seen.append(metrics))
+    n = learner.num_envs
+    learner._std_labels = torch.tensor([0, 0, 1, 1])  # the observations' phases
+    learner._explore_keep = torch.tensor([True, False, True, True])  # env 1 ran on zeros
+    learner._emit_metrics_by_label({"metrics_to_log": {"residual/position_mm": torch.tensor([1.0, 2.0, 3.0, 4.0])}}, 0)
+    got = {k: v for m in seen for k, v in m.items()}
+    torch.testing.assert_close(got["residual/position_mm_corner"], torch.tensor([1.0]))
+    torch.testing.assert_close(got["residual/position_mm_grasp"], torch.tensor([3.0, 4.0]))
+
+
+def test_metrics_by_label_needs_the_labels():
+    from robonuke_rl_core.learners.cfg import SACCfg
+
+    with pytest.raises(ValueError, match="std_by_label"):
+        SACCfg(metrics_by_label=["residual/position_mm"]).validate(None)
