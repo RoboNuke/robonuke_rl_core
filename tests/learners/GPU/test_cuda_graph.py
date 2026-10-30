@@ -153,3 +153,65 @@ def test_the_built_in_selection_loss_captures_and_replays_to_the_eager_value():
         graph.replay()
         torch.cuda.synchronize()
         assert torch.allclose(out, loss.compute(ctx), atol=1e-6)
+
+
+def test_a_routed_step_with_critic_only_demos_replays_to_the_eager_step(tmp_path):
+    """A routed residual's step (per-agent fills from add_block / add_rows, demos flagged for the critics only, the
+    actor's own batch drawn from the online rows [n_demo, fill), the PARTS terms) is captured and replays to what
+    the same step does eagerly."""
+    if not torch.cuda.is_available():
+        pytest.fail("this GPU test needs CUDA")
+    device = torch.device("cuda")
+    box = lambda d: gymnasium.spaces.Box(-np.inf, np.inf, (d,), np.float32)  # noqa: E731
+    obs, state, act = box(6), box(9), box(2)
+    rows = 12
+    demo = {
+        "observations": torch.randn(rows, 6), "next_observations": torch.randn(rows, 6),
+        "states": torch.randn(rows, 9), "next_states": torch.randn(rows, 9),
+        "actions": torch.rand(rows, 2) * 2 - 1, "rewards": torch.zeros(rows, 1),
+        "terminated": torch.tensor([[False]] * (rows - 1) + [[True]]), "truncated": torch.zeros(rows, 1, dtype=torch.bool),
+    }
+    demo["rewards"][-1] = 1.0
+    path = tmp_path / "demo.pt"
+    torch.save({"transitions": demo}, path)
+    cfg = SACCfg(batch_size=16, gradient_steps=2, policy_delay=2, num_critics=4, critic_subset=2, actor_q_reduction="mean",
+                 learning_starts=0, demo_transitions=str(path), demo_storage="memory_critic",
+                 success_clone_weight=10.0, failure_anchor_weight=10.0, parts_term_reduction="mean", actor_q_scale=2.5)
+    model = SimbaModelCfg(actor=SimbaActorCfg(actor_n=1, actor_latent=16), critic=SimbaCriticCfg(critic_n=1, critic_latent=16))
+    torch.manual_seed(0)
+    models = build_models("sac", model, obs, state, act, 1, device, num_critics=4)
+    memory = MultiRandomMemory(capacity=128, num_envs=1, num_agents=1, device=device)
+    learner = SAC(models=models, memory=memory, observation_space=obs, state_space=state, action_space=act,
+                  device=device, cfg=cfg, trainer_cfg=TrainerCfg(learner="sac", total_timesteps=100),
+                  num_agents=1, num_envs=1, model_cfg=model)
+    learner.init()
+    learner.enable_training_mode(True)
+    assert memory._agent_size == [rows] and learner._demo_rows == [rows]
+    online = {name: torch.randn(20, memory.get_tensor_by_name(name).shape[-1], device=device) for name in learner._tensors_names}
+    online["terminated"] = torch.zeros(20, 1, dtype=torch.bool, device=device)
+    online["truncated"] = torch.zeros(20, 1, dtype=torch.bool, device=device)
+    online["is_demo"] = torch.zeros(20, 1, device=device)
+    online["episode_ids"] = torch.zeros(20, 1, device=device)  # episode 0: the first env episode
+    learner._outcomes[0] = 1.0  # a success: the clone term has rows
+    memory.add_block(**online)
+    memory.sync_size()
+    assert learner._online_rows_available() and not learner._memory_wrapped()
+
+    eager, graphed = learner, copy.deepcopy(learner)
+    graphed._graphs = StepGraphs(warmup=1)
+    mode = (False, True, True)
+    step = lambda learner: (lambda: learner._gradient_step(mode, 16, 10, graph=True))  # noqa: E731
+    for _ in range(4):
+        state_rng = torch.cuda.get_rng_state()
+        graphed._graphs.run(mode, step(graphed))
+        torch.cuda.set_rng_state(state_rng)
+        step(eager)()
+    torch.cuda.synchronize()
+    assert graphed._graphs.captured == 1
+    for key in eager._checkpoint_model_keys():
+        a, b = getattr(eager, key).agent_state_dict(0), getattr(graphed, key).agent_state_dict(0)
+        for name in a:
+            assert torch.allclose(a[name], b[name], atol=1e-5), (key, name)
+    # the actor's batch is drawn from the online rows only
+    batch = eager._sample_online(16, graph=True)
+    assert float(batch["is_demo"].sum()) == 0.0

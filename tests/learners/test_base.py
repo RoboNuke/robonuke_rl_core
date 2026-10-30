@@ -708,3 +708,90 @@ def test_a_negative_success_window_is_refused():
                           experiment=SimpleNamespace(num_agents=1))
     with pytest.raises(ValueError, match="success_window"):
         TrainerCfg(learner="sac", total_timesteps=10, success_window=-1).validate(cfg)
+
+
+def test_best_by_success_follows_the_highest_success_and_never_goes_down():
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2, trainer_overrides={"best_by": "success"})
+    seen = best_rate_run(
+        learner,
+        [
+            (1.0, 0.20),
+            (5.0, 0.10),  # a higher return with less success: not a new best
+            (0.5, 0.60),  # the highest success so far, whatever its return: new best
+            (9.0, 0.40),  # lower success: stays 0.60
+        ],
+    )
+    assert seen == pytest.approx([0.20, 0.20, 0.60, 0.60], abs=1e-6)
+
+
+def test_best_by_success_writes_ckpt_best_only_on_a_new_highest_success():
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2, trainer_overrides={"best_by": "success"})
+    learner._mean_return = [1.0, 1.0]
+    learner._update_best(0, [0.5, 0.5], [1.0, 1.0])
+    assert learner._new_best == [True, True]
+    learner._update_best(1, [0.5, 0.7], [1.0, 1.0])  # agent 0 ties (not better), agent 1 improves
+    assert learner._new_best == [False, True]
+
+
+def test_best_by_is_validated():
+    from robonuke_rl_core.learners.cfg import TrainerCfg
+    from types import SimpleNamespace
+
+    cfg = TrainerCfg(learner="sac", total_timesteps=10, best_by="return_and_success")
+    with pytest.raises(ValueError, match="best_by"):
+        cfg.validate(SimpleNamespace(root=SimpleNamespace(task=SimpleNamespace(cfg=SimpleNamespace(scene=SimpleNamespace(num_envs=2)))), experiment=SimpleNamespace(num_agents=1)))
+
+
+def test_windowed_metrics_average_the_matching_episode_channels_over_the_same_window():
+    """trainer.windowed_metrics: matching episode channels (e.g. phase/passed_*) are the rolling mean of the last
+    success_window episodes, published at the flush; the others still go out per episode."""
+    from robonuke_rl_core.learners.base import SUCCESS_METRIC
+    from robonuke_rl_core.learners.cfg import TrainerCfg
+
+    learner = build_learner("sac", num_agents=1, envs_per_agent=2,
+                            trainer_overrides={"success_window": 3, "windowed_metrics": ["phase/passed_*"]})
+    published, hook = collector()
+    learner.on_log.append(hook)
+
+    def finish(passed, other, step):
+        learner.observe_step(
+            infos={"episode_metrics_to_log": {SUCCESS_METRIC: torch.zeros(2), "phase/passed_insert": torch.tensor(passed),
+                                              "phase/end": torch.tensor(other)}},
+            rewards=torch.zeros(2, 1), terminated=torch.ones(2, 1, dtype=torch.bool),
+            truncated=torch.zeros(2, 1, dtype=torch.bool), step=step,
+        )
+
+    finish([1.0, 1.0], [4.0, 5.0], 0)
+    assert not any("phase/passed_insert" in m for _, m, _ in published)  # nothing per episode
+    assert any("phase/end" in m for _, m, _ in published)  # not matched: per episode as before
+    learner._flush_episode_stats(0)
+    finish([0.0, 0.0], [5.0, 5.0], 1)  # last 3: 1, 0, 0
+    learner._flush_episode_stats(1)
+    rates = [float(m["phase/passed_insert"]) for _, m, _ in published if "phase/passed_insert" in m]
+    assert rates == [pytest.approx(1.0), pytest.approx(1 / 3)]
+    with pytest.raises(ValueError, match="windowed_metrics"):
+        TrainerCfg(learner="sac", total_timesteps=10, windowed_metrics=["phase/*"]).validate(None)
+
+
+
+def test_windowed_metrics_skip_episodes_without_a_value():
+    """A NaN episode value (a phase never reached) is not counted: the window holds the last N episodes with one."""
+    from robonuke_rl_core.learners.base import SUCCESS_METRIC
+
+    learner = build_learner("sac", num_agents=1, envs_per_agent=4,
+                            trainer_overrides={"success_window": 10, "windowed_metrics": ["phase/passed_*"]})
+    published, hook = collector()
+    learner.on_log.append(hook)
+    nan = float("nan")
+    learner.observe_step(
+        infos={"episode_metrics_to_log": {SUCCESS_METRIC: torch.tensor([1.0, 1.0, 0.0, 0.0]),
+                                          "phase/passed_insert": torch.tensor([1.0, 1.0, 0.0, 0.0]),
+                                          "phase/passed_success": torch.tensor([1.0, 1.0, nan, nan])}},
+        rewards=torch.zeros(4, 1), terminated=torch.ones(4, 1, dtype=torch.bool),
+        truncated=torch.zeros(4, 1, dtype=torch.bool), step=0,
+    )
+    learner._flush_episode_stats(0)
+    last = {name: float(v) for _, m, _ in published for name, v in m.items() if torch.as_tensor(v).numel() == 1}
+    assert last[SUCCESS_METRIC] == pytest.approx(0.5)
+    assert last["phase/passed_insert"] == pytest.approx(0.5)
+    assert last["phase/passed_success"] == pytest.approx(1.0)  # both episodes that reached it succeeded

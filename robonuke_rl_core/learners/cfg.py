@@ -50,6 +50,16 @@ class TrainerCfg:
     #: interval. N > 0: the mean over each agent's last N finished episodes, republished every
     #: interval (a rolling window, not cleared at the flush), so a short interval still has a rate
     success_window: int = 0
+    #: more ``infos["episode_metrics_to_log"]`` channels averaged over the same last ``success_window`` episodes
+    #: (e.g. per-phase pass rates): exact names or ``fnmatch`` patterns (``phase/passed_*``), each republished at
+    #: every flush instead of per episode. An episode whose value is NaN (e.g. a phase it never reached) is not
+    #: counted: the window holds the last ``success_window`` episodes with a value. Needs ``success_window`` > 0
+    windowed_metrics: List[str] = field(default_factory=list)
+    #: what picks ``ckpt_best`` and ``episode/best_success_rate``: "return" (the highest mean episode return of an
+    #: interval; ``best_success_rate`` is that interval's success rate, so it can go down when return and success
+    #: diverge, e.g. under shaped rewards) or "success" (the highest ``episode/success`` of an interval, the windowed
+    #: one with ``success_window``; ``best_success_rate`` is then its running maximum)
+    best_by: str = "return"
     #: env steps between per-agent checkpoints (0 disables)
     checkpoint_interval: int = 10000
     output_dir: str = "runs"
@@ -71,6 +81,10 @@ class TrainerCfg:
             )
         if self.success_window < 0:
             raise ValueError(f"trainer.success_window must be >= 0, got {self.success_window}")
+        if self.windowed_metrics and self.success_window < 1:
+            raise ValueError("trainer.windowed_metrics averages over the last success_window episodes: set success_window > 0")
+        if self.best_by not in ("return", "success"):
+            raise ValueError(f"trainer.best_by must be 'return' or 'success', got {self.best_by!r}")
         total_envs = cfg.root.task.cfg.scene.num_envs
         num_agents = cfg.experiment.num_agents
         if total_envs % num_agents != 0:
@@ -87,6 +101,10 @@ class _CommonCfg:
     discount_factor: float = 0.99
     #: env steps of uniform random actions before the policy is used
     random_timesteps: int = 0
+    #: run the first this many episodes (counted over every env) on zero actions -- for a residual, the base alone,
+    #: no exploration noise -- storing them as ordinary transitions, with no updates until they have finished, so
+    #: the memory starts with the base's own outcomes (its successes among them). 0 is off
+    warmup_episodes: int = 0
     #: env steps before the first update
     learning_starts: int = 0
     weight_decay: float = 0.0
@@ -108,6 +126,16 @@ class _CommonCfg:
     def _validate_common(self, name: str) -> None:
         if self.reward_clip <= 0.0:
             raise ValueError(f"{name}.reward_clip must be > 0, got {self.reward_clip}")
+
+
+@dataclass
+class PotentialTermCfg:
+    """One channel of ``sac.potential_terms``: ``weight`` times the ``channel`` the env publishes in its infos, in
+    the potential of the residual of phase ``route`` (``"*"``: an unrouted SAC)."""
+
+    route: str = MISSING
+    channel: str = MISSING
+    weight: float = MISSING
 
 
 @dataclass
@@ -159,6 +187,9 @@ class SACCfg(_CommonCfg):
     #: critics the bootstrap target takes its min over, drawn at random per agent each
     #: gradient step (REDQ's in-target minimization); equal to num_critics = min over all
     critic_subset: int = 2
+    #: draw the critic_subset target critics with replacement (SERL's ``jax.random.randint``: a critic may be drawn
+    #: twice, so the min is sometimes over fewer distinct critics). False: distinct critics (REDQ)
+    critic_subset_replacement: bool = False
     #: how the actor's loss reduces the critics' Q: "min" (over all of them; classic SAC) or
     #: "mean" (REDQ / RLPD, for a large ensemble)
     actor_q_reduction: str = "min"
@@ -177,6 +208,33 @@ class SACCfg(_CommonCfg):
     #: a batch, demos fill the rest. The actor always trains on online data only
     demo_sampling_start: int = 0
     demo_sampling_end: int = 0
+    #: inside the demo window, the actor trains on the critic's mixed (half demo) batch too -- one batch for both,
+    #: as RLPD does -- instead of its own online-only batch
+    demo_batch_shared: bool = False
+    #: the demo rows of a mixed batch count as successes in PARTS' clone term (TD3+BC's anchor to the dataset's
+    #: actions: the demo action, clipped to the actor's [-1, 1], is the clone target) and never as failures. False:
+    #: demo rows are in neither term
+    clone_demo_rows: bool = False
+    #: an L2 penalty on the actor's mean action, ``action_l2_weight * mean_d(a_mean_d^2)`` over each batch's rows
+    #: (the demo rows of a memory_critic memory excluded): pulls the actor toward zero -- for a residual, the base
+    #: alone -- wherever the critic's gain for a larger action does not outweigh it. 0 is off
+    action_l2_weight: float = 0.0
+    #: where the demos go. "sample": a separate set mixed into the critic's batches in the window above.
+    #: "memory": written into the replay memory once, before the first env step, as ordinary transitions
+    #: (overwritten when the memory wraps, like any other row; no window, no symmetric sampling); with
+    #: success_clone_weight / failure_anchor_weight each demo episode is an episode of its own, a success when it
+    #: holds a positive reward, so the actor's PARTS terms read them as any other row.
+    #: "memory_critic": written into the replay memory as with "memory", each row flagged as a demo: the critics
+    #: sample every row, the actor samples its own batch from the online rows only, so it never sees a demo and
+    #: always gets a full batch
+    demo_storage: str = "sample"
+    #: warmup_episodes: let the critics train on the warm-up's transitions (from learning_starts) while the actor
+    #: stays frozen until the warm-up has ended. False: nothing trains during the warm-up
+    warmup_trains_critics: bool = False
+    #: no update at all (critics or actor) until every agent's memory holds this many of its own online rows (demo
+    #: rows not counted): a routed residual starts training only once its phase has given it this much data, however
+    #: long that takes. 0 is off (learning_starts alone)
+    learning_starts_rows: int = 0
     #: capture each kind of gradient step (critic only / with the actor, with or without demo
     #: rows) as a CUDA graph and replay it as one launch: the update is launch-bound at small
     #: batch sizes. CUDA only (ignored on CPU); updates with aux losses, and mixed batches
@@ -257,6 +315,14 @@ class SACCfg(_CommonCfg):
     #: alone, on states of failed episodes), ``a_mean`` the actor's deterministic (mean) action. Rows of episodes still
     #: running count in neither
     success_clone_weight: float = 0.0
+    #: the demos in the actor too (with ``demo_transitions``): each actor step also clones ``batch_size`` demo rows,
+    #: per agent, as successes: ``success_clone_weight * mean ||a_mean(s_demo) - clip(a_demo, -1, 1)||^2`` (logged
+    #: ``actor/demo_clone_loss``). The critics take the demos through the demo sampling window as before
+    demo_actor_clone: bool = False
+    #: how PARTS' clone and anchor terms reduce over the action dims: "sum" (||.||^2, eq. 4 as written; grows with
+    #: the action width, e.g. 4x for a 4-step chunk) or "mean" (TD3+BC's per-dim mean squared error, so lambda_Q =
+    #: actor_q_scale / mean|Q| and lambda+ / lambda- keep TD3+BC's balance whatever the width)
+    parts_term_reduction: str = "sum"
     failure_anchor_weight: float = 0.0
     outcome_metric: str = "episode/success"
     #: PARTS' lambda_Q in TD3+BC's form (Fujimoto & Gu 2021): the actor's Q term is scaled by
@@ -272,11 +338,53 @@ class SACCfg(_CommonCfg):
     #: residual acting only after the grasp), so the memory holds only what is trained on; the agents then fill at
     #: their own pace (``MultiRandomMemory.add_rows``). Empty: every transition is stored
     store_labels: List[str] = field(default_factory=list)
+    #: PARTS' per-phase residuals: one complete SAC (actor, critics, targets, optimizers, replay memory) per listed
+    #: ``std_label_names`` label, all with this section's settings (``learners/routed.py``). Each env's action comes
+    #: from the residual of the label its observation is in (zeros, the base alone, in an unlisted one); each residual
+    #: stores only the transitions starting in its label, rewarded by its local outcome: 1 when the next observation's
+    #: label is a LATER entry of ``std_label_names`` (the phase passed, or e.g. ``success``), its attempt then ending;
+    #: an episode ending first ends it with 0. Empty: one SAC for every step
+    route_labels: List[str] = field(default_factory=list)
+    #: set per residual by the routing (one of ``route_labels``); a SAC with it stores, rewards and ends its attempts
+    #: as described there. Not set by hand
+    route_label: Optional[str] = None
+    #: potential-based reward shaping (Ng et al. 1999), per routed residual: a list of ``{route, channel, weight}``
+    #: (:class:`PotentialTermCfg`; ``route`` a route label, ``"*"`` for an unrouted SAC). Every stored transition's reward gains ``gamma Phi(s') - Phi(s)``
+    #: (``discount_factor``), ``Phi = -sum weight * value`` over the channels the env published with each observation
+    #: (``"<key>/<name>"`` reads ``infos[key][name]``, e.g. one_leg's ``eval_state/phase/tip_mm``): a dense reward for
+    #: closing the distance. ``Phi(s')`` is the next observation's on an attempt's last transition too (not 0), so an
+    #: attempt that ends far off pays for it. No shaping on the step after an env's episode ended (the values
+    #: published with its first observation are the ended episode's). A residual with no entry is unshaped. Empty: off
+    potential_terms: List[PotentialTermCfg] = field(default_factory=list)
     #: bootstrap through a time limit (``truncated`` without ``terminated``: ``r + gamma Q(s', a')``), as SB3 does with
     #: the true final observation. False ends every episode's last transition, ``r`` alone: Isaac Lab resets an env
     #: inside the step that ends it and returns the next episode's first observation, so ``s'`` there is not the
     #: state the episode reached
     bootstrap_time_limits: bool = True
+    #: PARTS' success-reweighted retraining, every ``retrain_every`` env steps (0: off): the replay memory keeps every
+    #: transition of a successful episode (``outcome_metric``) and those of a random ``retrain_failure_fraction`` of
+    #: the failed ones (episodes still running are kept), the networks, optimizers and temperature start fresh, and
+    #: ``retrain_gradient_steps`` updates run on that curated memory before online training resumes on it
+    retrain_every: int = 0
+    #: count ``learning_starts``, ``update_every`` and ``retrain_every`` in this residual's own steps (the env steps
+    #: whose starting label is its ``route_label``), and update only on those steps: a routed residual never updates
+    #: while its phase is not running (nor in phases with no residual). Needs ``route_labels``
+    route_clock: bool = False
+    #: hold transitions while the task makes no progress: the ``infos`` channel (``"<key>/<name>"`` for
+    #: ``infos[key][name]``) holding, per env, 1 on a step that made no progress (e.g. one_leg's
+    #: ``eval_state/phase/still``). Such transitions are held back, written once progress resumes; if the episode is
+    #: ended for lack of progress (``hold_stall_key`` 1 on its last step), only the first held transition is written,
+    #: as a terminal failure, and the rest are dropped, so the memory never fills with the repeated stalled states.
+    #: Set both or neither
+    hold_still_key: Optional[str] = None
+    hold_stall_key: Optional[str] = None
+    #: PARTS' reference dropout: in each actor update, zero the last ``reference_columns`` columns of the actor's
+    #: observation (the base action, for a residual that observes it last) for this fraction of the batch rows, so
+    #: the actor cannot learn its correction from the reference alone. 0 is off
+    reference_dropout: float = 0.0
+    reference_columns: int = 0
+    retrain_failure_fraction: float = 0.1
+    retrain_gradient_steps: int = 0
 
     ACTOR_Q_REDUCTIONS = ("min", "mean")
     ENTROPY_OBSERVATIONS = ("current", "next")
@@ -357,7 +465,25 @@ class SACCfg(_CommonCfg):
                 f"{self.demo_sampling_end}) mixes demos into the critic's batches, but "
                 f"{self._name()}.demo_transitions names no file"
             )
-        if self.demo_transitions and not window:
+        if self.demo_batch_shared and not (self.demo_transitions and window and self.demo_storage == "sample"):
+            raise ValueError(f"{self._name()}.demo_batch_shared shares the demo window's mixed batch: set demo_transitions, "
+                             "a demo_sampling_start..end window and demo_storage: sample")
+        if self.action_l2_weight < 0:
+            raise ValueError(f"{self._name()}.action_l2_weight must be >= 0, got {self.action_l2_weight}")
+        if self.clone_demo_rows and not (self.demo_transitions and window and self.success_clone_weight > 0):
+            raise ValueError(f"{self._name()}.clone_demo_rows clones the mixed batch's demo rows: set demo_transitions, a "
+                             "demo_sampling_start..end window and success_clone_weight > 0")
+        if self.demo_storage not in ("sample", "memory", "memory_critic"):
+            raise ValueError(f"{self._name()}.demo_storage must be 'sample', 'memory' or 'memory_critic', got {self.demo_storage!r}")
+        if self.demo_storage in ("memory", "memory_critic"):
+            if not self.demo_transitions:
+                raise ValueError(f"{self._name()}.demo_storage: memory writes sac.demo_transitions into the memory; set it")
+            if window:
+                raise ValueError(
+                    f"{self._name()}.demo_storage: memory puts the demos in the replay memory, not in a sampling "
+                    f"window: leave demo_sampling_start..end empty (got {self.demo_sampling_start}..{self.demo_sampling_end})"
+                )
+        if self.demo_transitions and not window and self.demo_storage == "sample":
             raise ValueError(
                 f"{self._name()}.demo_transitions is set but the sampling window "
                 f"[{self.demo_sampling_start}, {self.demo_sampling_end}) is empty, so the demos "
@@ -424,12 +550,47 @@ class SACCfg(_CommonCfg):
                 raise ValueError(
                     f"{name}.target_entropy_sigma must be > 0, got {self.target_entropy_sigma}"
                 )
+        for route in list(self.route_labels) + ([self.route_label] if self.route_label else []):
+            if self.std_by_label is None or route not in self.std_label_names:
+                raise ValueError(
+                    f"{name}.route_labels / route_label {route!r} must be one of std_label_names "
+                    f"{list(self.std_label_names)} (with std_by_label set)"
+                )
         if self.store_labels:
             if self.std_by_label is None:
                 raise ValueError(f"{name}.store_labels filters by std_by_label's labels; set std_by_label")
             unknown = [label for label in self.store_labels if label not in self.std_label_names]
             if unknown:
                 raise ValueError(f"{name}.store_labels {unknown} are not in std_label_names {list(self.std_label_names)}")
+        if self.retrain_every < 0 or self.retrain_gradient_steps < 0:
+            raise ValueError(f"{name}.retrain_every and retrain_gradient_steps must be >= 0")
+        if not 0.0 <= self.retrain_failure_fraction <= 1.0:
+            raise ValueError(f"{name}.retrain_failure_fraction must be in [0, 1], got {self.retrain_failure_fraction}")
+        routed = list(self.route_labels) + ([self.route_label] if self.route_label else [])
+        seen = set()
+        for term in self.potential_terms:
+            key = term.route
+            if key == "*" and routed:
+                raise ValueError(f"{name}.potential_terms route '*' is an unrouted SAC's; a routed one names its route labels")
+            if key != "*" and key not in self.std_label_names:
+                raise ValueError(f"{name}.potential_terms route {key!r} must be '*' or one of std_label_names {list(self.std_label_names)}")
+            if key != "*" and not routed:
+                raise ValueError(f"{name}.potential_terms route {key!r} shapes a routed residual: set route_labels (or use '*')")
+            if not term.channel:
+                raise ValueError(f"{name}.potential_terms: an entry for {key!r} names no channel")
+            if (key, term.channel) in seen:
+                raise ValueError(f"{name}.potential_terms lists {term.channel!r} twice for {key!r}")
+            seen.add((key, term.channel))
+        if self.route_clock and not (self.route_labels or self.route_label):
+            raise ValueError(f"{name}.route_clock counts a routed residual's own steps: set route_labels")
+        if bool(self.hold_still_key) != bool(self.hold_stall_key):
+            raise ValueError(f"{name}.hold_still_key and hold_stall_key go together: set both or neither")
+        if not 0.0 <= self.reference_dropout <= 1.0:
+            raise ValueError(f"{name}.reference_dropout must be in [0, 1], got {self.reference_dropout}")
+        if self.reference_dropout > 0 and self.reference_columns < 1:
+            raise ValueError(f"{name}.reference_dropout zeroes the actor observation's last reference_columns columns: set it >= 1")
+        if self.retrain_every and self.retrain_gradient_steps < 1:
+            raise ValueError(f"{name}.retrain_every retrains fresh networks: set retrain_gradient_steps >= 1")
         if self.success_clone_weight < 0 or self.failure_anchor_weight < 0:
             raise ValueError(
                 f"{name}.success_clone_weight and failure_anchor_weight must be >= 0, got "
@@ -437,8 +598,16 @@ class SACCfg(_CommonCfg):
             )
         if self.actor_q_scale is not None and self.actor_q_scale <= 0:
             raise ValueError(f"{name}.actor_q_scale must be > 0, got {self.actor_q_scale}")
-        if (self.success_clone_weight or self.failure_anchor_weight) and self.demo_transitions:
-            raise ValueError(f"{name}.success_clone_weight / failure_anchor_weight need episode outcomes, which demo transitions do not carry")
+        if self.learning_starts_rows < 0:
+            raise ValueError(f"{name}.learning_starts_rows must be >= 0, got {self.learning_starts_rows}")
+        if self.warmup_episodes < 0:
+            raise ValueError(f"{name}.warmup_episodes must be >= 0, got {self.warmup_episodes}")
+        if self.parts_term_reduction not in ("sum", "mean"):
+            raise ValueError(f"{name}.parts_term_reduction must be 'sum' or 'mean', got {self.parts_term_reduction!r}")
+        if self.demo_actor_clone and self.demo_storage in ("memory", "memory_critic"):
+            raise ValueError(f"{name}.demo_actor_clone samples the separate demo set; with demo_storage: memory the demos are memory rows the clone term already reads")
+        if self.demo_actor_clone and not (self.demo_transitions and self.success_clone_weight > 0):
+            raise ValueError(f"{name}.demo_actor_clone clones the demos with success_clone_weight: set demo_transitions and success_clone_weight > 0")
         if self.metrics_by_label and self.std_by_label is None:
             raise ValueError(f"{name}.metrics_by_label groups by std_by_label's labels; set std_by_label")
         if self.std_by_label is not None and not self.std_label_names:

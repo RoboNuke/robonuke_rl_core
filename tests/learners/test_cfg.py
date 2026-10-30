@@ -164,7 +164,7 @@ def test_ppo_rules(tmp_path, overrides, needle):
     "overrides, needle",
     [
         (["model.actor.activation=Swish"], "activation"),
-        (["model.actor.init=xavier"], "init"),
+        (["model.actor.init=he"], "init"),
         (["model.actor.log_std_bound=sigmoid"], "log_std_bound"),
         (["model.actor.learn_std=false", "model.actor.use_state_dependent_std=true"], "learn_std"),
         (["model.actor.log_std_bound=tanh", "model.actor.init_log_std=-20.0"], "init_log_std"),

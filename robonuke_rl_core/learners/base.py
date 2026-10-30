@@ -11,6 +11,7 @@ may depend on another agent's data; see CLAUDE.md's independence rule.
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import glob
 import os
 import re
@@ -183,6 +184,10 @@ class LearnerBase(Agent):
             torch.full((num_agents, window), float("nan"), device=self.device) if window > 0 else None
         )
         self._success_window_next = [0] * num_agents
+        #: ``trainer.windowed_metrics``: the patterns, and per matching channel the same rolling window and next slot
+        self._windowed_patterns = list(getattr(trainer_cfg, "windowed_metrics", None) or []) if window > 0 else []
+        self._metric_windows: Dict[str, torch.Tensor] = {}
+        self._metric_window_next: Dict[str, List[int]] = {}
         #: the success rate of the interval that produced the current best checkpoint, and
         #: which agents produced a new best in the interval just flushed
         self._best_success: List[float] = [float("nan")] * num_agents
@@ -445,16 +450,39 @@ class LearnerBase(Agent):
                 self._success_count[agent] += mine.numel()
                 if windowed:
                     self._push_success_window(agent, mine)
+            for name, value in metrics.items():
+                if self._is_windowed_metric(name):
+                    mine = value[lo:hi].index_select(0, index)
+                    mine = mine[torch.isfinite(mine)]  # NaN: no value for this episode, not counted
+                    if mine.numel():
+                        self._push_metric_window(name, agent, mine)
             self.emit(
                 agent,
                 {
                     name: value[lo:hi].index_select(0, index)
                     for name, value in metrics.items()
                     # windowed, the rate is published at the flush instead (_flush_episode_stats)
-                    if not (windowed and name == SUCCESS_METRIC)
+                    if not (windowed and name == SUCCESS_METRIC) and not self._is_windowed_metric(name)
                 },
                 step,
             )
+
+    def _is_windowed_metric(self, name: str) -> bool:
+        """``trainer.windowed_metrics``: whether episode channel ``name`` is averaged over the rolling window."""
+        return name != SUCCESS_METRIC and any(fnmatch.fnmatchcase(name, pattern) for pattern in self._windowed_patterns)
+
+    def _push_metric_window(self, name: str, agent: int, values: torch.Tensor) -> None:
+        """A ``windowed_metrics`` channel's newly finished episodes into the agent's rolling window for it."""
+        if name not in self._metric_windows:
+            self._metric_windows[name] = torch.full_like(self._success_window, float("nan"))
+            self._metric_window_next[name] = [0] * self.num_agents
+        window = self._metric_windows[name]
+        size = window.shape[1]
+        start, count = self._metric_window_next[name][agent], values.numel()
+        kept = values[-size:].to(window.dtype)
+        first = start + count - kept.numel()
+        window[agent, (first + torch.arange(kept.numel(), device=self.device)) % size] = kept
+        self._metric_window_next[name][agent] = (start + count) % size
 
     def _push_success_window(self, agent: int, values: torch.Tensor) -> None:
         """Write an agent's newly finished episodes' successes into its rolling window,
@@ -549,20 +577,28 @@ class LearnerBase(Agent):
                     {"episode/count": torch.tensor(count, device=self.device)},
                     step,
                 )
+        windowed = None
         if self._success_window is not None:
             # every interval, episodes or not: the window carries over. An agent with no
             # finished episode yet is all NaN, which the logger skips (no point published)
             rates = torch.nanmean(self._success_window, dim=1)
             for agent in range(self.num_agents):
                 self.emit(agent, {SUCCESS_METRIC: rates[agent]}, step)
-        self._update_best(step, success_total, success_count)
+            windowed = rates.tolist()
+            for name, window in self._metric_windows.items():
+                means = torch.nanmean(window, dim=1)
+                for agent in range(self.num_agents):
+                    self.emit(agent, {name: means[agent]}, step)
+        self._update_best(step, success_total, success_count, windowed)
         self._finished_count.zero_()
         self._finished_returns.zero_()
         self._finished_lengths.zero_()
         self._success_total.zero_()
         self._success_count.zero_()
 
-    def _update_best(self, step: int, success_total: List[float], success_count: List[float]) -> None:
+    def _update_best(
+        self, step: int, success_total: List[float], success_count: List[float], windowed: Optional[List[float]] = None
+    ) -> None:
         """Advance the best-return record, and publish the best checkpoint's success rate.
 
         ``episode/best_success_rate`` is the success rate measured over the interval that
@@ -577,7 +613,14 @@ class LearnerBase(Agent):
         The decision lives here, not in :meth:`_write_best_checkpoints`, because the flush
         hooks publish before checkpoints are written; deciding later would delay the metric
         by a whole interval.
+
+        ``trainer.best_by: success`` picks by the interval's ``episode/success`` instead (``windowed``, the rolling
+        rates, with ``success_window``): the best checkpoint is then the highest-success one, and
+        ``best_success_rate`` the running maximum of ``episode/success``.
         """
+        if getattr(self.trainer_cfg, "best_by", "return") == "success":
+            self._update_best_by_success(step, success_total, success_count, windowed)
+            return
         for agent in range(self.num_agents):
             mean_return = self._mean_return[agent]
             improved = mean_return == mean_return and mean_return > self._best_return[agent]
@@ -593,6 +636,25 @@ class LearnerBase(Agent):
                     {BEST_SUCCESS_METRIC: torch.tensor(rate, device=self.device)},
                     step,
                 )
+
+    def _update_best_by_success(
+        self, step: int, success_total: List[float], success_count: List[float], windowed: Optional[List[float]]
+    ) -> None:
+        """``best_by: success``: a new best where this interval's success rate beats every earlier one."""
+        for agent in range(self.num_agents):
+            if windowed is not None:
+                rate_now = windowed[agent]
+            else:
+                rate_now = success_total[agent] / success_count[agent] if success_count[agent] > 0 else float("nan")
+            best = self._best_success[agent]
+            improved = rate_now == rate_now and (best != best or rate_now > best)
+            self._new_best[agent] = improved
+            if improved:
+                self._best_success[agent] = rate_now
+                self._best_return[agent] = self._mean_return[agent]
+            rate = self._best_success[agent]
+            if rate == rate:
+                self.emit(agent, {BEST_SUCCESS_METRIC: torch.tensor(rate, device=self.device)}, step)
 
     @property
     def mean_returns(self) -> List[float]:

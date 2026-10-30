@@ -156,11 +156,11 @@ class MlpActorCfg:
     num_layers: int = 2
     #: a ``torch.nn`` activation class name: ReLU, SiLU, Tanh, ELU, GELU, ...
     activation: str = "ReLU"
-    #: hidden-layer init: "orthogonal" (gain sqrt(2)) or "kaiming" (fan-in normal, ResiP);
-    #: biases zero. The output layers are orthogonal either way
+    #: hidden-layer init: "orthogonal" (gain sqrt(2)) or "kaiming" (fan-in normal, ResiP) -- the
+    #: output layers orthogonal -- or "xavier" (SERL: xavier-uniform on every layer); biases zero
     init: str = "orthogonal"
-    #: orthogonal gain of the mean head (ResiP and Policy Decorator: 0.01, a near-zero
-    #: initial action)
+    #: the gain of the mean (and state-dependent log std) head's init (ResiP and Policy Decorator:
+    #: 0.01, a near-zero initial action; SERL: 1.0)
     output_init_scale: float = 0.01
     #: the log std every dim starts at (ResiP's residual: -1.0)
     init_log_std: float = 0.0
@@ -179,6 +179,8 @@ class MlpActorCfg:
     #: tanh-squash the Gaussian (SAC; actions in [-1, 1]). false is a plain Gaussian (ResiP's
     #: residual): PPO, or SAC with ``sac.unsquashed_actor``
     squash: bool = True
+    #: a LayerNorm between every hidden layer's Linear and its activation (SERL's ``use_layer_norm``)
+    layer_norm: bool = False
 
 
 @dataclass
@@ -188,10 +190,12 @@ class MlpCriticCfg:
     hidden_size: int = 256
     num_layers: int = 2
     activation: str = "ReLU"
-    #: "orthogonal" or "kaiming", as the actor's
+    #: "orthogonal", "kaiming" or "xavier", as the actor's
     init: str = "orthogonal"
-    #: orthogonal gain of the value head (ResiP: 1.0)
+    #: the gain of the value head's init (ResiP: 1.0)
     output_init_scale: float = 1.0
+    #: a LayerNorm between every hidden layer's Linear and its activation (SERL's ``use_layer_norm``)
+    layer_norm: bool = False
 
 
 @dataclass
@@ -281,6 +285,9 @@ class FlashSACActorCfg:
     #: (left out of weight normalization) and its bias at the value the tanh bound maps to ``log(init_std)``; the
     #: head then learns its state dependence from there
     init_std: Optional[float] = None
+    #: a constant std for every state and dim, no std head (ResiP's frozen exploration, e.g. exp(-1) = 0.368). None:
+    #: the state-dependent head. Not with ``init_std``
+    fixed_std: Optional[float] = None
 
 
 @dataclass
@@ -309,6 +316,11 @@ class FlashSACModelCfg:
                     f"model.{name}: hidden_size >= 1, num_blocks >= 0 and expansion >= 1, got "
                     f"{section.hidden_size}, {section.num_blocks}, {section.expansion}"
                 )
+        if self.actor.fixed_std is not None:
+            if self.actor.init_std is not None:
+                raise ValueError("model.actor.fixed_std freezes the std; init_std starts a learned one: set one")
+            if self.actor.fixed_std <= 0:
+                raise ValueError(f"model.actor.fixed_std must be > 0, got {self.actor.fixed_std}")
         if self.actor.init_std is not None and not (
             math.exp(self.actor.min_log_std) < self.actor.init_std < math.exp(self.actor.max_log_std)
         ):

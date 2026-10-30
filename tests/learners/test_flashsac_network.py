@@ -3,6 +3,8 @@ package's per-agent vmap, its running statistics, and SAC's per-call modes."""
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -123,3 +125,19 @@ def test_init_std_must_lie_inside_the_bound():
 
     with pytest.raises(ValueError, match="init_std"):
         FlashSACModelCfg(actor=FlashSACActorCfg(init_std=10.0)).validate(SimpleNamespace(trainer=SimpleNamespace(learner="sac")))
+
+
+def test_a_fixed_std_is_one_constant_with_no_head_and_the_actor_still_trains():
+    flash = {**FLASH, "target_entropy_sigma": None, "learn_entropy": False, "initial_entropy_value": 0.0}
+    learner = build_learner("sac", num_agents=2, model_overrides={"mean_init_scale": 0.01, "fixed_std": math.exp(-1)}, **flash)
+    params, buffers = learner.policy.net._stacked()
+    assert not any(name.startswith("log_std.") for name in params)
+    learner.enable_training_mode(False)
+    with torch.no_grad():
+        _, out = learner.policy.compute({"observations": torch.randn(16, OBS_DIM)}, "policy")
+    torch.testing.assert_close(out["log_std"].exp(), torch.full((16, ACT_DIM), math.exp(-1)))
+    learner.enable_training_mode(True)
+    fill_memory(learner)
+    learner.update(timestep=1, timesteps=100)
+    _, out = learner.policy.compute({"observations": torch.randn(16, OBS_DIM)}, "policy")
+    torch.testing.assert_close(out["log_std"].exp(), torch.full((16, ACT_DIM), math.exp(-1)))

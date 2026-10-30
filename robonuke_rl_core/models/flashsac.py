@@ -137,7 +137,8 @@ class FlashSACActorNet(nn.Module):
     """FlashSAC's actor: trunk -> mean and raw log std heads. Returns ``(mean, log_std, *stats)``."""
 
     def __init__(self, obs_dim: int, action_dim: int, hidden: int, num_blocks: int, expansion: int,
-                 min_log_std: float, max_log_std: float, mean_init_scale: float = 1.0, init_std=None) -> None:
+                 min_log_std: float, max_log_std: float, mean_init_scale: float = 1.0, init_std=None,
+                 fixed_std=None) -> None:
         super().__init__()
         self.trunk = _Trunk(obs_dim, hidden, num_blocks, expansion)
         self.mean = _linear(hidden, action_dim, bias=True)
@@ -146,8 +147,13 @@ class FlashSACActorNet(nn.Module):
             # orthogonal gain and stays out of weight normalization, which would set its rows back to unit length
             nn.init.orthogonal_(self.mean.weight, gain=float(mean_init_scale))
             self.mean.skip_weight_norm = True
-        self.log_std = _linear(hidden, action_dim, bias=True)
-        if init_std is not None:
+        #: fixed_std: one constant log std for every state and dim (ResiP's frozen exploration), no head, no parameter
+        self.fixed = fixed_std is not None
+        if self.fixed:
+            self.register_buffer("fixed_log_std", torch.full((action_dim,), math.log(float(fixed_std))))
+        else:
+            self.log_std = _linear(hidden, action_dim, bias=True)
+        if init_std is not None and not self.fixed:
             # every state starts at this std: the (state-dependent) log std head's weights start at gain 0.01, out of
             # weight normalization, and its bias at the raw value the tanh bound maps to log(init_std)
             unit = 2.0 * (math.log(float(init_std)) - float(min_log_std)) / (float(max_log_std) - float(min_log_std)) - 1.0
@@ -162,8 +168,11 @@ class FlashSACActorNet(nn.Module):
 
     def forward(self, observations: torch.Tensor):
         h, stats = self.trunk(observations)
-        raw = self.log_std(h)
-        log_std = self.min_log_std + (self.max_log_std - self.min_log_std) * 0.5 * (1.0 + torch.tanh(raw))
+        if self.fixed:
+            log_std = self.fixed_log_std.expand(observations.shape[0], -1)
+        else:
+            raw = self.log_std(h)
+            log_std = self.min_log_std + (self.max_log_std - self.min_log_std) * 0.5 * (1.0 + torch.tanh(raw))
         return (self.mean(h), log_std) + _flat_stats(stats)
 
 
@@ -217,7 +226,7 @@ class FlashSACActor(EnsembleModel, GaussianMixin, Model):
 
     def __init__(self, observation_space, action_space, device, num_agents: int = 1, hidden_size: int = 128,
                  num_blocks: int = 2, expansion: int = 4, min_log_std: float = -10.0, max_log_std: float = 2.0,
-                 mean_init_scale: float = 1.0, init_std=None) -> None:
+                 mean_init_scale: float = 1.0, init_std=None, fixed_std=None) -> None:
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
         GaussianMixin.__init__(self, clip_actions=False, clip_log_std=False, reduction="sum")
         self.num_agents = num_agents
@@ -226,7 +235,8 @@ class FlashSACActor(EnsembleModel, GaussianMixin, Model):
 
         def build() -> nn.Module:
             return FlashSACActorNet(self.num_observations, self.num_actions, int(hidden_size), int(num_blocks),
-                                    int(expansion), float(min_log_std), float(max_log_std), float(mean_init_scale), init_std)
+                                    int(expansion), float(min_log_std), float(max_log_std), float(mean_init_scale), init_std,
+                                    fixed_std)
 
         self.net = VmapEnsemble(build, num_agents, device=device)
 

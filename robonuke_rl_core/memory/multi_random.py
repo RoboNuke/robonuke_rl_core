@@ -89,6 +89,11 @@ class MultiRandomMemory:
         self._agent_index = torch.arange(self.num_agents, device=self.device).unsqueeze(-1)
         #: ``size`` on the device, for :meth:`sample_graph_safe`; refreshed by :meth:`sync_size`
         self._size_on_device = torch.zeros((), dtype=torch.float32, device=self.device)
+        #: each agent's fill on the device, for a memory written with add_rows / add_block (sync_size copies it): a
+        #: captured sampler reads the per-agent bounds from here
+        self._agent_size_on_device = torch.zeros((self.num_agents,), dtype=torch.float32, device=self.device)
+        #: per agent, the rows ever written through add_rows / add_block (more than the capacity: wrapped)
+        self._agent_written: Optional[List[int]] = None
         #: :meth:`add_rows`: each agent's own write pointer and fill (the agents no longer in lockstep); None until
         #: the first such write, after which ``size`` is the smallest agent's fill
         self._agent_pointer: Optional[List[int]] = None
@@ -182,8 +187,8 @@ class MultiRandomMemory:
     def add_rows(self, keep: torch.Tensor, **values: torch.Tensor) -> None:
         """Write only the envs ``keep`` selects (``(num_envs,)`` bool) of one env-step: every value is
         ``(num_envs, dim)`` in env order, and each agent appends its kept rows at its own pointer, so the agents'
-        fills drift apart (sampling then bounds each agent by its own fill). A memory written this way takes no
-        :meth:`add_samples` and has no :meth:`time_view` (PPO's lockstep)."""
+        fills drift apart (sampling then bounds each agent by its own fill). From then on :meth:`add_samples` writes
+        through here too, and there is no :meth:`time_view` (PPO's lockstep)."""
         if not values:
             raise ValueError("add_rows() got no tensors")
         keep = keep.reshape(-1).to(torch.bool)
@@ -212,7 +217,60 @@ class MultiRandomMemory:
                 self.tensors[name][agent, positions] = block[agent, rows].to(self.tensors[name].dtype)
             self._agent_pointer[agent] = (self._agent_pointer[agent] + count) % self.capacity
             self._agent_size[agent] = min(self._agent_size[agent] + count, self.capacity)
+            self._agent_written = self._agent_written or [0] * self.num_agents
+            self._agent_written[agent] += count
         self.size = min(self._agent_size)
+
+    def add_block(self, **values: torch.Tensor) -> None:
+        """Append the same ``rows`` rows (every value ``(rows, dim)``) to every agent's stream, each at its own
+        pointer, in order (e.g. demo transitions written into the memory once, then overwritten like any other
+        row). Leaves the memory out of lockstep, as :meth:`add_rows`."""
+        if not values:
+            raise ValueError("add_block() got no tensors")
+        rows = {int(value.shape[0]) for value in values.values()}
+        if len(rows) != 1:
+            raise ValueError(f"add_block() values differ in rows: { {n: tuple(v.shape) for n, v in values.items()} }")
+        count = rows.pop()
+        if count > self.capacity:
+            raise ValueError(f"add_block() of {count} rows exceeds the memory's capacity {self.capacity} per agent")
+        if self._agent_pointer is None:
+            self._agent_pointer = [self.pointer] * self.num_agents
+            self._agent_size = [self.size] * self.num_agents
+        for name, value in values.items():
+            target = self.get_tensor_by_name(name)
+            if value.reshape(count, -1).shape[-1] != target.shape[-1]:
+                raise ValueError(f"'{name}': expected width {target.shape[-1]}, got {tuple(value.shape)}")
+        for agent in range(self.num_agents):
+            positions = (self._agent_pointer[agent] + torch.arange(count, device=self.device)) % self.capacity
+            for name, value in values.items():
+                self.tensors[name][agent, positions] = value.reshape(count, -1).to(self.device, self.tensors[name].dtype)
+            self._agent_pointer[agent] = (self._agent_pointer[agent] + count) % self.capacity
+            self._agent_size[agent] = min(self._agent_size[agent] + count, self.capacity)
+            self._agent_written = self._agent_written or [0] * self.num_agents
+            self._agent_written[agent] += count
+        self.size = min(self._agent_size)
+
+    def keep_rows(self, keep: torch.Tensor) -> List[int]:
+        """Compact each agent's stored rows to those ``keep`` (``(num_agents, size)`` bool over the written rows)
+        selects, in their stored order, and continue writing after them (the agents' fills then differ, as with
+        :meth:`add_rows`). Returns the rows each agent kept."""
+        if self._agent_pointer is None:
+            self._agent_pointer = [self.pointer] * self.num_agents
+            self._agent_size = [self.size] * self.num_agents
+        kept_counts = []
+        for agent in range(self.num_agents):
+            size = self._agent_size[agent]
+            rows = keep[agent, :size].nonzero(as_tuple=False).reshape(-1)
+            count = int(rows.numel())
+            for tensor in self.tensors.values():
+                tensor[agent, :count] = tensor[agent, rows].clone()
+            self._agent_size[agent] = count
+            self._agent_pointer[agent] = count % self.capacity
+            self._agent_written = self._agent_written or [0] * self.num_agents
+            self._agent_written[agent] = count
+            kept_counts.append(count)
+        self.size = min(self._agent_size)
+        return kept_counts
 
     def add_samples(self, **values: torch.Tensor) -> None:
         """Write one env-step: every value is ``(num_envs, dim)`` in env order.
@@ -221,7 +279,9 @@ class MultiRandomMemory:
         carries; call it once per env-step with everything that step produced.
         """
         if self._agent_pointer is not None:
-            raise RuntimeError("this memory is written with add_rows (agents out of lockstep); add_samples cannot follow")
+            # out of lockstep (add_rows, keep_rows): every env's row, each agent at its own pointer
+            self.add_rows(torch.ones(self.num_envs, dtype=torch.bool, device=self.device), **values)
+            return
         if not values:
             raise ValueError("add_samples() got no tensors")
         rows = self.envs_per_agent
@@ -278,23 +338,64 @@ class MultiRandomMemory:
         )
         return [self._gather(names, indices)]
 
+    def count_where(self, flag: str, value: float) -> List[int]:
+        """Per agent, how many of its written rows have ``flag`` (a one-wide tensor) equal to ``value``."""
+        tensor = self.get_tensor_by_name(flag)
+        sizes = self._agent_size or [self.size] * self.num_agents
+        return [int((tensor[agent, : sizes[agent], 0] == value).sum()) for agent in range(self.num_agents)]
+
+    def sample_where(self, *, names: Sequence[str], batch_size: int, flag: str, value: float) -> List[List[torch.Tensor]]:
+        """:meth:`sample` restricted to the rows whose ``flag`` (a one-wide tensor) equals ``value``: ``batch_size``
+        of them per agent, drawn uniformly with replacement from that agent's eligible rows (e.g. the online rows of a
+        memory that also holds flagged demo rows). Raises when an agent has none."""
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        tensor = self.get_tensor_by_name(flag)
+        sizes = self._agent_size or [self.size] * self.num_agents
+        indices = torch.empty((self.num_agents, batch_size), dtype=torch.long, device=self.device)
+        for agent in range(self.num_agents):
+            eligible = (tensor[agent, : sizes[agent], 0] == value).nonzero(as_tuple=False).reshape(-1)
+            if eligible.numel() == 0:
+                raise ValueError(f"agent {agent} has no row with {flag} == {value} to sample")
+            indices[agent] = eligible[torch.randint(0, eligible.numel(), (batch_size,), device=self.device)]
+        return [self._gather(names, indices)]
+
     def sync_size(self) -> None:
         """Copy ``size`` to the device (an async fill, no host sync) for
         :meth:`sample_graph_safe`. Call before each replay of a captured sampler."""
         self._size_on_device.fill_(float(self.size))
+        if self._agent_size is not None:
+            self._agent_size_on_device.copy_(torch.tensor(self._agent_size, dtype=torch.float32), non_blocking=True)
 
     def sample_graph_safe(self, *, names: Sequence[str], batch_size: int) -> List[List[torch.Tensor]]:
         """:meth:`sample`, with the row bound read from the device (``sync_size``) instead of
         baked in as a Python number, so a CUDA graph that captured it stays right as the
         memory fills. Uniform over the written rows, like :meth:`sample`; a different random
         stream (``floor(u * size)`` rather than ``randint``)."""
-        if self._agent_size is not None:
-            raise RuntimeError("a memory written with add_rows has per-agent fills: sample it with sample()")
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         uniform = torch.rand((self.num_agents, batch_size), device=self.device)
-        indices = (uniform * self._size_on_device).long().clamp_(max=self.capacity - 1)
+        if self._agent_size is not None:  # add_rows / add_block: each agent bounded by its own fill
+            indices = (uniform * self._agent_size_on_device.unsqueeze(-1)).long().clamp_(max=self.capacity - 1)
+        else:
+            indices = (uniform * self._size_on_device).long().clamp_(max=self.capacity - 1)
         return [self._gather(names, indices)]
+
+    def sample_range_graph_safe(self, *, names: Sequence[str], batch_size: int, low: torch.Tensor) -> List[List[torch.Tensor]]:
+        """:meth:`sample_graph_safe` over each agent's rows ``[low, fill)`` only (``low`` a ``(num_agents,)`` device
+        tensor, e.g. the end of a block of demo rows written first): device work only, so a captured graph stays right
+        as the memory fills. The caller keeps ``low < fill`` and the memory unwrapped."""
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        sizes = self._agent_size_on_device if self._agent_size is not None else self._size_on_device.expand(self.num_agents)
+        low = low.to(torch.float32)
+        uniform = torch.rand((self.num_agents, batch_size), device=self.device)
+        indices = (low.unsqueeze(-1) + uniform * (sizes - low).unsqueeze(-1)).long().clamp_(max=self.capacity - 1)
+        return [self._gather(names, indices)]
+
+    def written(self) -> List[int]:
+        """Per agent, the rows ever written (a fill that stopped at the capacity has wrapped)."""
+        return list(getattr(self, "_agent_written", None) or [self.size] * self.num_agents)
 
     def sample_all(
         self,

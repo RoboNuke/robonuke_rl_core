@@ -229,11 +229,13 @@ class WandbLogger:
             self.save_file(config_path)
 
     # ------------------------------------------------------------------ files
-    def save_file(self, path: Any, agent: Optional[int] = None) -> None:
+    def save_file(self, path: Any, agent: Optional[int] = None, base_path: Optional[Any] = None) -> None:
         """Add a plain file to one run's Files tab, or to every run's when ``agent`` is None.
 
         Ordinary run files (``run.save``), never the Artifacts API: an eval downloads these
-        back by name, so a file is stored under its base name and nothing else.
+        back by name, so a file is stored under its base name and nothing else (or, with
+        ``base_path``, under its path relative to that folder: a routed SAC's
+        ``<phase>/checkpoints/<file>``, whose phases share file names).
         """
         from pathlib import Path
 
@@ -242,7 +244,7 @@ class WandbLogger:
             raise FileNotFoundError(f"cannot upload {source}: not a file")
         runs = self.runs if agent is None else [self.runs[agent]]
         for run in runs:
-            run.save(str(source), base_path=str(source.parent), policy="now")
+            run.save(str(source), base_path=str(base_path if base_path is not None else source.parent), policy="now")
 
     def checkpoint(self, agent: int, step: int, path: Any) -> None:
         """The learner's ``on_checkpoint`` hook: mirror that agent's checkpoint file."""

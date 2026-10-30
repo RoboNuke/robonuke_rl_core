@@ -663,6 +663,8 @@ def run_eval(
                 break
             actions = policy(observations, states)
             next_observations, rewards, terminated, truncated, infos = env.step(actions)
+            if hasattr(policy, "observe"):  # a policy that reads the env's infos (a routed SAC's phases)
+                policy.observe(infos)
             metrics = per_env_channel(infos, "metrics_to_log", num_envs)
             episode_metrics = per_env_channel(infos, "episode_metrics_to_log", num_envs)
             eval_state = per_env_channel(infos, "eval_state", num_envs)
@@ -1029,6 +1031,23 @@ def build_eval_policy(
     learner_name = cfg.trainer.learner
     if learner_name in EVAL_POLICY_BUILDERS:
         return EVAL_POLICY_BUILDERS[learner_name](cfg, env, checkpoint, deterministic)
+    routes = list(getattr(cfg[learner_name], "route_labels", None) or []) if learner_name == "sac" else []
+    if routes:
+        return _build_routed_eval_policy(cfg, env, checkpoint, deterministic, routes)
+    return _build_single_eval_policy(cfg, env, checkpoint, deterministic)
+
+
+def _build_single_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic: bool, learner_cfg: Any = None) -> tuple:
+    """:func:`build_eval_policy` for one learner (``learner_cfg``: its section, by default the run's)."""
+    from .learners.cfg import LEARNERS, sac_critic_outputs
+    from .learners.ppo import PPO
+    from .learners.sac import SAC
+    from .models.factory import build_models
+
+    classes = {"sac": SAC, "ppo": PPO}
+    learner_name = cfg.trainer.learner
+    if learner_cfg is None:
+        learner_cfg = cfg[learner_name]
     if learner_name not in classes:
         raise ValueError(
             f"cannot evaluate learner {learner_name!r}; known: {sorted(LEARNERS)} plus registered "
@@ -1053,8 +1072,8 @@ def build_eval_policy(
         1,  # one agent
         env.device,
         controller_cfg,
-        num_critics=int(cfg[learner_name].num_critics) if learner_name == "sac" else 2,
-        critic_outputs=sac_critic_outputs(cfg[learner_name]) if learner_name == "sac" else 1,
+        num_critics=int(learner_cfg.num_critics) if learner_name == "sac" else 2,
+        critic_outputs=sac_critic_outputs(learner_cfg) if learner_name == "sac" else 1,
         critic_action_space=critic_space,
     )
     extra = (
@@ -1069,7 +1088,7 @@ def build_eval_policy(
         state_space=state_space,
         action_space=env.action_space,
         device=env.device,
-        cfg=cfg[learner_name],
+        cfg=learner_cfg,
         trainer_cfg=cfg.trainer,
         num_agents=1,
         num_envs=env.num_envs,
@@ -1088,3 +1107,75 @@ def build_eval_policy(
             return outputs["mean_actions"] if deterministic else actions
 
     return policy, learner, metadata
+
+
+class _RoutedEvalPolicy:
+    """A routed SAC's frozen per-phase policies (``sac.route_labels``): each env acts with the residual of the phase
+    its observation is in (zeros, the base alone, elsewhere), read from the env's infos after every step
+    (:meth:`observe`; :func:`run_eval` calls it); :meth:`reset` forgets the phases (a fresh round starts with none,
+    the base alone, until the env publishes them). :meth:`load_agent` loads every phase's checkpoint of a name:
+    ``<run>/<phase>/checkpoints/<name>``."""
+
+    def __init__(self, parts: dict, names, deterministic: bool) -> None:
+        self.parts = parts  # route -> (policy, learner)
+        self.names = list(names)
+        self.deterministic = deterministic
+        self.labels = None
+
+    def reset(self) -> None:
+        self.labels = None
+
+    def observe(self, infos: Any) -> None:
+        learner = next(iter(self.parts.values()))[1]
+        self.labels = learner._std_labels_from(infos)
+
+    def __call__(self, observations: torch.Tensor, states: Optional[torch.Tensor]) -> torch.Tensor:
+        actions = None
+        for route, (policy, _) in self.parts.items():
+            routed = policy(observations, states)
+            if actions is None:
+                actions = torch.zeros_like(routed)
+            if self.labels is not None:
+                mask = (self.labels == self.names.index(route)).reshape(-1, 1).to(routed.dtype)
+                actions = actions + mask * routed
+        return actions
+
+    def load_agent(self, path: Any, slot: int = 0, *, with_optimizer: bool = False) -> Dict[str, Any]:
+        from pathlib import Path
+
+        path = Path(path)
+        base = path.parent.parent.parent
+        metadata = {}
+        for route, (_, learner) in self.parts.items():
+            metadata = learner.load_agent(base / route / "checkpoints" / path.name, slot=slot, with_optimizer=with_optimizer)
+        self.enable_training_mode(False)
+        return metadata
+
+    def enable_training_mode(self, enabled: bool = True) -> None:
+        for _, learner in self.parts.values():
+            learner.enable_training_mode(enabled)
+            if not enabled and any(getattr(m, "uses_batch_stats", False) for m in learner.models.values() if m is not None):
+                learner.enable_models_training_mode(False)
+
+
+def _build_routed_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic: bool, routes) -> tuple:
+    """:func:`build_eval_policy` for a routed SAC: ``checkpoint`` is one phase's file,
+    ``<run>/<phase>/checkpoints/<name>``; every phase's file of that name is loaded."""
+    import copy
+    from pathlib import Path
+
+    path = Path(checkpoint)
+    base = path.parent.parent.parent
+    parts = {}
+    metadata = {}
+    for route in routes:
+        route_cfg = copy.deepcopy(cfg.sac)
+        route_cfg.route_label = route
+        route_cfg.route_labels = []
+        route_cfg.demo_transitions = None  # eval stores and samples nothing
+        policy, learner, metadata = _build_single_eval_policy(
+            cfg, env, base / route / "checkpoints" / path.name, deterministic, learner_cfg=route_cfg
+        )
+        parts[route] = (policy, learner)
+    routed = _RoutedEvalPolicy(parts, cfg.sac.std_label_names, deterministic)
+    return routed, routed, metadata

@@ -291,10 +291,18 @@ class SAC(LearnerBase):
         names = ["observations", "actions", "rewards", "next_observations", "terminated", "truncated"]
         if self._asymmetric:
             names += ["states", "next_states"]
+        # the critic action transform's side inputs: a demo file must carry them as well (and their next_ values)
+        for name in sorted(getattr(self, "_side_inputs", {}) or {}):
+            names += [name, f"next_{name}"]
         return names
 
     def _n_step(self) -> int:
         return int(self.cfg.n_step)
+
+    def _own_potential_terms(self) -> Dict[str, float]:
+        """``potential_terms``' entry for this SAC (its route's, or "*"), ``{channel: weight}``; empty if unshaped."""
+        route = self.cfg.route_label or "*"
+        return {str(t.channel): float(t.weight) for t in (self.cfg.potential_terms or []) if t.route == route}
 
     def _load_demo_transitions(self) -> Dict[str, torch.Tensor]:
         """The demo file's tensors on the device, checked against the agent's spaces."""
@@ -309,6 +317,16 @@ class SAC(LearnerBase):
                 "tensors (and optional 'meta')"
             )
         transitions = data["transitions"]
+        meta = data.get("meta") or {}
+        own = self._own_potential_terms()
+        if own or meta.get("potential_terms"):
+            # the demo rewards must carry the online rewards' shaping
+            made = {str(c): float(w) for c, w in (meta.get("potential_terms") or {}).items()}
+            if made != own or float(meta.get("discount_factor", float("nan"))) != float(self.cfg.discount_factor):
+                raise ValueError(
+                    f"sac.demo_transitions ({path}) was shaped with potential_terms {made} and discount_factor "
+                    f"{meta.get('discount_factor')}, this learner with {own} and {self.cfg.discount_factor}: remake it"
+                )
         names = self._demo_names()
         missing = [n for n in names if n not in transitions]
         if missing:
@@ -323,6 +341,8 @@ class SAC(LearnerBase):
         }
         if self._asymmetric:
             widths["states"] = widths["next_states"] = self._space_width(self.state_space)
+        for name, width in (getattr(self, "_side_inputs", {}) or {}).items():
+            widths[name] = widths[f"next_{name}"] = int(width)
         rows = None
         out = {}
         for name in names:
@@ -343,6 +363,21 @@ class SAC(LearnerBase):
             out[name] = tensor.to(device=self.device, dtype=dtype)
         if not rows:
             raise ValueError(f"sac.demo_transitions ({path}) holds no transitions")
+        # each row's demo episode (0, 1, ...; a row that ends one closes it) and each episode's outcome (1 when it
+        # holds a positive reward; shaped rewards are no success flag, so a shaped file carries its rows' own
+        # "success"): demo_storage memory gives them episode ids
+        ends = (out["terminated"] | out["truncated"]).reshape(-1)
+        self._demo_episode = torch.cumsum(ends.to(torch.long), 0) - ends.to(torch.long)
+        episodes = int(self._demo_episode.max()) + 1
+        if own:
+            if "success" not in transitions or tuple(transitions["success"].shape) != (rows, 1):
+                raise KeyError(f"sac.demo_transitions ({path}) is shaped (potential_terms) but carries no (rows, 1) 'success'")
+            success = transitions["success"].to(device=self.device, dtype=torch.float32).reshape(-1) > 0.5
+        else:
+            success = out["rewards"].reshape(-1) > 0
+        self._demo_episode_success = torch.zeros(episodes, device=self.device).index_reduce_(
+            0, self._demo_episode, success.to(torch.float32), "amax"
+        )
         if self._n_step() > 1:
             out = n_step_rows(out, self._n_step(), float(self.cfg.discount_factor))
         # actions may lie beyond the squashed policy's [-1, 1]: only the critic sees demo rows,
@@ -353,6 +388,39 @@ class SAC(LearnerBase):
                 raise ValueError(f"sac.demo_transitions ({path}): '{name}' holds non-finite values")
         print(f"[sac] {rows} demo transitions from {path}", flush=True)
         return out
+
+    def _write_demos_to_memory(self, demo: Dict[str, torch.Tensor]) -> None:
+        """``demo_storage: memory``: the demo rows into every agent's replay memory, ahead of the online rows, with
+        episode ids of their own when the PARTS terms track outcomes."""
+        rows = dict(demo)
+        if getattr(self, "_track_outcomes", False):
+            first = self._next_episode
+            ids = first + self._demo_episode
+            episodes = self._demo_episode_success.numel()
+            need = first + episodes
+            if need > self._outcomes.numel():
+                grown = torch.full((max(need, 2 * self._outcomes.numel()),), -1.0, device=self.device)
+                grown[: self._outcomes.numel()] = self._outcomes
+                self._outcomes = grown
+            self._outcomes[first:need] = self._demo_episode_success
+            self._next_episode = need
+            rows["episode_ids"] = ids.to(torch.float32).unsqueeze(-1)
+        if self.cfg.demo_storage == "memory_critic":
+            rows["is_demo"] = torch.ones(next(iter(demo.values())).shape[0], 1, device=self.device)
+            if getattr(self, "_track_outcomes", False):
+                # outcome -1 ("still running"): in neither PARTS term (the actor skips demo rows anyway)
+                self._outcomes[first:need] = -1.0
+        missing = [name for name in self._tensors_names if name not in rows]
+        if missing:
+            raise KeyError(f"sac.demo_storage: memory: the demo rows lack the memory's {missing}")
+        if self.cfg.demo_storage == "memory_critic" and int(self.memory.size) != 0:
+            raise RuntimeError("sac.demo_storage: memory_critic writes the demos first, into an empty memory")
+        self.memory.add_block(**{name: rows[name] for name in self._tensors_names})
+        if self.cfg.demo_storage == "memory_critic":
+            # the online rows of each agent are [n_demo, fill) until the memory wraps: the actor's sampler bound
+            self._demo_rows = list(self.memory._agent_size)
+            self._online_low = torch.tensor(self._demo_rows, dtype=torch.float32, device=self.device)
+        print(f"[sac] {next(iter(demo.values())).shape[0]} demo transitions written into the replay memory", flush=True)
 
     @staticmethod
     def _space_width(space) -> int:
@@ -368,6 +436,45 @@ class SAC(LearnerBase):
     def _sample(self, rows: int, graph: bool = False) -> Dict[str, torch.Tensor]:
         sample = self.memory.sample_graph_safe if graph else self.memory.sample
         return dict(zip(self._tensors_names, sample(names=self._tensors_names, batch_size=rows)[0]))
+
+    def _sample_online(self, rows: int, graph: bool = False) -> Dict[str, torch.Tensor]:
+        """``demo_storage: memory_critic``: ``rows`` rows per agent from its online rows only (``is_demo`` 0). Until the
+        memory wraps those are each agent's rows ``[n_demo, fill)``, sampled with device work only (capturable);
+        after a wrap, by the flag (eager)."""
+        names = self._tensors_names
+        if not self._memory_wrapped():
+            sample = self.memory.sample_range_graph_safe if graph else self._sample_range_eager
+            return dict(zip(names, sample(names=names, batch_size=rows, low=self._online_low)[0]))
+        return dict(zip(names, self.memory.sample_where(names=names, batch_size=rows, flag="is_demo", value=0.0)[0]))
+
+    def _sample_range_eager(self, *, names, batch_size: int, low: torch.Tensor):
+        self.memory.sync_size()
+        return self.memory.sample_range_graph_safe(names=names, batch_size=batch_size, low=low)
+
+    def _memory_wrapped(self) -> bool:
+        """Whether some agent's memory has written past its capacity (old rows, demos first, overwritten)."""
+        return max(self.memory.written()) > self.memory.capacity
+
+    def _online_rows_available(self) -> bool:
+        """``demo_storage: memory_critic``: every agent holds at least one online row (host side, outside any graph)."""
+        if self._memory_wrapped():
+            return min(self.memory.count_where("is_demo", 0.0)) > 0
+        fills = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
+        return min(f - d for f, d in zip(fills, self._demo_rows)) > 0
+
+    def _online_rows_ready(self) -> bool:
+        """``learning_starts_rows``: every agent's memory holds that many online rows (cached once true)."""
+        need = int(self.cfg.learning_starts_rows)
+        if not need or getattr(self, "_rows_ready", False):
+            return True
+        if self.memory is None or self.memory.size == 0:
+            return False
+        if "is_demo" in self._tensors_names:
+            counts = self.memory.count_where("is_demo", 0.0)
+        else:
+            counts = list(self.memory._agent_size or [int(self.memory.size)] * self.num_agents)
+        self._rows_ready = min(counts) >= need
+        return self._rows_ready
 
     def _mixed_batch(self, rows: int, graph: bool = False) -> Dict[str, torch.Tensor]:
         """The critic's batch inside the demo window: per agent, ``min(rows // 2, stored)``
@@ -386,6 +493,16 @@ class SAC(LearnerBase):
                 part = online[name].view(self.num_agents, n_online, -1)
                 demo = torch.cat((part.to(demo.dtype), demo), dim=1)
             batch[name] = demo.reshape(self.num_agents * rows, -1)
+        if getattr(self, "_track_outcomes", False):
+            # demo rows carry no attempt of their own: a placeholder id, and a flag that keeps them out of PARTS'
+            # clone / anchor terms (the Q term still reads them, e.g. with demo_batch_shared)
+            ids = torch.zeros((self.num_agents, n_demo, 1), device=self.device)
+            skip = torch.ones((self.num_agents, n_demo, 1), device=self.device)
+            if online is not None:
+                ids = torch.cat((online["episode_ids"].view(self.num_agents, n_online, 1).to(ids.dtype), ids), dim=1)
+                skip = torch.cat((torch.zeros((self.num_agents, n_online, 1), device=self.device), skip), dim=1)
+            batch["episode_ids"] = ids.reshape(self.num_agents * rows, 1)
+            batch["_parts_skip"] = skip.reshape(self.num_agents * rows, 1)
         return batch
 
     def _resolve_target_entropy(self) -> float:
@@ -472,13 +589,21 @@ class SAC(LearnerBase):
         self._tensors_names += self.create_aux_memory_tensors()
         #: PARTS' actor terms: every stored transition carries its episode's id; the outcomes table holds each
         #: finished episode's outcome (1 success, 0 failure; -1 while it runs)
-        self._track_outcomes = bool(self.cfg.success_clone_weight or self.cfg.failure_anchor_weight)
+        self._track_outcomes = bool(
+            self.cfg.success_clone_weight or self.cfg.failure_anchor_weight or self.cfg.retrain_every
+        )
+        #: potential_terms: this SAC's channels and weights (its route's entry, or "*"); Phi of the observation the
+        #: next transition starts from, and whether it belongs to that transition's episode
+        self._potential_terms = self._own_potential_terms()
+        self._potential_prev = None
+        self._potential_valid = None
         if self._track_outcomes:
             self.memory.create_tensor(name="episode_ids", size=1, dtype=torch.float32)
             self._tensors_names.append("episode_ids")
             self._env_episode = torch.arange(self.num_envs, device=self.device)
             self._next_episode = self.num_envs
-            self._outcomes = torch.full((max(4096, 4 * self.num_envs),), -1.0, device=self.device)
+            # preallocated so a captured CUDA graph keeps reading the same tensor (growth re-captures)
+            self._outcomes = torch.full((max(1 << 16, 4 * self.num_envs),), -1.0, device=self.device)
         #: the critic action transform's side_inputs: name -> width, stored as name and next_name
         self._side_inputs = {
             str(name): int(width)
@@ -488,13 +613,15 @@ class SAC(LearnerBase):
             for stored in (name, f"next_{name}"):
                 self.memory.create_tensor(name=stored, size=width, dtype=torch.float32)
                 self._tensors_names.append(stored)
+        if self.cfg.demo_storage == "memory_critic":
+            # 1 on a demo row: the critics train on it, the actor's loss skips it
+            self.memory.create_tensor(name="is_demo", size=1, dtype=torch.float32)
+            self._tensors_names.append("is_demo")
         if self.cfg.demo_transitions:
             self._demo = self._load_demo_transitions()
-        if self._demo is not None and self._side_inputs:
-            raise ValueError(
-                f"sac.demo_transitions cannot be mixed into batches while the critic action transform reads "
-                f"the per-transition side inputs {sorted(self._side_inputs)}: the demos do not carry them"
-            )
+            if self.cfg.demo_storage in ("memory", "memory_critic"):
+                self._write_demos_to_memory(self._demo)
+                self._demo = None  # ordinary memory rows from here on
         if self._demo is not None and self.aux_memory_keys():
             raise ValueError(
                 "sac.demo_transitions cannot be mixed into batches while aux losses need per-"
@@ -513,7 +640,14 @@ class SAC(LearnerBase):
         return self.state_normalizer(states, train=train)
 
     # ------------------------------------------------------------------ interaction
+    def _warming_up(self) -> bool:
+        """``warmup_episodes``: still within the first episodes, run on zero actions with no updates."""
+        return int(self.cfg.warmup_episodes) > getattr(self, "_finished_episodes", 0)
+
     def act(self, observations, states, *, timestep: int, timesteps: int):
+        if self.training and self._warming_up():
+            width = self._space_width(self.action_space)
+            return torch.zeros((observations.shape[0], width), device=self.device), {}
         if self.training and timestep < self.cfg.random_timesteps:
             return self._explore_progressively(self.random_actions(observations.shape[0]), timestep), {}
         inputs = {"observations": self.normalize_observations(observations)}
@@ -654,6 +788,10 @@ class SAC(LearnerBase):
             truncated=truncated,
             step=timestep,
         )
+        if self.training:
+            # the env's own episode ends (warmup_episodes counts them)
+            self._finished_episodes = getattr(self, "_finished_episodes", 0) + int((terminated | truncated).sum())
+        shaping = self._potential_shaping(infos, terminated | truncated) if self._potential_terms else None
         #: the label of the observation this transition starts from (store_labels)
         start_labels = getattr(self, "_std_labels", None)
         if self.cfg.std_by_label:
@@ -663,6 +801,12 @@ class SAC(LearnerBase):
 
         if not self.training:
             return
+        local_outcome = None
+        if self.cfg.route_label:
+            # this residual's own attempts: rewarded and ended by its label's local outcome
+            rewards, terminated, truncated, local_outcome = self._route_signals(start_labels, terminated, truncated)
+        if shaping is not None:
+            rewards = rewards + shaping.to(rewards.dtype).reshape(rewards.shape)
         extra: Dict[str, torch.Tensor] = {}
         if self._asymmetric:
             if states is None or next_states is None:
@@ -674,14 +818,27 @@ class SAC(LearnerBase):
             extra["next_states"] = next_states
         extra.update(self.aux_memory_values(infos))
         extra.update(self._side_input_values(infos, observations.shape[0]))
+        if self.cfg.route_label:
+            # route_clock: this step is one of this residual's own when an env starts it in the route's label
+            index = self.cfg.std_label_names.index(self.cfg.route_label)
+            self._route_step_now = start_labels is not None and bool((start_labels == index).any())
+            self._route_steps = getattr(self, "_route_steps", 0) + int(self._route_step_now)
+        if self.cfg.demo_storage == "memory_critic":
+            extra["is_demo"] = torch.zeros(observations.shape[0], 1, device=self.device)
+        if self.cfg.hold_still_key:
+            n = observations.shape[0]
+            extra["_still"] = self._infos_flags(infos, self.cfg.hold_still_key, n)
+            # a last-step field of an n-step window (the "next_" prefix): set on every row whose window ends on a stall
+            extra["next__stalled"] = self._infos_flags(infos, self.cfg.hold_stall_key, n) * (terminated | truncated).reshape(n, 1).to(torch.float32)
         if self.cfg.executed_action_mask:
             actions = actions * self._executed_mask(infos, actions)
         if getattr(self, "_track_outcomes", False):
             extra["episode_ids"] = self._env_episode.to(torch.float32).unsqueeze(-1)
-            self._record_outcomes(infos, terminated, truncated)
-        if self.cfg.store_labels:
+            self._record_outcomes(infos, terminated, truncated, outcome=local_outcome)
+        stored_labels = [self.cfg.route_label] if self.cfg.route_label else list(self.cfg.store_labels)
+        if stored_labels:
             # stored only where the starting observation's label is listed (none before the first label is known)
-            allowed = [self.cfg.std_label_names.index(label) for label in self.cfg.store_labels]
+            allowed = [self.cfg.std_label_names.index(label) for label in stored_labels]
             if start_labels is None:
                 keep = torch.zeros(observations.shape[0], dtype=torch.bool, device=self.device)
             else:
@@ -704,11 +861,101 @@ class SAC(LearnerBase):
             row = self._n_step_window.push(row)
             if row is None:
                 return
+        if self.cfg.hold_still_key:
+            self._write_holding(row)
+            return
         if "_keep" in row:  # store_labels: only the transitions starting in a listed phase
             keep = row.pop("_keep").reshape(-1) > 0.5
             self.memory.add_rows(keep, **row)
             return
         self.memory.add_samples(**row)
+
+    def forced_env_reset(self) -> None:
+        super().forced_env_reset()
+        self._potential_prev = None  # potential_terms: every env starts over; the kept Phi is the cut episodes'
+
+    def _potential_shaping(self, infos: Any, done: torch.Tensor) -> torch.Tensor:
+        """``potential_terms``: this step's ``(num_envs, 1)`` shaping ``gamma Phi(s') - Phi(s)`` (0 where ``Phi(s)``
+        is unknown or the ended episode's), ``Phi(s')`` from this step's ``infos``, kept as the next step's ``Phi(s)``."""
+        rows = done.reshape(-1).shape[0]
+        phi = torch.zeros(rows, 1, device=self.device)
+        for path, weight in self._potential_terms.items():
+            value = infos.get(path) if isinstance(infos, dict) else None
+            if value is None and isinstance(infos, dict) and "/" in path:
+                key, name = path.split("/", 1)
+                channel = infos.get(key)
+                value = channel.get(name) if isinstance(channel, dict) else None
+            if value is None:
+                raise RuntimeError(f"sac.potential_terms: the env's infos carry no '{path}' this step")
+            value = torch.as_tensor(value, device=self.device, dtype=torch.float32).reshape(-1, 1)
+            if value.shape[0] != rows:
+                raise ValueError(f"infos '{path}' has {value.shape[0]} rows, the step {rows}")
+            if not bool(torch.isfinite(value).all()):
+                raise ValueError(f"sac.potential_terms: infos '{path}' is not finite this step: {value.reshape(-1).tolist()}")
+            phi = phi - float(weight) * value
+        if self._potential_prev is None:
+            shaping = torch.zeros_like(phi)
+        else:
+            shaping = (float(self.cfg.discount_factor) * phi - self._potential_prev) * self._potential_valid
+        self._potential_prev = phi
+        # an env whose episode ended starts the next step from its new episode's first observation
+        self._potential_valid = (~done.reshape(-1, 1).to(torch.bool)).to(torch.float32).to(self.device)
+        return shaping
+
+    def _infos_flags(self, infos: Any, path: str, rows: int) -> torch.Tensor:
+        """``(rows, 1)`` float flags from the ``infos`` channel ``path`` (``"<key>/<name>"`` reads ``infos[key][name]``)."""
+        value = infos.get(path) if isinstance(infos, dict) else None
+        if value is None and isinstance(infos, dict) and "/" in path:
+            key, name = path.split("/", 1)
+            channel = infos.get(key)
+            value = channel.get(name) if isinstance(channel, dict) else None
+        if value is None:
+            raise RuntimeError(f"sac.hold_still_key / hold_stall_key: the env's infos carry no '{path}' this step")
+        value = torch.as_tensor(value, device=self.device, dtype=torch.float32).reshape(-1, 1)
+        if value.shape[0] != rows:
+            raise ValueError(f"infos '{path}' has {value.shape[0]} rows, the step {rows}")
+        return (value > 0.5).to(torch.float32)
+
+    def _write_holding(self, row: Dict[str, torch.Tensor]) -> None:
+        """``hold_still_key``: write each env's row now when its step made progress (after the rows held for that env,
+        in order); hold it while the task makes no progress; when the episode ends for lack of progress, write only
+        the first held row, as a terminal failure, and drop the rest (and the window's later rows of that end)."""
+        n = self.num_envs
+        still = row.pop("_still").reshape(-1) > 0.5
+        stalled = row.pop("next__stalled").reshape(-1) > 0.5
+        keep = row.pop("_keep").reshape(-1) > 0.5 if "_keep" in row else torch.ones(n, dtype=torch.bool, device=self.device)
+        if not hasattr(self, "_held"):
+            self._held = [[] for _ in range(n)]
+            self._stall_resolved = [False] * n
+        for env in range(n):
+            one = {name: value[env : env + 1] for name, value in row.items()}
+            if bool(stalled[env]):
+                if self._stall_resolved[env]:
+                    continue  # a later row of the same stall: dropped
+                self._stall_resolved[env] = True
+                first, first_keep = self._held[env][0] if self._held[env] else (one, bool(keep[env]))
+                first = dict(first)
+                first["terminated"] = torch.ones_like(first["terminated"])
+                first["truncated"] = torch.zeros_like(first["truncated"])
+                self._write_env_row(env, first, first_keep)
+                self._held[env] = []
+                continue
+            self._stall_resolved[env] = False
+            if bool(still[env]):
+                self._held[env].append((one, bool(keep[env])))
+                continue
+            for held, held_keep in self._held[env]:
+                self._write_env_row(env, held, held_keep)
+            self._held[env] = []
+            self._write_env_row(env, one, bool(keep[env]))
+
+    def _write_env_row(self, env: int, row: Dict[str, torch.Tensor], keep: bool) -> None:
+        """One env's row (every value ``(1, width)``) into the memory, at that env's agent's pointer."""
+        if not keep:
+            return
+        mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        mask[env] = True
+        self.memory.add_rows(mask, **{name: value.expand(self.num_envs, *value.shape[1:]) for name, value in row.items()})
 
     def _executed_mask(self, infos: Any, actions: torch.Tensor) -> torch.Tensor:
         """``executed_action_mask``: ``(num_envs, 1)`` 1 where the env executed the agent's action this step."""
@@ -721,25 +968,47 @@ class SAC(LearnerBase):
             raise ValueError(f"infos['{key}'] has {mask.shape[0]} rows, the actions {actions.shape[0]}")
         return mask
 
-    def _record_outcomes(self, infos: Any, terminated: torch.Tensor, truncated: torch.Tensor) -> None:
-        """Record the outcome of every episode that ended this step and give those envs new episode ids."""
+    def _route_signals(self, start_labels, terminated: torch.Tensor, truncated: torch.Tensor):
+        """``route_label``: ``(rewards, terminated, truncated, outcome)`` of this residual's own attempts, per env:
+        success (reward 1) when the transition starts in the label and the next observation's label is a later
+        ``std_label_names`` entry; the attempt ends there, or when the env's episode ends (success 0). Truncation is
+        never separate: an attempt's end is terminal."""
+        names = list(self.cfg.std_label_names)
+        index = names.index(self.cfg.route_label)
+        done = (terminated | truncated).reshape(-1, 1).to(torch.bool)
+        if start_labels is None or self._std_labels is None:
+            success = torch.zeros_like(done)
+        else:
+            start = start_labels.reshape(-1, 1)
+            after = self._std_labels.reshape(-1, 1)
+            success = (start == index) & (after > index) & (after < len(names))
+        end = success | done
+        return success.to(torch.float32), end, torch.zeros_like(end), success.reshape(-1).to(torch.float32)
+
+    def _record_outcomes(self, infos: Any, terminated: torch.Tensor, truncated: torch.Tensor, outcome=None) -> None:
+        """Record the outcome of every episode that ended this step and give those envs new episode ids
+        (``outcome``: the per-env outcomes to record, e.g. a route's local ones; None reads ``outcome_metric``)."""
         done = (terminated.reshape(-1) | truncated.reshape(-1)).to(self.device)
         if not bool(done.any()):
             return
-        channel = infos.get("episode_metrics_to_log") if isinstance(infos, dict) else None
-        value = channel.get(self.cfg.outcome_metric) if isinstance(channel, dict) else None
-        if value is None:
-            raise RuntimeError(
-                f"sac.success_clone_weight / failure_anchor_weight: an episode ended but infos carry no "
-                f"episode_metrics_to_log['{self.cfg.outcome_metric}']"
-            )
-        outcome = (torch.as_tensor(value, device=self.device).reshape(-1) > 0.5).to(torch.float32)
+        if outcome is None:
+            channel = infos.get("episode_metrics_to_log") if isinstance(infos, dict) else None
+            value = channel.get(self.cfg.outcome_metric) if isinstance(channel, dict) else None
+            if value is None:
+                raise RuntimeError(
+                    f"sac.success_clone_weight / failure_anchor_weight: an episode ended but infos carry no "
+                    f"episode_metrics_to_log['{self.cfg.outcome_metric}']"
+                )
+            outcome = (torch.as_tensor(value, device=self.device).reshape(-1) > 0.5).to(torch.float32)
+        outcome = outcome.to(self.device)
         ids = self._env_episode[done]
         need = int(ids.max()) + 1 + int(done.sum())
         if need > self._outcomes.numel():
             grown = torch.full((max(need, 2 * self._outcomes.numel()),), -1.0, device=self.device)
             grown[: self._outcomes.numel()] = self._outcomes
             self._outcomes = grown
+            if self._graphs is not None:
+                self._graphs.clear()  # the captured steps read the old table
         self._outcomes[ids] = outcome[done]
         fresh = torch.arange(self._next_episode, self._next_episode + int(done.sum()), device=self.device)
         self._env_episode[done] = fresh
@@ -762,6 +1031,23 @@ class SAC(LearnerBase):
         return out
 
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
+        if self._warming_up() and not self.cfg.warmup_trains_critics:
+            return  # warmup_episodes: no update until the base's episodes have finished
+        if not self._online_rows_ready():
+            return  # learning_starts_rows: not yet this much of its own data
+        if self.cfg.route_clock:
+            # this residual's own steps only: nothing while its phase is not running
+            if not getattr(self, "_route_step_now", False):
+                return
+            clock = self._route_steps - 1
+            since_start = clock - int(self.cfg.learning_starts)
+            if since_start >= 0 and since_start % int(self.cfg.update_every) == 0:
+                self.enable_models_training_mode(True)
+                self.update(timestep=timestep, timesteps=timesteps)
+                self.enable_models_training_mode(False)
+            self._maybe_periodic_reset(timestep)
+            self._maybe_retrain(clock, timesteps, logged_at=timestep)
+            return
         # learning_starts is the first update of anything (the critics); the actor joins at
         # policy_learning_starts. From there one round of gradient_steps every update_every
         # env steps (policy_delay keeps counting gradient steps)
@@ -771,16 +1057,20 @@ class SAC(LearnerBase):
             self.update(timestep=timestep, timesteps=timesteps)
             self.enable_models_training_mode(False)
         self._maybe_periodic_reset(timestep)
+        self._maybe_retrain(timestep, timesteps)
 
     # ------------------------------------------------------------------ losses
     def _target_min(self, target_qs: torch.Tensor, rows: int) -> torch.Tensor:
         """Min over the target critics ``(critics, agents * rows, 1)``: all of them, or a random
         ``critic_subset`` per agent."""
         subset = int(self.cfg.critic_subset)
-        if subset == self._num_critics:
+        if subset == self._num_critics and not self.cfg.critic_subset_replacement:
             return target_qs.min(dim=0).values  # draws nothing
         per_agent = target_qs.view(self._num_critics, self.num_agents, rows, -1).permute(1, 0, 2, 3)
-        chosen = torch.argsort(torch.rand(self.num_agents, self._num_critics, device=self.device), dim=1)[:, :subset]
+        if self.cfg.critic_subset_replacement:
+            chosen = torch.randint(0, self._num_critics, (self.num_agents, subset), device=self.device)
+        else:
+            chosen = torch.argsort(torch.rand(self.num_agents, self._num_critics, device=self.device), dim=1)[:, :subset]
         index = chosen[:, :, None, None].expand(-1, -1, rows, per_agent.shape[-1])
         return per_agent.gather(1, index).min(dim=1).values.reshape(self.num_agents * rows, -1)
 
@@ -889,6 +1179,10 @@ class SAC(LearnerBase):
         """``alpha * log_pi - Q``, with Q the min (or mean, ``actor_q_reduction``) over the
         critics. ``cross_batch_value``: the actor runs on ``s ++ s'`` and the loss reads the
         current half (FlashSAC's update_actor)."""
+        if self.cfg.reference_dropout > 0:
+            inputs = {**inputs, "observations": self._drop_reference(inputs["observations"])}
+            if next_inputs is not None:
+                next_inputs = {**next_inputs, "observations": self._drop_reference(next_inputs["observations"])}
         if self.cfg.cross_batch_value:
             both = {
                 **inputs,
@@ -915,16 +1209,68 @@ class SAC(LearnerBase):
         q = q_pi.mean(dim=0) if self.cfg.actor_q_reduction == "mean" else q_pi.min(dim=0).values
         entropy = self.expand_per_agent(self._entropy_coefficient, rows)
         q_term = q
+        # demo_storage: memory_critic: the actor's rows are the online ones (1), never the demos (0)
+        online = (1.0 - sampled["is_demo"]).reshape(-1, 1) if sampled is not None and "is_demo" in sampled else None
         if self.cfg.actor_q_scale is not None:
             # TD3+BC's lambda = scale / mean|Q|, per agent, no gradient through it
-            mean_abs = q.detach().abs().view(self.num_agents, rows).mean(dim=1).clamp(min=1e-6)
+            if online is None:
+                mean_abs = q.detach().abs().view(self.num_agents, rows).mean(dim=1).clamp(min=1e-6)
+            else:
+                weights = online.view(self.num_agents, rows)
+                mean_abs = ((q.detach().abs().view(self.num_agents, rows) * weights).sum(dim=1)
+                            / weights.sum(dim=1).clamp(min=1.0)).clamp(min=1e-6)
             q_term = q * self.expand_per_agent((float(self.cfg.actor_q_scale) / mean_abs).unsqueeze(-1), rows)
-        policy_loss = (entropy * log_prob - q_term).mean()
+        if online is None:
+            policy_loss = (entropy * log_prob - q_term).mean()
+        else:
+            per_row = (entropy * log_prob - q_term).view(self.num_agents, rows)
+            weights = online.view(self.num_agents, rows)
+            policy_loss = ((per_row * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)).mean()
+        if self.cfg.action_l2_weight > 0:
+            # action_l2_weight: the actor's mean action pulled toward zero (per-dim mean of its square)
+            per_row = outputs["mean_actions"].pow(2).mean(dim=-1).view(self.num_agents, rows)
+            if online is None:
+                l2 = per_row.mean(dim=1)
+            else:
+                weights = online.view(self.num_agents, rows)
+                l2 = (per_row * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+            policy_loss = policy_loss + float(self.cfg.action_l2_weight) * l2.mean()
+            outputs = {**outputs, "parts_metrics": {**outputs.get("parts_metrics", {}), "actor/action_l2": l2.detach()}}
         if getattr(self, "_track_outcomes", False):
             extra, metrics = self._parts_terms(sampled, outputs["mean_actions"], rows)
             policy_loss = policy_loss + extra
+            # the Q term's size in the actor loss, beside the clone and anchor terms (each agent's batch mean)
+            metrics = {**outputs.get("parts_metrics", {}), **metrics, "actor/q_term": q_term.detach().view(self.num_agents, rows).mean(dim=1)}
+            if online is not None:
+                metrics["actor/demo_rows"] = 1.0 - online.view(self.num_agents, rows).mean(dim=1)
             outputs = {**outputs, "parts_metrics": metrics}
+        if self.cfg.demo_actor_clone and self._demo is not None:
+            clone, value = self._demo_clone_term(rows)
+            policy_loss = policy_loss + clone
+            outputs = {**outputs, "parts_metrics": {**outputs.get("parts_metrics", {}), "actor/demo_clone_loss": value}}
         return policy_loss, actions, log_prob, q, outputs
+
+    def _drop_reference(self, observations: torch.Tensor) -> torch.Tensor:
+        """``reference_dropout``: the last ``reference_columns`` columns zeroed in that fraction of the rows."""
+        columns = int(self.cfg.reference_columns)
+        dropped = torch.rand(observations.shape[0], 1, device=observations.device) < float(self.cfg.reference_dropout)
+        mask = torch.ones_like(observations)
+        mask[:, -columns:] = (~dropped).to(observations.dtype)
+        return observations * mask
+
+    def _demo_clone_term(self, rows: int):
+        """``demo_actor_clone``: PARTS' clone term on the demos, which are successes: ``success_clone_weight *
+        mean ||a_mean(s_demo) - clip(a_demo, -1, 1)||^2`` over ``rows`` demo rows drawn per agent (each agent its
+        own). Returns ``(loss, per-agent value)``."""
+        demo_rows = next(iter(self._demo.values())).shape[0]
+        index = torch.randint(0, demo_rows, (self.num_agents, rows), device=self.device).reshape(-1)
+        observations = self.normalize_observations(self._demo["observations"][index])
+        with self._batch_mode(self.policy, True):
+            _, outputs = self.policy.act({"observations": observations}, role="policy")
+        target = self._demo["actions"][index].clamp(-1.0, 1.0)
+        per_row = (outputs["mean_actions"] - target).pow(2).sum(dim=-1).view(self.num_agents, rows)
+        value = per_row.mean(dim=1)
+        return float(self.cfg.success_clone_weight) * value.mean(), value.detach()
 
     def _parts_terms(self, sampled, mean_actions: torch.Tensor, rows: int):
         """PARTS' eq. 4 terms, per agent over its batch rows of finished episodes: ``success_clone_weight *
@@ -933,8 +1279,19 @@ class SAC(LearnerBase):
         outcome = self._outcomes[sampled["episode_ids"].reshape(-1).long()].view(self.num_agents, rows)
         success = (outcome == 1.0).to(mean_actions.dtype)
         failure = (outcome == 0.0).to(mean_actions.dtype)
-        clone = (mean_actions - sampled["actions"]).pow(2).sum(dim=-1).view(self.num_agents, rows)
-        anchor = mean_actions.pow(2).sum(dim=-1).view(self.num_agents, rows)
+        for flag in ("is_demo", "_parts_skip"):  # demo rows: in neither term ...
+            if flag in sampled:
+                demo_row = sampled[flag].view(self.num_agents, rows).to(mean_actions.dtype)
+                success, failure = success * (1.0 - demo_row), failure * (1.0 - demo_row)
+                if flag == "_parts_skip" and self.cfg.clone_demo_rows:
+                    success = success + demo_row  # ... or, clone_demo_rows, successes to clone
+        stored = sampled["actions"]
+        if not self.cfg.unsquashed_actor:
+            # a squashed actor reaches [-1, 1]; only demo rows (demo_storage: memory) lie beyond it
+            stored = stored.clamp(-1.0, 1.0)
+        reduce = torch.mean if self.cfg.parts_term_reduction == "mean" else torch.sum
+        clone = reduce((mean_actions - stored).pow(2), dim=-1).view(self.num_agents, rows)
+        anchor = reduce(mean_actions.pow(2), dim=-1).view(self.num_agents, rows)
         clone_mean = (clone * success).sum(dim=1) / success.sum(dim=1).clamp(min=1.0)
         anchor_mean = (anchor * failure).sum(dim=1) / failure.sum(dim=1).clamp(min=1.0)
         loss = (float(self.cfg.success_clone_weight) * clone_mean + float(self.cfg.failure_anchor_weight) * anchor_mean).mean()
@@ -988,18 +1345,23 @@ class SAC(LearnerBase):
 
     def _update(self, *, timestep: int, timesteps: int) -> None:
         rows = self.cfg.batch_size  # per agent; the memory returns N * batch_size rows
-        if self.cfg.store_labels and int(self.memory.size) == 0:
+        if (self.cfg.store_labels or self.cfg.route_label) and int(self.memory.size) == 0:
             return  # no transition of a stored phase yet for some agent: nothing to learn from
-        policy_on = timestep >= self._policy_learning_starts()
+        # warmup_trains_critics: the actor stays frozen until the warm-up episodes have ended
+        policy_on = timestep >= self._policy_learning_starts() and not self._warming_up()
+        if policy_on and self.cfg.demo_storage == "memory_critic" and not self._online_rows_available():
+            policy_on = False  # only demos so far: the critics train, the actor waits for its own data
         demo_on = self._demo_active(timestep)
         # a graph replays fixed shapes: a mixed batch's online share is fixed only once the
         # memory holds half a batch; aux losses are captured only when every term is graph-safe
-        # (losses.terms[*].graph_safe), the others run eagerly
+        # (losses.terms[*].graph_safe), the others run eagerly. Per-agent fills (store_labels,
+        # route_label, demos in the memory) sample with device-side bounds (sync_size); a
+        # memory_critic memory that has wrapped samples its online rows by flag, eagerly
         graph = (
             self._graphs is not None
-            and not self.cfg.store_labels  # per-agent fills: the plain sampler
             and self.aux_loss_graph_safe()
             and (not demo_on or int(self.memory.size) >= rows // 2)
+            and not (self.cfg.demo_storage == "memory_critic" and self._memory_wrapped())
         )
         if graph:
             self.memory.sync_size()
@@ -1036,10 +1398,20 @@ class SAC(LearnerBase):
         Polyak step. Device work only (no host sync, every state written in place), so it can
         be captured as a CUDA graph. Returns the tensors the metrics are built from."""
         demo_on, policy_on, actor_step = mode
-        # outside the demo window one online batch serves both losses, as in classic SAC;
-        # inside it the critic's batch is mixed and the actor's stays online
-        online = self._sample(rows, graph) if (policy_on or not demo_on) else None
-        sampled = self._mixed_batch(rows, graph) if demo_on else online
+        if self.cfg.demo_storage == "memory_critic":
+            # the critics sample the whole memory, demos included; the actor its own full batch of online rows
+            sampled = self._sample(rows, graph)
+            online = self._sample_online(rows, graph) if actor_step else sampled
+        else:
+            # outside the demo window one online batch serves both losses, as in classic SAC;
+            # inside it the critic's batch is mixed and the actor's stays online -- or, with
+            # demo_batch_shared, the actor takes the same mixed batch (RLPD)
+            if demo_on and self.cfg.demo_batch_shared:
+                sampled = self._mixed_batch(rows, graph)
+                online = sampled
+            else:
+                online = self._sample(rows, graph) if (policy_on or not demo_on) else None
+                sampled = self._mixed_batch(rows, graph) if demo_on else online
         inputs, next_inputs, critic_inputs, critic_next_inputs = self._batch_inputs(sampled)
 
         critic_loss, critic_1_values, critic_2_values, target_values, next_log_prob, critic_ce = self._compute_critic_loss(
@@ -1230,6 +1602,13 @@ class SAC(LearnerBase):
                 "lr/actor": self.policy_optimizer.lr.to(torch.float32),
                 "lr/critic": self.critic_optimizer.lr.to(torch.float32),
             }
+            if self.cfg.route_label:
+                # how much practice this residual has had: the agent steps that started in its phase (an agent step is
+                # residual.steps_per_chunk env steps), its replay rows (demos included) and its gradient updates
+                metrics["route/steps"] = torch.full((self.num_agents,), float(getattr(self, "_route_steps", 0)), device=self.device)
+                sizes = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
+                metrics["route/memory_rows"] = torch.tensor([float(v) for v in sizes], device=self.device)
+                metrics["route/updates"] = torch.full((self.num_agents,), float(self._updates), device=self.device)
             if self.return_scaler is not None:
                 # what the critics' rewards are divided by (adaptive_reward_scaling)
                 metrics["reward/scale_denominator"] = self.return_scaler.denominator.reshape(-1).clone()
@@ -1257,6 +1636,42 @@ class SAC(LearnerBase):
             self.emit_per_agent(metrics, timestep)
 
     # ------------------------------------------------------------------ SimBa periodic reset
+    def _maybe_retrain(self, timestep: int, timesteps: int, logged_at: Optional[int] = None) -> None:
+        """``retrain_every``: PARTS' success-reweighted retraining (see the field's doc). ``timestep`` is the clock it
+        counts (``route_clock``: this residual's own steps), ``logged_at`` the env step its metric goes out at."""
+        every = int(self.cfg.retrain_every)
+        if not every or timestep <= 0 or timestep % every or int(self.memory.size) == 0:
+            return
+        if logged_at is not None:
+            print(f"[sac] {self.cfg.route_label}: retraining at its own step {timestep} (env step {logged_at})", flush=True)
+            timestep = logged_at
+        size = max(self.memory._agent_size) if self.memory._agent_size is not None else int(self.memory.size)
+        ids = self.memory.get_tensor_by_name("episode_ids")[:, :size, 0].long()
+        outcome = self._outcomes[ids.clamp(min=0)]
+        # each failed episode is kept whole or dropped whole, drawn once per episode id
+        draw = torch.rand(self._outcomes.numel(), device=self.device) < float(self.cfg.retrain_failure_fraction)
+        keep = (outcome == 1.0) | (outcome == -1.0) | ((outcome == 0.0) & draw[ids.clamp(min=0)])
+        before = [int(n) for n in (self.memory._agent_size or [self.memory.size] * self.num_agents)]
+        kept = self.memory.keep_rows(keep)
+        print(f"[sac] retrain at step {timestep}: memory {before} -> {kept} rows (every success, "
+              f"{self.cfg.retrain_failure_fraction:.0%} of the failed episodes); fresh networks, "
+              f"{self.cfg.retrain_gradient_steps} offline updates", flush=True)
+        self._periodic_reset()  # fresh networks (weight-normalized as at build), optimizers and temperature
+        if self.memory.size == 0:
+            return
+        rows = self.cfg.batch_size
+        self.enable_models_training_mode(True)
+        for _ in range(int(self.cfg.retrain_gradient_steps)):
+            self._set_learning_rates(timesteps)
+            actor_step = (self._updates + 1) % self.cfg.policy_delay == 0
+            demo_on = self._demo_active(timestep)
+            self._gradient_step((demo_on, True, actor_step), rows, timestep, graph=False)
+            self._updates += 1
+        self.enable_models_training_mode(False)
+        self.emit_per_agent(
+            {"retrain/kept_rows": torch.tensor(kept, dtype=torch.float32, device=self.device)}, timestep
+        )
+
     def _maybe_periodic_reset(self, timestep: int) -> None:
         cfg = self.cfg
         if not cfg.periodic_reset_enabled or timestep <= 0:

@@ -238,7 +238,7 @@ def valid_fields(**overrides) -> dict:
         ({"min_log_std": 2.0, "max_log_std": 2.0}, "min_log_std"),
         ({"num_layers": 0}, "num_layers"),
         ({"hidden_size": 0}, "hidden_size"),
-        ({"init": "xavier"}, "init"),
+        ({"init": "he"}, "init"),
         ({"output_init_scale": 0.0}, "output_init_scale"),
         ({"activation": "Swish"}, "activation"),
     ],
@@ -257,3 +257,38 @@ def test_edge_values_the_rules_allow():
 def test_the_actor_refuses_selection_dims_and_points_at_simba():
     with pytest.raises(ValueError, match="simba"):
         MlpActor(box(OBS_DIM), box(ACT_DIM), "cpu", num_agents=1, pos_component_dims=[0], force_component_dims=[1], selection_names=["x"])
+
+
+def test_serl_layers_are_linear_layernorm_tanh_with_xavier_init():
+    from robonuke_rl_core.models.mlp import MlpActorNet, MlpQCriticNet
+
+    torch.manual_seed(0)
+    actor = MlpActorNet(obs_dim=5, action_dim=3, hidden_size=16, num_layers=2, activation="Tanh", init="xavier",
+                        output_init_scale=1.0, init_log_std=0.0, learn_std=True, use_state_dependent_std=True,
+                        log_std_bound="clip", min_log_std=math.log(1e-5), max_log_std=math.log(5.0), layer_norm=True)
+    kinds = [type(m).__name__ for m in actor.trunk]
+    assert kinds == ["Linear", "LayerNorm", "Tanh", "Linear", "LayerNorm", "Tanh"]
+    critic = MlpQCriticNet(5, 3, 16, 2, "Tanh", "xavier", 1.0, 1, True)
+    assert [type(m).__name__ for m in critic.trunk] == kinds
+    # xavier-uniform: every weight inside +-sqrt(6 / (fan_in + fan_out)), biases zero (the log std head's too: std 1)
+    for linear in [actor.trunk[0], actor.trunk[3], actor.mean, actor.log_std_head, critic.out]:
+        bound = math.sqrt(6.0 / (linear.in_features + linear.out_features))
+        assert float(linear.weight.abs().max()) <= bound + 1e-6
+        assert float(linear.weight.abs().max()) > 0.5 * bound
+        assert torch.all(linear.bias == 0)
+    # without layer_norm nothing changes
+    plain = MlpQCriticNet(5, 3, 16, 2, "ReLU", "orthogonal", 1.0)
+    assert [type(m).__name__ for m in plain.trunk] == ["Linear", "ReLU", "Linear", "ReLU"]
+
+
+def test_layer_norm_reaches_the_models_through_the_config():
+    cfg = MlpModelCfg(actor=MlpActorCfg(hidden_size=8, num_layers=1, layer_norm=True, init="xavier"),
+                      critic=MlpCriticCfg(hidden_size=8, num_layers=1, layer_norm=True, init="xavier"))
+    cfg.validate(None)
+    space = gymnasium.spaces.Box(-np.inf, np.inf, (4,), np.float32)
+    models = build_models("sac", cfg, space, None, gymnasium.spaces.Box(-1, 1, (2,), np.float32), 1, "cpu", None, num_critics=2)
+    for name in ("policy", "critics"):
+        # the ensemble stacks the template's parameters: trunk[1] is the LayerNorm (weight starts at 1)
+        params = dict(models[name].named_parameters())
+        assert torch.all(params["net.trunk__1__weight"] == 1.0), name
+        assert params["net.trunk__1__weight"].shape[-1] == 8

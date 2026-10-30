@@ -13,6 +13,9 @@ the residual-RL papers build theirs and configured in ``models/cfg.py``
   SAC actor and critics, a state-dependent log std bounded softly,
   ``min + 0.5 (max - min) (tanh(x) + 1)`` on [-20, 2] (``use_state_dependent_std: true``,
   ``log_std_bound: tanh``).
+* **SERL** (Luo et al., 2024, https://arxiv.org/abs/2401.16013; ``serl_launcher``'s ``MLP``): 2 x 256
+  Linear -> LayerNorm -> tanh actor and critics, xavier-uniform layers, a state-dependent log std
+  head (``layer_norm: true``, ``activation: Tanh``, ``init: xavier``).
 
 Same two layers as SimBa: ``MlpActorNet`` / ``MlpQCriticNet`` / ``MlpValueCriticNet`` are
 plain single-agent ``nn.Module``s returning raw tensors (no sampling, no in-place buffer
@@ -51,9 +54,10 @@ __all__ = [
 ]
 
 #: hidden-layer initializations: ``orthogonal`` (gain sqrt(2), the CleanRL / Policy Decorator
-#: convention) or ``kaiming`` (``kaiming_normal_`` fan-in, ResiP's ``layer_init``); biases are
-#: zero, and the output layer is orthogonal with the configured gain either way
-INITS = ("orthogonal", "kaiming")
+#: convention), ``kaiming`` (``kaiming_normal_`` fan-in, ResiP's ``layer_init``) -- the output
+#: layer orthogonal with the configured gain -- or ``xavier`` (SERL's ``default_init``,
+#: ``xavier_uniform`` on every layer, the output layers' with the configured gain); biases zero
+INITS = ("orthogonal", "kaiming", "xavier")
 #: how the log std is kept in ``[min_log_std, max_log_std]``: a hard ``clip``, the soft
 #: ``tanh`` map ``min + 0.5 (max - min) (tanh(x) + 1)``, or ``none``
 LOG_STD_BOUNDS = ("clip", "tanh", "none")
@@ -102,6 +106,7 @@ def check_mlp_actor_fields(
     min_log_std: float,
     max_log_std: float,
     squash: bool,
+    layer_norm: bool = False,
 ) -> None:
     """The actor's rules, shared by the config's ``validate`` and the model's constructor."""
     check_mlp_critic_fields(prefix, hidden_size, num_layers, activation, init, output_init_scale)
@@ -132,24 +137,31 @@ def _init_hidden(linear: nn.Linear, init: str) -> None:
         nn.init.orthogonal_(linear.weight, math.sqrt(2.0))
     elif init == "kaiming":
         nn.init.kaiming_normal_(linear.weight, mode="fan_in", nonlinearity="relu")
+    elif init == "xavier":
+        nn.init.xavier_uniform_(linear.weight)
     else:
         raise ValueError(f"init must be one of {INITS}, got {init!r}")
     nn.init.zeros_(linear.bias)
 
 
-def _init_output(linear: nn.Linear, scale: float) -> None:
-    """ResiP's and CleanRL's output layer: orthogonal with gain ``scale``, zero bias."""
-    nn.init.orthogonal_(linear.weight, float(scale))
+def _init_output(linear: nn.Linear, scale: float, init: str = "orthogonal") -> None:
+    """The output layer, zero bias: ResiP's and CleanRL's orthogonal with gain ``scale``, or (``init: xavier``)
+    SERL's xavier-uniform with that gain."""
+    if init == "xavier":
+        nn.init.xavier_uniform_(linear.weight, float(scale))
+    else:
+        nn.init.orthogonal_(linear.weight, float(scale))
     nn.init.zeros_(linear.bias)
 
 
-def _trunk(in_dim: int, hidden_size: int, num_layers: int, activation: str, init: str) -> nn.Sequential:
+def _trunk(in_dim: int, hidden_size: int, num_layers: int, activation: str, init: str, layer_norm: bool = False) -> nn.Sequential:
+    """``num_layers`` x (Linear [-> LayerNorm] -> activation); ``layer_norm`` is SERL's ``use_layer_norm``."""
     layers = []
     width = in_dim
     for _ in range(num_layers):
         linear = nn.Linear(width, hidden_size)
         _init_hidden(linear, init)
-        layers += [linear, activation_module(activation)]
+        layers += [linear] + ([nn.LayerNorm(hidden_size)] if layer_norm else []) + [activation_module(activation)]
         width = hidden_size
     return nn.Sequential(*layers)
 
@@ -191,11 +203,12 @@ class MlpActorNet(nn.Module):
         log_std_bound: str,
         min_log_std: float,
         max_log_std: float,
+        layer_norm: bool = False,
     ) -> None:
         super().__init__()
-        self.trunk = _trunk(obs_dim, hidden_size, num_layers, activation, init)
+        self.trunk = _trunk(obs_dim, hidden_size, num_layers, activation, init, layer_norm)
         self.mean = nn.Linear(hidden_size, action_dim)
-        _init_output(self.mean, output_init_scale)
+        _init_output(self.mean, output_init_scale, init)
         self.use_state_dependent_std = bool(use_state_dependent_std)
         self.log_std_bound = str(log_std_bound)
         self.min_log_std = float(min_log_std)
@@ -204,7 +217,7 @@ class MlpActorNet(nn.Module):
         if self.use_state_dependent_std:
             # the std head starts at the configured sigma for every state
             self.log_std_head = nn.Linear(hidden_size, action_dim)
-            _init_output(self.log_std_head, output_init_scale)
+            _init_output(self.log_std_head, output_init_scale, init)
             with torch.no_grad():
                 self.log_std_head.bias.fill_(raw)
             self.log_std = None
@@ -230,11 +243,11 @@ class MlpActorNet(nn.Module):
 class MlpQCriticNet(nn.Module):
     """Q(observation, action) -> scalar, or ``outputs`` logits of a categorical Q."""
 
-    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int, num_layers: int, activation: str, init: str, output_init_scale: float, outputs: int = 1) -> None:
+    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int, num_layers: int, activation: str, init: str, output_init_scale: float, outputs: int = 1, layer_norm: bool = False) -> None:
         super().__init__()
-        self.trunk = _trunk(obs_dim + action_dim, hidden_size, num_layers, activation, init)
+        self.trunk = _trunk(obs_dim + action_dim, hidden_size, num_layers, activation, init, layer_norm)
         self.out = nn.Linear(hidden_size, outputs)
-        _init_output(self.out, output_init_scale)
+        _init_output(self.out, output_init_scale, init)
 
     def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         return self.out(self.trunk(torch.cat([observations, actions], dim=-1)))
@@ -243,11 +256,11 @@ class MlpQCriticNet(nn.Module):
 class MlpValueCriticNet(nn.Module):
     """V(observation) -> scalar."""
 
-    def __init__(self, obs_dim: int, hidden_size: int, num_layers: int, activation: str, init: str, output_init_scale: float) -> None:
+    def __init__(self, obs_dim: int, hidden_size: int, num_layers: int, activation: str, init: str, output_init_scale: float, layer_norm: bool = False) -> None:
         super().__init__()
-        self.trunk = _trunk(obs_dim, hidden_size, num_layers, activation, init)
+        self.trunk = _trunk(obs_dim, hidden_size, num_layers, activation, init, layer_norm)
         self.out = nn.Linear(hidden_size, 1)
-        _init_output(self.out, output_init_scale)
+        _init_output(self.out, output_init_scale, init)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.out(self.trunk(observations))
@@ -277,6 +290,7 @@ class MlpActor(EnsembleModel, GaussianMixin, Model):
         min_log_std: float = -20.0,
         max_log_std: float = 2.0,
         squash: bool = True,
+        layer_norm: bool = False,
         **layout,
     ) -> None:
         if layout:
@@ -318,6 +332,7 @@ class MlpActor(EnsembleModel, GaussianMixin, Model):
                 log_std_bound=str(log_std_bound),
                 min_log_std=float(min_log_std),
                 max_log_std=float(max_log_std),
+                layer_norm=bool(layer_norm),
             )
 
         self.net = VmapEnsemble(build, num_agents, device=device)
@@ -377,6 +392,7 @@ class MlpQCritic(EnsembleModel, DeterministicMixin, Model):
         output_init_scale: float = 1.0,
         members: int = 1,
         outputs: int = 1,
+        layer_norm: bool = False,
     ) -> None:
         check_mlp_critic_fields("model.critic", hidden_size, num_layers, activation, init, output_init_scale)
         if outputs < 1:
@@ -390,7 +406,7 @@ class MlpQCritic(EnsembleModel, DeterministicMixin, Model):
         def build() -> nn.Module:
             return MlpQCriticNet(
                 self.num_observations, self.num_actions, int(hidden_size), int(num_layers),
-                str(activation), str(init), float(output_init_scale), int(outputs),
+                str(activation), str(init), float(output_init_scale), int(outputs), bool(layer_norm),
             )
 
         self.net = VmapEnsemble(build, num_agents, device=device, members=members)
@@ -413,6 +429,7 @@ class MlpValueCritic(EnsembleModel, DeterministicMixin, Model):
         activation: str = "ReLU",
         init: str = "orthogonal",
         output_init_scale: float = 1.0,
+        layer_norm: bool = False,
     ) -> None:
         check_mlp_critic_fields("model.critic", hidden_size, num_layers, activation, init, output_init_scale)
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -422,7 +439,7 @@ class MlpValueCritic(EnsembleModel, DeterministicMixin, Model):
         def build() -> nn.Module:
             return MlpValueCriticNet(
                 self.num_observations, int(hidden_size), int(num_layers), str(activation), str(init),
-                float(output_init_scale),
+                float(output_init_scale), bool(layer_norm),
             )
 
         self.net = VmapEnsemble(build, num_agents, device=device)

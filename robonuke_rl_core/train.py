@@ -89,64 +89,88 @@ def main(argv=None, setup=None) -> int:
         from robonuke_rl_core.learners.sac import critic_action_space, critic_action_transform
 
         transform = critic_action_transform(cfg, env)
-    models = build_models(
-        learner_name,
-        cfg.model,
-        env.observation_space,
-        state_space,
-        env.action_space,
-        num_agents,
-        env.device,
-        controller_cfg,
-        num_critics=int(learner_cfg.num_critics) if learner_name == "sac" else 2,
-        critic_outputs=sac_critic_outputs(learner_cfg) if learner_name == "sac" else 1,
-        critic_action_space=critic_action_space(transform, env.action_space) if transform is not None else None,
-    )
+    def make_learner(learner_cfg, dirs):
+        """One learner of ``learner_cfg`` with its own models, memory and optimizers (a routed SAC builds one per
+        phase)."""
+        models = build_models(
+            learner_name,
+            cfg.model,
+            env.observation_space,
+            state_space,
+            env.action_space,
+            num_agents,
+            env.device,
+            controller_cfg,
+            num_critics=int(learner_cfg.num_critics) if learner_name == "sac" else 2,
+            critic_outputs=sac_critic_outputs(learner_cfg) if learner_name == "sac" else 1,
+            critic_action_space=critic_action_space(transform, env.action_space) if transform is not None else None,
+        )
 
-    # transitions per agent: PPO holds one rollout, SAC holds what the config asks for
-    capacity = (
-        int(learner_cfg.rollouts) * (total_envs // num_agents)
-        if learner_name == "ppo"
-        else int(cfg.memory.memory_size)
-    )
-    memory = MultiRandomMemory(
-        capacity=capacity, num_envs=total_envs, num_agents=num_agents, device=env.device
-    )
+        # transitions per agent: PPO holds one rollout, SAC holds what the config asks for
+        capacity = (
+            int(learner_cfg.rollouts) * (total_envs // num_agents)
+            if learner_name == "ppo"
+            else int(cfg.memory.memory_size)
+        )
+        memory = MultiRandomMemory(
+            capacity=capacity, num_envs=total_envs, num_agents=num_agents, device=env.device
+        )
 
-    extra = (
-        {
-            "model_cfg": cfg.model,
-            "controller_cfg": controller_cfg,
-            "critic_action_space": critic_action_space(transform, env.action_space) if transform is not None else None,
-        }
-        if learner_name == "sac"
-        else {}
-    )
-    learner = learners[learner_name](
-        models=models,
-        memory=memory,
-        observation_space=env.observation_space,
-        state_space=state_space,
-        action_space=env.action_space,
-        device=env.device,
-        cfg=learner_cfg,
-        trainer_cfg=cfg.trainer,
-        num_agents=num_agents,
-        num_envs=total_envs,
-        run_dirs=dirs,
-        **extra,
-    )
+        extra = (
+            {
+                "model_cfg": cfg.model,
+                "controller_cfg": controller_cfg,
+                "critic_action_space": critic_action_space(transform, env.action_space) if transform is not None else None,
+            }
+            if learner_name == "sac"
+            else {}
+        )
+        learner = learners[learner_name](
+            models=models,
+            memory=memory,
+            observation_space=env.observation_space,
+            state_space=state_space,
+            action_space=env.action_space,
+            device=env.device,
+            cfg=learner_cfg,
+            trainer_cfg=cfg.trainer,
+            num_agents=num_agents,
+            num_envs=total_envs,
+            run_dirs=dirs,
+            **extra,
+        )
 
-    if learner_name == "sac":
-        # set before the trainer's init(): the memory stores the transform's side inputs
-        learner.critic_action_transform = transform
-        if learner.critic_action_transform is not None:
-            print("[train] critics take a registered action transform (register_critic_action)", flush=True)
+        if learner_name == "sac":
+            # set before the trainer's init(): the memory stores the transform's side inputs
+            learner.critic_action_transform = transform
+            if learner.critic_action_transform is not None:
+                print("[train] critics take a registered action transform (register_critic_action)", flush=True)
 
-    aux = build_aux_losses(cfg.losses, num_agents)
-    if aux is not None:
-        learner.aux_loss.append(aux)
-        print(f"[train] aux losses: {[t.name for t in cfg.losses.terms]}", flush=True)
+        aux = build_aux_losses(cfg.losses, num_agents)
+        if aux is not None:
+            learner.aux_loss.append(aux)
+            print(f"[train] aux losses: {[t.name for t in cfg.losses.terms]}", flush=True)
+        return learner
+
+    routes = list(learner_cfg.route_labels) if learner_name == "sac" else []
+    if routes:
+        # PARTS' per-phase residuals (sac.route_labels): one SAC per phase, its own run directory per agent
+        import copy
+
+        from robonuke_rl_core.learners.routed import RoutedSAC
+
+        routed = {}
+        for route in routes:
+            route_cfg = copy.deepcopy(learner_cfg)
+            route_cfg.route_label = route
+            route_cfg.route_labels = []
+            if route_cfg.demo_transitions and "{route}" in str(route_cfg.demo_transitions):
+                route_cfg.demo_transitions = str(route_cfg.demo_transitions).format(route=route)
+            routed[route] = make_learner(route_cfg, [d / route for d in dirs])
+        learner = RoutedSAC(routed, learner_cfg.std_label_names)
+        print(f"[train] routed SAC: one residual per phase {routes}", flush=True)
+    else:
+        learner = make_learner(learner_cfg, dirs)
 
     # one wandb run per agent, carrying exactly what resolved_config.yaml holds
     logger = WandbLogger.from_config(
@@ -155,9 +179,23 @@ def main(argv=None, setup=None) -> int:
         config_path=config_path,  # uploaded once, as a plain run file
         device=env.device,
     )
-    learner.on_log.append(logger)
-    learner.on_flush.append(logger.flush)
-    learner.on_checkpoint.append(logger.checkpoint)  # every checkpoint mirrors to its run
+    if routes:
+        from robonuke_rl_core.learners.routed import route_hook
+
+        last = routes[-1]
+        for index, (route, routed_learner) in enumerate(learner.learners.items()):
+            # env / episode metrics once, each residual's learner metrics under <phase>/
+            routed_learner.on_log.append(route_hook(logger, route, first=index == 0))
+            # uploaded as <phase>/checkpoints/<file>: the phases' checkpoints share file names
+            routed_learner.on_checkpoint.append(
+                lambda agent, step, path: logger.save_file(path, agent=agent, base_path=Path(path).parent.parent.parent)
+            )
+            if route == last:  # after every residual emitted its interval
+                routed_learner.on_flush.append(logger.flush)
+    else:
+        learner.on_log.append(logger)
+        learner.on_flush.append(logger.flush)
+        learner.on_checkpoint.append(logger.checkpoint)  # every checkpoint mirrors to its run
 
     print(f"[train] {learner_name}: {num_agents} agents x {total_envs // num_agents} envs", flush=True)
     print(f"[train] runs: {', '.join(str(d) for d in dirs)}")
