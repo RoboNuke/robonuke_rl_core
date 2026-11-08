@@ -326,7 +326,9 @@ class SACCfg(_CommonCfg):
     #: FlashSAC's noise repetition: while training, each agent's envs hold one Gaussian noise
     #: draw for k env steps, k drawn from a Zeta(noise_repeat_zeta_s) truncated at
     #: noise_repeat_max (P(k) ~ k^-s), then draw both afresh; the action is the policy's
-    #: ``tanh(mean + std * noise)``. The uniform ``random_timesteps`` actions are not held
+    #: ``tanh(mean + std * noise)`` (DDPG: ``mean + exploration_std * noise``, its exploration noise; the target
+    #: smoothing noise stays fresh every update). The uniform ``random_timesteps`` actions (DDPG: its warm-up's
+    #: random actions, either ``random_action_mode``) are not held
     noise_repeat: bool = False
     noise_repeat_zeta_s: float = 2.0
     noise_repeat_max: int = 16
@@ -379,12 +381,11 @@ class SACCfg(_CommonCfg):
     #: PARTS' per-phase residuals: one complete SAC (actor, critics, targets, optimizers, replay memory) per listed
     #: ``std_label_names`` label, all with this section's settings (``learners/routed.py``). Each env's action comes
     #: from the residual of the label its observation is in (zeros, the base alone, in an unlisted one); each residual
-    #: stores only the transitions starting in its label, rewarded by its local outcome: 1 when the next observation's
-    #: label is a LATER entry of ``std_label_names`` (the phase passed, or e.g. ``success``), its attempt then ending;
-    #: an episode ending first ends it with 0. Empty: one SAC for every step
+    #: stores only the transitions starting in its label, with the env's reward; a transition whose next observation is
+    #: in another label is stored as terminal. Empty: one SAC for every step
     route_labels: List[str] = field(default_factory=list)
-    #: set per residual by the routing (one of ``route_labels``); a SAC with it stores, rewards and ends its attempts
-    #: as described there. Not set by hand
+    #: set per residual by the routing (one of ``route_labels``); a SAC with it stores only the transitions starting in
+    #: its label. Not set by hand
     route_label: Optional[str] = None
     #: potential-based reward shaping (Ng et al. 1999), per routed residual: a list of ``{route, channel, weight}``
     #: (:class:`PotentialTermCfg`; ``route`` a route label, ``"*"`` for an unrouted SAC). Every stored transition's reward gains ``gamma Phi(s') - Phi(s)``
@@ -773,7 +774,7 @@ class DDPGCfg(SACCfg):
             "learn_entropy": self.learn_entropy, "backup_entropy": self.backup_entropy,
             "initial_entropy_value": self.initial_entropy_value != 0.0, "target_entropy": self.target_entropy is not None,
             "target_entropy_sigma": self.target_entropy_sigma is not None, "entropy_lr_schedule": self.entropy_lr_schedule,
-            "noise_repeat": self.noise_repeat, "unsquashed_actor": self.unsquashed_actor,
+            "unsquashed_actor": self.unsquashed_actor,
             "progressive_exploration_steps": self.progressive_exploration_steps > 0,
             "critic_distribution": self.critic_distribution != "scalar", "cross_batch_value": self.cross_batch_value,
             "periodic_reset_enabled": self.periodic_reset_enabled, "retrain_every": self.retrain_every > 0,

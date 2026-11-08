@@ -2,8 +2,8 @@
 pieces as options (``learners/cfg.py`` ``DDPGCfg``).
 
 The actor is deterministic, ``a = actor_action_scale * tanh(mu(s))`` (the model's squashed mean); exploration is
-Gaussian noise of a fixed, scheduled std added to it when acting (``exploration_std``), the action clamped to
-``action_clip``. The critics regress on
+Gaussian noise of a fixed, scheduled std added to it when acting (``exploration_std``; ``noise_repeat``: each agent's
+draw held for k ~ truncated Zeta steps, as SAC's), the action clamped to ``action_clip``. The critics regress on
 
     y = r + gamma^n * (1 - done) * reduce_target(Q'_k(s', a')),   a' = mu'(s') [+ clip(N(0, std), +-c)]
 
@@ -168,7 +168,10 @@ class DDPG(SAC):
                 return self._clamp(mean), {**outputs, "mean_actions": mean}
             std = self.exploration_std(timestep)
             self._explore_std.fill_(std)
-            noise = torch.randn_like(mean) * std
+            # noise_repeat: FlashSAC's held draw (each agent keeps one standard-normal draw for k ~ truncated Zeta
+            # steps), else a fresh one every step
+            draw = self._repeated_noise(rows, mean.shape[-1]) if self.cfg.noise_repeat else torch.randn_like(mean)
+            noise = draw * std
             if self.cfg.exploration_noise_clip is not None:
                 noise = noise.clamp(-float(self.cfg.exploration_noise_clip), float(self.cfg.exploration_noise_clip))
             actions = self._clamp(mean + noise)

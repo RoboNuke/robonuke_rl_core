@@ -1,12 +1,15 @@
 """PARTS-style per-phase residuals (``sac.route_labels``): one complete SAC per listed label, routed per env.
 
 Su et al., "From Pretraining to Proficiency" (arXiv:2609.21788): each bottleneck subtask of a long-horizon task gets its
-own residual policy, its own replay buffer and its own local reward. Here a "phase" is a ``sac.std_label_names`` label
-the env publishes for every observation (``sac.std_by_label``, e.g. one_leg's ``eval_state/phase/id``), and
-``sac.route_labels`` lists the phases that get a residual. Each is an ordinary :class:`~robonuke_rl_core.learners.sac.SAC`
-with every setting of the ``sac`` section and ``route_label`` set (its own actor, critics, targets, optimizers, replay
-memory; see :meth:`SAC._route_signals` for its local reward and attempt ends), so every SAC option (n-step, PARTS'
-terms, success-reweighted retraining, demos) applies to each residual separately.
+own residual policy, its own replay buffer and its own local reward (here the env's own rewards, e.g. its per-phase
+terms). Here a "phase" is a ``sac.std_label_names`` label the env publishes for every observation
+(``sac.std_by_label``, e.g. one_leg's ``eval_state/phase/id``), and ``sac.route_labels`` lists the phases that get a
+residual. Each is an ordinary :class:`~robonuke_rl_core.learners.sac.SAC` with every setting of the ``sac`` section and
+``route_label`` set (its own actor, critics, targets, optimizers, replay memory), so every SAC option (n-step, PARTS'
+terms, success-reweighted retraining, demos) applies to each residual separately. Routing decides only which residual
+acts, which memory a transition goes to, which residual updates and the per-phase logging: the env's rewards are stored
+as they are; a transition whose next observation is in another phase is stored as terminal (``phase_end``), the only
+change made to the env's data (a demo loader marks the same steps).
 
 :class:`RoutedSAC` is what the trainer drives: it hands every env step to every residual (each stores only the
 transitions starting in its own phase), and for each env takes the action of the residual of the phase its observation
@@ -105,9 +108,12 @@ class RoutedSAC:
         return actions, outputs
 
     def record_transition(self, *, infos, **kwargs) -> None:
-        for learner in self.learners.values():
-            learner.record_transition(infos=infos, **kwargs)
+        """Every residual sees the step (each stores only the transitions starting in its phase); a transition whose
+        next observation is in another phase is terminal (``phase_end``). Rewards and the env's flags pass as they are."""
         labels = self._labels_from(infos)
+        phase_end = self.phase_end(self._labels, labels, kwargs["terminated"])
+        for learner in self.learners.values():
+            learner.record_transition(infos=infos, phase_end=phase_end, **kwargs)
         if self.phase_logger is not None:
             # the phase each env's step started in, and the one it ended in
             self.phase_logger.observe(self._labels, labels, kwargs["rewards"], kwargs["terminated"], kwargs["truncated"],
@@ -125,6 +131,14 @@ class RoutedSAC:
             learner.forced_env_reset()
 
     # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def phase_end(start: Optional[torch.Tensor], after: Optional[torch.Tensor], like: torch.Tensor) -> torch.Tensor:
+        """``(num_envs, 1)`` bool: the step starts in one phase and its next observation is in another (False before
+        the first label is known)."""
+        if start is None or after is None:
+            return torch.zeros_like(like, dtype=torch.bool)
+        return (start.reshape(-1) != after.reshape(-1).to(start.device)).reshape(like.shape).to(like.device)
+
     def _labels_from(self, infos: Any) -> Optional[torch.Tensor]:
         """The label channel every residual reads (``sac.std_by_label``), from the first residual's parser."""
         first = next(iter(self.learners.values()))

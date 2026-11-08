@@ -813,13 +813,14 @@ class SAC(LearnerBase):
         for hook in self.on_flush:  # published now, as wandb step 0
             hook(0)
 
-    def _repeated_noise(self, rows: int) -> torch.Tensor:
+    def _repeated_noise(self, rows: int, width: Optional[int] = None) -> torch.Tensor:
         """``noise_repeat``: FlashSAC's ``_sample_flashsac_actions`` per agent. Every step a
         fresh standard-normal draw and a fresh length k ~ truncated Zeta are made; an agent
         whose held draw has been used k times (or never drawn) takes them, the others keep
         theirs. The draws' shapes depend on nothing but the env count, and an agent's counter
-        on nothing but its own draws. Episode ends do not cut a hold short (nor in FlashSAC)."""
-        width = int(self.policy.num_continuous)
+        on nothing but its own draws. Episode ends do not cut a hold short (nor in FlashSAC). ``width``: the draw's
+        (default the policy's action width)."""
+        width = int(self.policy.num_continuous) if width is None else int(width)
         if self._held_noise is None or self._held_noise.shape != (rows, width):
             self._held_noise = torch.zeros(rows, width, device=self.device)
             self._noise_count.zero_()
@@ -945,7 +946,11 @@ class SAC(LearnerBase):
         infos,
         timestep: int,
         timesteps: int,
+        phase_end=None,
     ) -> None:
+        """``phase_end`` (``(num_envs, 1)`` bool, from :class:`~robonuke_rl_core.learners.routed.RoutedSAC`): the
+        transitions whose next observation is in another phase; stored as terminal, the only change made to the env's
+        data. The env's reward is stored as it is."""
         self.observe_step(
             infos=infos,
             rewards=rewards,
@@ -966,10 +971,9 @@ class SAC(LearnerBase):
 
         if not self.training:
             return
-        local_outcome = None
-        if self.cfg.route_label:
-            # this residual's own attempts: rewarded and ended by its label's local outcome
-            rewards, terminated, truncated, local_outcome = self._route_signals(start_labels, terminated, truncated)
+        env_terminated, env_truncated = terminated, truncated
+        if phase_end is not None:
+            terminated = terminated | phase_end.reshape(terminated.shape).to(torch.bool)
         if shaping is not None:
             rewards = rewards + shaping.to(rewards.dtype).reshape(rewards.shape)
         extra: Dict[str, torch.Tensor] = {}
@@ -1006,7 +1010,7 @@ class SAC(LearnerBase):
             actions = actions * self._executed_mask(infos, actions)
         if getattr(self, "_track_outcomes", False):
             extra["episode_ids"] = self._env_episode.to(torch.float32).unsqueeze(-1)
-            self._record_outcomes(infos, terminated, truncated, outcome=local_outcome)
+            self._record_outcomes(infos, env_terminated, env_truncated)
         stored_labels = [self.cfg.route_label] if self.cfg.route_label else list(self.cfg.store_labels)
         if stored_labels:
             # stored only where the starting observation's label is listed (none before the first label is known)
@@ -1139,23 +1143,6 @@ class SAC(LearnerBase):
         if mask.shape[0] != actions.shape[0]:
             raise ValueError(f"infos['{key}'] has {mask.shape[0]} rows, the actions {actions.shape[0]}")
         return mask
-
-    def _route_signals(self, start_labels, terminated: torch.Tensor, truncated: torch.Tensor):
-        """``route_label``: ``(rewards, terminated, truncated, outcome)`` of this residual's own attempts, per env:
-        success (reward 1) when the transition starts in the label and the next observation's label is a later
-        ``std_label_names`` entry; the attempt ends there, or when the env's episode ends (success 0). Truncation is
-        never separate: an attempt's end is terminal."""
-        names = list(self.cfg.std_label_names)
-        index = names.index(self.cfg.route_label)
-        done = (terminated | truncated).reshape(-1, 1).to(torch.bool)
-        if start_labels is None or self._std_labels is None:
-            success = torch.zeros_like(done)
-        else:
-            start = start_labels.reshape(-1, 1)
-            after = self._std_labels.reshape(-1, 1)
-            success = (start == index) & (after > index) & (after < len(names))
-        end = success | done
-        return success.to(torch.float32), end, torch.zeros_like(end), success.reshape(-1).to(torch.float32)
 
     def _record_outcomes(self, infos: Any, terminated: torch.Tensor, truncated: torch.Tensor, outcome=None) -> None:
         """Record the outcome of every episode that ended this step and give those envs new episode ids

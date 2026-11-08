@@ -1,5 +1,5 @@
-"""``sac.route_labels`` (learners/routed.py): one SAC per phase, routed per env; their local rewards, attempt ends,
-storage and the routed eval policy."""
+"""``sac.route_labels`` (learners/routed.py): one SAC per phase, routed per env; the env's rewards stored as they are,
+the phase-switch terminal, storage and the routed eval policy."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def test_each_env_acts_with_its_phases_residual_and_the_base_elsewhere():
     torch.manual_seed(1)
 
 
-def test_each_residual_stores_only_its_phase_with_its_local_reward_and_attempt_end():
+def test_each_residual_stores_only_its_phase_with_the_envs_reward_and_a_terminal_phase_switch():
     routed = routed_pair()
     routed.enable_training_mode(True)
     step(routed, 0, [2, 2, 3])  # no label before this step: nothing stored; now envs 0, 1 in insert, env 2 in screw
@@ -63,12 +63,24 @@ def test_each_residual_stores_only_its_phase_with_its_local_reward_and_attempt_e
     insert = routed.learners["insert"].memory
     screw = routed.learners["screw"].memory
     assert insert.size == 3 and screw.size == 2  # insert: envs 0, 1 then env 0; screw: env 2 then env 1
-    i_rewards = insert.get_tensor_by_name("rewards")[0, :3, 0].tolist()
-    s_rewards = screw.get_tensor_by_name("rewards")[0, :2, 0].tolist()
-    assert sorted(i_rewards) == [0.0, 0.0, 1.0]  # only env 1's passing step pays; never the env's own reward 7
-    assert sorted(s_rewards) == [0.0, 1.0]  # env 2's success
+    assert insert.get_tensor_by_name("rewards")[0, :3, 0].tolist() == [7.0, 7.0, 7.0]  # the env's own reward
+    assert screw.get_tensor_by_name("rewards")[0, :2, 0].tolist() == [7.0, 7.0]
     i_term = insert.get_tensor_by_name("terminated")[0, :3, 0].tolist()
-    assert sum(i_term) == 1  # the passed attempt ends; the ongoing ones do not
+    s_term = screw.get_tensor_by_name("terminated")[0, :2, 0].tolist()
+    assert sorted(i_term) == [False, False, True]  # env 1's step into screw ends insert's data; the ongoing ones do not
+    assert sorted(s_term) == [False, True]  # env 2's step into the success code
+
+
+def test_the_phase_switch_is_the_only_change_and_the_envs_own_end_passes_through():
+    assert RoutedSAC.phase_end(None, torch.tensor([2.0]), torch.zeros(1, 1, dtype=torch.bool)).tolist() == [[False]]
+    end = RoutedSAC.phase_end(torch.tensor([2, 2, 3]), torch.tensor([2.0, 3.0, 3.0]), torch.zeros(3, 1, dtype=torch.bool))
+    assert end.reshape(-1).tolist() == [False, True, False]
+    routed = routed_pair()
+    routed.enable_training_mode(True)
+    step(routed, 0, [2, 2, 2])
+    step(routed, 1, [2, 2, 2], done=torch.tensor([True, False, False]))  # env 0's episode ends inside insert
+    term = routed.learners["insert"].memory.get_tensor_by_name("terminated")[0, :3, 0].tolist()
+    assert sorted(term) == [False, False, True]
 
 
 def test_learner_metrics_are_prefixed_by_phase_and_env_metrics_pass_once():
@@ -248,14 +260,14 @@ def _shaped_learner(learner="sac", **extra):
 
 
 @pytest.mark.parametrize("learner_name", ["sac", "ddpg"])  # DDPG stores through SAC's record_transition
-def test_potential_shaping_adds_gamma_phi_next_minus_phi_to_the_local_reward(learner_name):
+def test_potential_shaping_adds_gamma_phi_next_minus_phi_to_the_envs_reward(learner_name):
     learner = _shaped_learner(learner_name)
     learner.enable_training_mode(True)
     _shaped_step(learner, 0, 2, tip=30.0)  # the first label: Phi(s) = -3, nothing stored
-    _shaped_step(learner, 1, 2, tip=20.0)  # 0.9 * -2 - -3 = 1.2
-    _shaped_step(learner, 2, 3, tip=1.0)  # passes insert: 1 + 0.9 * -0.1 - -2 = 2.91 (Phi(s') kept on the last step)
+    _shaped_step(learner, 1, 2, tip=20.0)  # 0 + 0.9 * -2 - -3 = 1.2
+    _shaped_step(learner, 2, 3, tip=1.0)  # passes insert: 0 + 0.9 * -0.1 - -2 = 1.91 (the env's reward 0 here)
     rewards = learner.memory.get_tensor_by_name("rewards")[0, :2, 0].tolist()
-    assert rewards == pytest.approx([1.2, 2.91])
+    assert rewards == pytest.approx([1.2, 1.91])
 
 
 def test_no_shaping_across_an_episode_end_and_a_missing_or_nan_channel_fails():

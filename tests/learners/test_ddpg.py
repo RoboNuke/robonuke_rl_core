@@ -53,6 +53,33 @@ def test_the_action_is_the_scaled_squashed_mean_plus_scheduled_noise_clamped():
     assert float(clamped.act(obs, None, timestep=1, timesteps=100)[0].abs().max()) <= 1.0
 
 
+def test_noise_repeat_holds_the_exploration_draw_per_agent_for_its_drawn_length():
+    learner = ddpg(actor_action_scale=1.0, exploration_std=0.3, action_clip=10.0, noise_repeat=True, noise_repeat_max=8)
+    learner.enable_training_mode(True)
+    obs = torch.randn(6, OBS_DIM)
+    with torch.no_grad():
+        mean = learner.policy.act({"observations": obs}, role="policy")[1]["mean_actions"]
+    torch.manual_seed(0)
+    draws, lengths = [], []
+    for step in range(200):
+        actions, _ = learner.act(obs, None, timestep=step, timesteps=1000)
+        torch.testing.assert_close(actions, mean + 0.3 * learner._held_noise)  # the held draw is the exploration noise
+        draws.append(learner._held_noise.clone())
+        lengths.append(learner._noise_length.clone())
+    draws, lengths = torch.stack(draws), torch.stack(lengths)
+    assert int(lengths.max()) <= 8
+    for agent in range(2):
+        block = draws[:, agent * 3:(agent + 1) * 3]
+        changed = (block[1:] != block[:-1]).any(dim=(1, 2))
+        starts = [0] + [t + 1 for t in range(len(changed)) if changed[t]]
+        for start, end in zip(starts, starts[1:]):
+            assert end - start == int(lengths[start, agent])  # each hold lasts its drawn length
+    plain = ddpg()
+    plain.enable_training_mode(True)
+    plain.act(torch.randn(6, OBS_DIM), None, timestep=5, timesteps=100)
+    assert plain._held_noise is None  # off: a fresh draw every step
+
+
 def test_resfits_warm_up_acts_uniformly_until_this_learner_starts_learning():
     learner = ddpg(random_action_scale=0.2, learning_starts_rows=10**6, actor_action_scale=0.1, exploration_std=0.0)
     obs = torch.randn(6, OBS_DIM)
@@ -226,7 +253,8 @@ def test_checkpoints_carry_the_target_actor(tmp_path):
 
 def test_the_config_refuses_sac_only_options_and_bad_values():
     DDPGCfg().validate(None)
-    for bad in ({"learn_entropy": True}, {"critic_distribution": "categorical"}, {"noise_repeat": True},
+    DDPGCfg(noise_repeat=True).validate(None)  # held exploration noise, as SAC's
+    for bad in ({"learn_entropy": True}, {"critic_distribution": "categorical"}, {"noise_repeat": True, "noise_repeat_max": 0},
                 {"cross_batch_value": True}, {"action_l2_weight": 1.0}, {"critic_loss": "huber"},
                 {"q_target_min": 0.0}, {"actor_action_scale": 0.0}, {"actor_q_reduction": "min_random_pair"},
                 {"exploration_std": -1.0}):
