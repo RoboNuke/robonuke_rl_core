@@ -158,7 +158,7 @@ def test_a_categorical_critic_emits_its_bins_and_trains(architecture):
 def test_the_categorical_target_is_flashsacs_from_the_lowest_q_critic():
     learner = build_learner(
         "sac", num_agents=1, critic_distribution="categorical", critic_num_bins=11,
-        normalize_observations=False, initial_entropy_value=0.3, discount_factor=0.9,
+        state_preprocessor="none", initial_entropy_value=0.3, discount_factor=0.9,
     )
     fill_memory(learner)
     rows = 4
@@ -245,7 +245,7 @@ def test_an_agents_scale_depends_on_its_own_envs_only():
 
 def test_the_critics_reward_is_divided_and_the_memory_keeps_it_raw():
     learner = build_learner(
-        "sac", num_agents=2, adaptive_reward_scaling=True, normalize_observations=False, backup_entropy=False
+        "sac", num_agents=2, adaptive_reward_scaling=True, state_preprocessor="none", backup_entropy=False
     )
     fill_memory(learner)
     assert torch.all(learner.return_scaler.denominator != 1.0)
@@ -377,7 +377,7 @@ def test_the_zeta_lengths_are_flashsacs():
 
 
 def test_held_noise_is_piecewise_constant_per_agent_and_drives_the_action():
-    learner = build_learner("sac", num_agents=2, envs_per_agent=3, noise_repeat=True, normalize_observations=False)
+    learner = build_learner("sac", num_agents=2, envs_per_agent=3, noise_repeat=True, state_preprocessor="none")
     torch.manual_seed(0)
     observations = torch.randn(6, OBS_DIM)
     draws, lengths = [], []

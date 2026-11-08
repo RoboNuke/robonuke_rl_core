@@ -97,12 +97,19 @@ def _kept(learner) -> dict:
         # KL 0 and keep updating, while agent 1 (whose stored log_prob came from its unscaled
         # observations) is dropped in the extreme copy only. The test asserts that this
         # happened, so the masking path is really exercised.
-        ("ppo", {"grad_norm_clip": 0.5, "kl_threshold": 0.1, "normalize_observations": False}),
-        ("ppo", {"kl_threshold": 0.1, "value_update_ratio": 3, "normalize_observations": False}),
+        ("ppo", {"grad_norm_clip": 0.5, "kl_threshold": 0.1, "state_preprocessor": "none"}),
+        ("ppo", {"kl_threshold": 0.1, "value_update_ratio": 3, "state_preprocessor": "none"}),
         # a Bernoulli dim exercises the straight-through and Bernoulli log-prob paths
         ("ppo", {"model_overrides": {"bernoulli_action_dims": [1]}}),
         ("sac", {"model_overrides": {"bernoulli_action_dims": [1]}}),
         ("ppo", {"entropy_loss_scale": 0.01, "value_update_ratio": 3}),
+        # DDPG: plain, then ResFiT's pieces (an ensemble with a random-subset target min, target-policy smoothing,
+        # the actor on the ensemble mean every 2nd step, its critic loss form) with clipping, then a random-pair actor
+        ("ddpg", {"architecture": "mlp"}),
+        ("ddpg", {"architecture": "mlp", "num_critics": 4, "critic_subset": 2, "target_policy_noise": True,
+                  "gradient_steps": 2, "policy_delay": 2, "critic_loss": "mean_abs_squared", "grad_norm_clip": 0.5,
+                  "actor_action_scale": 0.1, "action_l2_reg_weight": 0.1}),
+        ("ddpg", {"architecture": "mlp", "num_critics": 3, "critic_subset": 2, "actor_q_reduction": "min_random_pair"}),
     ],
 )
 def test_one_agents_data_cannot_change_another_agents_update(learner_name, overrides):
@@ -155,7 +162,7 @@ def test_ppo_kl_early_stop_drops_only_the_offending_agent():
     # its pre-scaled observations). With normalization on, the stats move between the rollout
     # and the update and every agent starts with a large KL.
     learner = build_learner(
-        "ppo", num_agents=3, envs_per_agent=2, kl_threshold=0.1, normalize_observations=False
+        "ppo", num_agents=3, envs_per_agent=2, kl_threshold=0.1, state_preprocessor="none"
     )
     fill_memory(learner)
     make_extreme(learner, AGENT_UNDER_TEST)

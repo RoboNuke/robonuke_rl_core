@@ -104,7 +104,7 @@ what actually ran. `load_from_run(run_dir, overrides)` uses that file minus `met
 
 ## Learners
 
-Words: a **learner** is the RL algorithm (`sac`, `ppo`); an **agent** is one of
+Words: a **learner** is the RL algorithm (`sac`, `ppo`, `ddpg`); an **agent** is one of
 `experiment.num_agents` independent policies trained in parallel; a **block network** holds
 every agent's parameters with a leading `num_agents` dimension so one forward pass serves all
 of them. Agent `i` owns envs `[i*envs_per_agent, (i+1)*envs_per_agent)`.
@@ -243,6 +243,16 @@ scratch, so no GAE chain crosses the reset. A loop that steps on without resetti
 trainer) is refused by `record_transition`. With no request the loop is skrl's.
 `tests/learners/test_trainer.py` drives it on CPU against a fake vectorized env.
 
+**Several agents (`experiment.num_agents` > 1) keep separate schedules.** Each agent has its own `route_clock` (its
+envs' steps in the phase), its own `learning_starts_rows` (its own online rows), and its own update and `policy_delay`
+counts and LR schedule. DDPG adds its own uniform warm-up (`random_action_scale`) and critic warm-up burst
+(`critic_warmup_updates`) per agent. An update steps only the agents that are due. Every optimizer step and every
+target update (critics and the target actor) is masked to those agents, so an agent that is not due keeps its weights,
+targets, optimizer moments and step counts exactly. A block batch's online share is sized by the due agents' data
+alone. With such a schedule, `periodic_reset_enabled`, `retrain_every` and a `state_preprocessor` whose statistics update during training act on
+every agent at once, so they are refused. The agents share one random-number stream (batch draws, exploration noise),
+so they are independent in what they learn and when, but not bit-reproducible in isolation.
+
 ### Add a learner
 
 1. Subclass `LearnerBase` in `robonuke_rl_core/learners/<name>.py`. Implement
@@ -255,6 +265,14 @@ trainer) is refused by `record_transition`. With no request the loop is skrl's.
 4. Copy the independence test for it (one line in the parametrize list) and add it to
    `tests/learners/GPU/test_train_smoke.py`'s `LEARNERS`.
 
+`ddpg` (`learners/ddpg.py`) is the worked example of a learner that reuses SAC's machinery: it subclasses
+`SAC`, its `DDPGCfg` subclasses `SACCfg` (refusing SAC's entropy-only fields in `validate`), and it overrides
+only acting, the two losses, the actor step (target actor Polyak) and the update schedule (critic warm-up). It
+needs a `target_policy` model, so only the `mlp` architecture builds it. `train.main` treats every learner in
+its `q_learners` tuple (sac, ddpg) as a replay learner: memory, demos, routing and CUDA graphs. A SAC-family
+learner joins that tuple and `evaluation.py`'s learner classes. The class attribute `HAS_TEMPERATURE` decides
+whether SAC's update publishes `entropy/coefficient`.
+
 A **project learner** that brings its own entry script and loop (no package models,
 memory or `LearnerBase`) only needs `register_learner("<name>")` in its `setup()`, so
 `trainer.learner` accepts it; `train.main` refuses it with a pointer to the project's script.
@@ -264,6 +282,8 @@ Eval and debug load its checkpoints once `setup()` also calls
 A project adds env wrappers to every env the package builds (train, eval, debug) with
 `envs.build.register_env_wrapper(fn)` in `setup()`; `build_env` applies them outside all
 package wrappers, as `fn(cfg, env, task_name) -> env`.
+A project can also build the demo transitions at load, with the env's own code (`learners.sac.register_demo_loader(fn)` in its training script's `setup()`): `train.main` calls `fn(cfg, env)` once the env is built, and a returned `loader(data, route_label) -> {"transitions": ..., "meta": ...}` turns the loaded `demo_transitions` file (a project's raw demo episodes, say) into the learner's transitions; `route_label` is the learner's own (None unrouted). At most one builder may answer; without one the file must already hold `transitions`. The `demo` state preprocessor is then fitted on what the loader returns.
+
 A project gives SAC's critics another action input than the agent's own (a residual agent's
 executed action) with `learners.sac.register_critic_action(fn)` in its training script's
 `setup()`: `train.main` calls `fn(cfg, env)` once the env is built, and a returned
@@ -277,7 +297,7 @@ answer; None means the critics take the agent's action. Two optional transform a
 script registers the builder too) and `side_inputs` `{name: width}`: per-transition tensors the env
 publishes as `infos[name]` and `infos["next_" + name]` every step, stored in the memory and handed to the
 transform as a third argument `{name: tensor}` (the `next_` ones for the target) — never a critic input.
-Not with demo transitions.
+A demo transitions file must then carry every side input and its `next_` value as well (checked at load).
 `run_eval` calls `policy.reset()` after each round's reset when the policy has one, for a
 policy that keeps state across steps (an action-chunking queue).
 
@@ -470,6 +490,9 @@ the episodes that have it.
 | `loss/policy`, `loss/critic`, `loss/value`, `loss/entropy` | the learner | SAC's `loss/entropy` is the temperature's loss, PPO's is the entropy bonus's contribution |
 | `policy/std`, `policy/entropy`, `policy/log_prob` | the learner | `policy/std` is the mean commanded sigma |
 | `entropy/coefficient` | SAC | alpha |
+| `entropy/current`, `entropy/target`, `entropy/gap` | SAC (`learn_entropy`) | the batch entropy estimate the temperature step used (-mean log pi on `entropy_observations`), the target it chases, and current - target: > 0 alpha falls, < 0 alpha rises (at Adam's ~fixed rate, whatever the gap's size) |
+| `lr/entropy` | SAC (`learn_entropy`) | the temperature's LR (`entropy_lr_schedule`) |
+| `policy/mean_action` | SAC, step 0 | the initial policy's mean \|tanh mean\| (its noise-free action); with `policy/std`, `policy/log_prob`, `entropy/*` and `lr/*` published at step 0 from the first training observations, before any update |
 | `sac/demo_fraction` | SAC | the share of each critic batch that came from `sac.demo_transitions`: 0.5 inside the window once the memory holds half a batch, more before, 0 outside. Only published when demos are configured. With `policy_delay` > 1 the actor's metrics (`loss/policy`, `policy/*`, `grad_norm/policy`) come only from the gradient steps that updated it |
 | `q/q1_mean`, `q/q2_mean`, `q/target_mean` | SAC | + `/min`, `/max` |
 | `ppo/kl`, `ppo/clip_fraction`, `ppo/kept` | PPO | `ppo/kept` is the per-agent KL early stop |
@@ -849,7 +872,7 @@ sources of truth for a run's name is how runs get lost. Every computed group is 
 against the same rule `WandbCfg.validate` applies, before anything is queued.
 
 The job runs `hpc.train_script` (default `scripts/train.py`, relative to the project root,
-checked to exist before anything is queued). `train.main` runs sac / ppo only, so an
+checked to exist before anything is queued). `train.main` runs sac / ppo / ddpg only, so an
 experiment of a project-registered learner names that project's own entry script there
 (`hpc.train_script: scripts/train_bc.py`).
 

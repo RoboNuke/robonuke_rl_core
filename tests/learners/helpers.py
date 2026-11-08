@@ -13,7 +13,8 @@ import numpy as np
 import torch
 
 from robonuke_rl_core.learners.base import run_dirs  # noqa: F401  (re-exported for tests)
-from robonuke_rl_core.learners.cfg import PPOCfg, SACCfg, TrainerCfg, sac_critic_outputs
+from robonuke_rl_core.learners.cfg import DDPGCfg, PPOCfg, SACCfg, TrainerCfg, sac_critic_outputs
+from robonuke_rl_core.learners.ddpg import DDPG
 from robonuke_rl_core.learners.ppo import PPO
 from robonuke_rl_core.learners.sac import SAC, critic_action_space
 from robonuke_rl_core.memory.multi_random import MultiRandomMemory
@@ -33,7 +34,7 @@ from robonuke_rl_core.models.factory import build_models
 OBS_DIM = 4
 STATE_DIM = 6
 ACT_DIM = 2
-LEARNER_CLASSES = {"sac": SAC, "ppo": PPO}
+LEARNER_CLASSES = {"sac": SAC, "ppo": PPO, "ddpg": DDPG}
 
 
 def tiny_model_cfg() -> SimbaModelCfg:
@@ -65,6 +66,8 @@ def learner_cfg(learner: str, **overrides) -> Any:
     """A tiny but complete cfg for one learner."""
     if learner == "sac":
         cfg = SACCfg(batch_size=4, gradient_steps=1, learning_starts=0)
+    elif learner == "ddpg":
+        cfg = DDPGCfg(batch_size=4, gradient_steps=1, learning_starts=0)
     elif learner == "ppo":
         cfg = PPOCfg(rollouts=4, learning_epochs=2, mini_batches=2, learning_starts=0)
     else:
@@ -137,8 +140,8 @@ def build_learner(
         num_agents,
         "cpu",
         controller_cfg,
-        num_critics=cfg.num_critics if learner == "sac" else 2,
-        critic_outputs=sac_critic_outputs(cfg) if learner == "sac" else 1,
+        num_critics=cfg.num_critics if learner in ("sac", "ddpg") else 2,
+        critic_outputs=sac_critic_outputs(cfg) if learner in ("sac", "ddpg") else 1,
         critic_action_space=(
             critic_action_space(critic_action_transform, action_space) if critic_action_transform is not None else None
         ),
@@ -147,7 +150,7 @@ def build_learner(
         capacity=rollout * envs_per_agent, num_envs=num_envs, num_agents=num_agents, device="cpu"
     )
     extra = (
-        {"model_cfg": model_cfg, "controller_cfg": controller_cfg} if learner == "sac" else {}
+        {"model_cfg": model_cfg, "controller_cfg": controller_cfg} if learner in ("sac", "ddpg") else {}
     )
     instance = LEARNER_CLASSES[learner](
         models=models,

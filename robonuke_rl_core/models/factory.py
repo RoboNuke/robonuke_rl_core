@@ -188,6 +188,43 @@ def _build_mlp_sac(
     return models
 
 
+def _build_mlp_ddpg(
+    model_cfg: MlpModelCfg,
+    obs_space,
+    state_space,
+    action_space,
+    num_agents,
+    device,
+    actor,
+    num_critics: int = 1,
+    critic_outputs: int = 1,
+    critic_action_space=None,
+):
+    """``architecture: mlp`` for DDPG: the MLP actor (squashed; its mean is the deterministic action, its std unused)
+    and its target copy, ``num_critics`` MLP Q critics stacked in one module and their targets."""
+    if num_critics < 1:
+        raise ValueError(f"DDPG needs at least 1 critic (ddpg.num_critics), got {num_critics}")
+    if critic_outputs != 1:
+        raise ValueError(f"DDPG's critics emit one Q value, got critic_outputs={critic_outputs}")
+    critic_space = state_space if state_space is not None else obs_space
+
+    def make_q():
+        return MlpQCritic(
+            observation_space=critic_space,
+            action_space=critic_action_space if critic_action_space is not None else action_space,
+            device=device,
+            num_agents=num_agents,
+            members=num_critics,
+            outputs=1,
+            **_kwargs(model_cfg.critic),
+        )
+
+    def make_actor():
+        return MlpActor(observation_space=obs_space, action_space=action_space, device=device, num_agents=num_agents, **actor)
+
+    return {"policy": make_actor(), "target_policy": make_actor(), "critics": make_q(), "target_critics": make_q()}
+
+
 def _build_mlp_ppo(
     model_cfg: MlpModelCfg,
     obs_space,
@@ -269,6 +306,7 @@ MODEL_BUILDERS: Dict[tuple, Callable[..., Dict[str, Model]]] = {
     ("simba", "sac"): _build_sac,
     ("simba", "ppo"): _build_ppo,
     ("mlp", "sac"): _build_mlp_sac,
+    ("mlp", "ddpg"): _build_mlp_ddpg,
     ("mlp", "ppo"): _build_mlp_ppo,
     ("flashsac", "sac"): _build_flashsac_sac,
 }

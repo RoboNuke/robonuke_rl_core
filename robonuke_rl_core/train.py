@@ -20,13 +20,16 @@ def main(argv=None, setup=None) -> int:
 
     from isaaclab.app import AppLauncher
 
+    from robonuke_rl_core.config import simulator_of, start_simulator
+
     AppLauncher.add_app_launcher_args(parser)
     args, overrides = parser.parse_known_args(argv)
-    app_launcher = AppLauncher(args)
+    # Isaac Sim starts only for a task it simulates (task.simulator: isaac, the default)
+    app_launcher = start_simulator(args, simulator_of(args, overrides))
     if setup is not None:
-        # Isaac Sim is up: a project imports its tasks (gym.register) and registers its
-        # config sections, losses, overlays and model architectures here, before the
-        # config loads.
+        # Isaac Sim is up (or not needed): a project imports its tasks (gym.register) and
+        # registers its config sections, losses, overlays and model architectures here,
+        # before the config loads.
         setup()
 
 
@@ -44,11 +47,14 @@ def main(argv=None, setup=None) -> int:
     from robonuke_rl_core.logging import WandbLogger
     from robonuke_rl_core.losses import build_aux_losses
     from robonuke_rl_core.learners.ppo import PPO
+    from robonuke_rl_core.learners.ddpg import DDPG
     from robonuke_rl_core.learners.sac import SAC
     from robonuke_rl_core.memory.multi_random import MultiRandomMemory
     from robonuke_rl_core.models.factory import build_models
 
-    learners = {"sac": SAC, "ppo": PPO}
+    learners = {"sac": SAC, "ppo": PPO, "ddpg": DDPG}
+    #: the off-policy learners built on SAC's machinery (critic ensembles, replay, routing)
+    q_learners = ("sac", "ddpg")
 
     cfg = load_from_args(args, overrides)
     learner_name = cfg.trainer.learner
@@ -85,10 +91,12 @@ def main(argv=None, setup=None) -> int:
     # a project's register_critic_action: the critics may take another action than the agent's,
     # at another width (they are built for it)
     transform = None
-    if learner_name == "sac":
-        from robonuke_rl_core.learners.sac import critic_action_space, critic_action_transform
+    if learner_name in q_learners:
+        from robonuke_rl_core.learners.sac import critic_action_space, critic_action_transform, demo_loader
 
         transform = critic_action_transform(cfg, env)
+        # a project's register_demo_loader: the demo file's transitions are built at load, with the env's own code
+        loader = demo_loader(cfg, env)
     def make_learner(learner_cfg, dirs):
         """One learner of ``learner_cfg`` with its own models, memory and optimizers (a routed SAC builds one per
         phase)."""
@@ -101,8 +109,8 @@ def main(argv=None, setup=None) -> int:
             num_agents,
             env.device,
             controller_cfg,
-            num_critics=int(learner_cfg.num_critics) if learner_name == "sac" else 2,
-            critic_outputs=sac_critic_outputs(learner_cfg) if learner_name == "sac" else 1,
+            num_critics=int(learner_cfg.num_critics) if learner_name in q_learners else 2,
+            critic_outputs=sac_critic_outputs(learner_cfg) if learner_name in q_learners else 1,
             critic_action_space=critic_action_space(transform, env.action_space) if transform is not None else None,
         )
 
@@ -122,7 +130,7 @@ def main(argv=None, setup=None) -> int:
                 "controller_cfg": controller_cfg,
                 "critic_action_space": critic_action_space(transform, env.action_space) if transform is not None else None,
             }
-            if learner_name == "sac"
+            if learner_name in q_learners
             else {}
         )
         learner = learners[learner_name](
@@ -140,9 +148,12 @@ def main(argv=None, setup=None) -> int:
             **extra,
         )
 
-        if learner_name == "sac":
+        if learner_name in q_learners:
             # set before the trainer's init(): the memory stores the transform's side inputs
             learner.critic_action_transform = transform
+            learner.demo_loader = loader
+            if loader is not None:
+                print("[train] demo transitions built at load by a registered demo loader (register_demo_loader)", flush=True)
             if learner.critic_action_transform is not None:
                 print("[train] critics take a registered action transform (register_critic_action)", flush=True)
 
@@ -152,7 +163,7 @@ def main(argv=None, setup=None) -> int:
             print(f"[train] aux losses: {[t.name for t in cfg.losses.terms]}", flush=True)
         return learner
 
-    routes = list(learner_cfg.route_labels) if learner_name == "sac" else []
+    routes = list(learner_cfg.route_labels) if learner_name in q_learners else []
     if routes:
         # PARTS' per-phase residuals (sac.route_labels): one SAC per phase, its own run directory per agent
         import copy
@@ -172,25 +183,52 @@ def main(argv=None, setup=None) -> int:
     else:
         learner = make_learner(learner_cfg, dirs)
 
+    phase_logging = bool(routes) and bool(getattr(learner_cfg, "phase_logging", False))
     # one wandb run per agent, carrying exactly what resolved_config.yaml holds
     logger = WandbLogger.from_config(
         cfg,
         OmegaConf.to_container(OmegaConf.load(config_path), resolve=True),
         config_path=config_path,  # uploaded once, as a plain run file
         device=env.device,
+        flat_names=phase_logging,
     )
+    phase_logger = None
+    if phase_logging:
+        # sac.phase_logging: every phase its own attempts, step counter and publish cadence (learners/phase_logging.py)
+        from robonuke_rl_core.learners.phase_logging import PhaseLogger
+        from robonuke_rl_core.logging import DISTRIBUTIONS
+
+        phase_logger = PhaseLogger(
+            logger,
+            names=learner_cfg.std_label_names,
+            phases=list(learner_cfg.phase_logging_phases) or list(learner_cfg.std_label_names),
+            routes=routes,
+            num_agents=num_agents,
+            envs_per_agent=total_envs // num_agents,
+            write_interval=int(cfg.trainer.write_interval),
+            success_window=cfg.trainer.success_window,
+            distributions=DISTRIBUTIONS,
+        )
+        learner.phase_logger = phase_logger
+        logger.define_phase_axes(routes)
     if routes:
         from robonuke_rl_core.learners.routed import route_hook
 
         last = routes[-1]
         for index, (route, routed_learner) in enumerate(learner.learners.items()):
-            # env / episode metrics once, each residual's learner metrics under <phase>/
-            routed_learner.on_log.append(route_hook(logger, route, first=index == 0))
+            # env / episode metrics once, each residual's learner metrics under <phase>/ (phase logging:
+            # <phase>_<family>/, published on the phase's own cadence)
+            if phase_logger is not None:
+                routed_learner.on_log.append(phase_logger.hook_for(route, first=index == 0))
+            else:
+                routed_learner.on_log.append(route_hook(logger, route, first=index == 0))
             # uploaded as <phase>/checkpoints/<file>: the phases' checkpoints share file names
             routed_learner.on_checkpoint.append(
                 lambda agent, step, path: logger.save_file(path, agent=agent, base_path=Path(path).parent.parent.parent)
             )
             if route == last:  # after every residual emitted its interval
+                if phase_logger is not None:
+                    routed_learner.on_flush.append(phase_logger.on_global_flush)
                 routed_learner.on_flush.append(logger.flush)
     else:
         learner.on_log.append(logger)
@@ -213,7 +251,8 @@ def main(argv=None, setup=None) -> int:
         logger.close()  # publish what is pending and finish every run
 
     env.close()
-    app_launcher.app.close()
+    if app_launcher is not None:
+        app_launcher.app.close()
     return 0
 
 

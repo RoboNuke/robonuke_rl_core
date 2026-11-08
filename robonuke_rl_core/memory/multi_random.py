@@ -326,9 +326,11 @@ class MultiRandomMemory:
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-        if self.size == 0:
+        if self.size == 0 and (self._agent_size is None or max(self._agent_size) == 0):
             raise ValueError("cannot sample from an empty memory")
         if self._agent_size is not None:  # add_rows: each agent bounded by its own fill
+            # an agent with no rows yet (its fill 0) gets row 0 as filler: a learner masks such an agent out of the
+            # update (SAC._update), so its filler rows reach no loss it is stepped on
             sizes = torch.tensor(self._agent_size, dtype=torch.float32, device=self.device).unsqueeze(-1)
             uniform = torch.rand((self.num_agents, batch_size), device=self.device)
             indices = (uniform * sizes).long().clamp_(max=self.capacity - 1)

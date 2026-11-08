@@ -13,10 +13,10 @@ from typing import Any, List, Optional
 
 from omegaconf import MISSING
 
-__all__ = ["TrainerCfg", "SACCfg", "PPOCfg", "LEARNERS", "register_learner", "known_learners", "sac_critic_outputs"]
+__all__ = ["TrainerCfg", "SACCfg", "DDPGCfg", "PPOCfg", "LEARNERS", "register_learner", "known_learners", "sac_critic_outputs"]
 
 #: the package's own learners: ``models/factory`` builds their networks and eval loads them
-LEARNERS = ("sac", "ppo")
+LEARNERS = ("sac", "ppo", "ddpg")
 
 #: learners a project registers with :func:`register_learner`. They bring their own entry
 #: script and training loop; the package only has to accept the name in ``trainer.learner``.
@@ -95,6 +95,19 @@ class TrainerCfg:
 
 
 @dataclass
+class StatePreprocessorKwargsCfg:
+    """``<learner>.state_preprocessor_kwargs`` (skrl's ``state_preprocessor_kwargs``)."""
+
+    #: let ``train=True`` calls update the statistics: during updates (the sampled batches), as skrl does. Null: the
+    #: preprocessor's own default -- ``running`` true, ``demo`` false (frozen after its one-time fit on the demos)
+    update_normalizer_during_training: Optional[bool] = None
+    #: the standardized value is clipped to +-this (skrl's ``clip_threshold``)
+    clip_threshold: float = 5.0
+    #: added to the std (skrl's ``epsilon``)
+    epsilon: float = 1e-8
+
+
+@dataclass
 class _CommonCfg:
     """Fields every learner shares."""
 
@@ -110,9 +123,12 @@ class _CommonCfg:
     weight_decay: float = 0.0
     #: per-agent gradient-norm clip (0 disables); each agent is clipped by its own norm
     grad_norm_clip: float = 0.0
-    #: running normalization of observations (and states, when asymmetric), per agent
-    normalize_observations: bool = True
-    normalizer_clip: float = 5.0
+    #: the input normalizer, as skrl's ``state_preprocessor`` (``models/normalizer.py``, one per agent): "none"; "running"
+    #: (skrl's ``RunningStandardScaler``, statistics from the training batches); "demo" (the same scaler fitted once,
+    #: when the learner starts, on all of ``demo_transitions``' rows; Q learners only). It standardizes the actor's
+    #: observations, the critics' states (asymmetric) and, for Q learners, the critics' action
+    state_preprocessor: str = "running"
+    state_preprocessor_kwargs: StatePreprocessorKwargsCfg = field(default_factory=StatePreprocessorKwargsCfg)
     #: ``"module:name"`` of a ``f(rewards, timestep, timesteps) -> rewards`` shaper
     rewards_shaper: Optional[str] = None
     #: scale the stored reward by its per-agent running std (ResiP's ``RunningMeanStdClip``:
@@ -123,7 +139,19 @@ class _CommonCfg:
     #: the scaled reward is clipped to +-this
     reward_clip: float = 5.0
 
+    def update_normalizer(self) -> bool:
+        """Whether ``train=True`` calls update the preprocessor's statistics (the kwarg, or the type's default)."""
+        flag = self.state_preprocessor_kwargs.update_normalizer_during_training
+        return (self.state_preprocessor == "running") if flag is None else bool(flag)
+
     def _validate_common(self, name: str) -> None:
+        from robonuke_rl_core.models.normalizer import STATE_PREPROCESSORS
+
+        if self.state_preprocessor not in STATE_PREPROCESSORS:
+            raise ValueError(f"{name}.state_preprocessor must be one of {STATE_PREPROCESSORS}, got {self.state_preprocessor!r}")
+        kw = self.state_preprocessor_kwargs
+        if not float(kw.clip_threshold) > 0 or not float(kw.epsilon) >= 0:
+            raise ValueError(f"{name}.state_preprocessor_kwargs: clip_threshold must be > 0 and epsilon >= 0")
         if self.reward_clip <= 0.0:
             raise ValueError(f"{name}.reward_clip must be > 0, got {self.reward_clip}")
 
@@ -162,6 +190,10 @@ class SACCfg(_CommonCfg):
     #: separately for the actor and the critics. 0 is none
     actor_lr_warmup: int = 0
     critic_lr_warmup: int = 0
+    #: the temperature's LR follows ``lr_schedule`` too, from ``entropy_lr`` to ``lr_end`` over the same gradient-step
+    #: count as the actor and critics (FlashSAC schedules all three optimizers alike), with no warm-up. False: the
+    #: temperature learns at a constant ``entropy_lr``. Needs ``learn_entropy``
+    entropy_lr_schedule: bool = False
     learn_entropy: bool = True
     initial_entropy_value: float = 0.2
     #: target entropy; None means -|A|
@@ -235,6 +267,12 @@ class SACCfg(_CommonCfg):
     #: rows not counted): a routed residual starts training only once its phase has given it this much data, however
     #: long that takes. 0 is off (learning_starts alone)
     learning_starts_rows: int = 0
+    #: debugging: with every numbered checkpoint, also write each agent's replay memory (its rows, oldest first, every
+    #: stored field: observations, states, actions, rewards, terminated, next_*, side inputs, ...) to ``memory_<step>.pt``
+    #: beside it. Large (a full 300k-row memory is hundreds of MB per checkpoint) and never uploaded. With demo_storage:
+    #: sample the demos are their own file and are not in it; with memory / memory_critic they are its first rows
+    #: (meta.demo_rows_in_memory). False: no memory files
+    save_memory_with_checkpoints: bool = False
     #: capture each kind of gradient step (critic only / with the actor, with or without demo
     #: rows) as a CUDA graph and replay it as one launch: the update is launch-bound at small
     #: batch sizes. CUDA only (ignored on CPU); updates with aux losses, and mixed batches
@@ -370,6 +408,14 @@ class SACCfg(_CommonCfg):
     #: whose starting label is its ``route_label``), and update only on those steps: a routed residual never updates
     #: while its phase is not running (nor in phases with no residual). Needs ``route_labels``
     route_clock: bool = False
+    #: per-phase logging (``learners/phase_logging.py``): every phase in ``phase_logging_phases`` its own attempts
+    #: (``<phase>_episode/*``), step counter (``<phase>_step``) and, for a routed phase, its own publish every
+    #: ``trainer.write_interval`` of its steps with its residual's metrics under ``<phase>_<family>/*``; the unrouted
+    #: phases' rates, lengths and step counts in ``episode/``; the env's ``phase/*`` family folded into ``episode/``;
+    #: one ``/`` per metric name. Needs ``route_labels`` and ``std_by_label``
+    phase_logging: bool = False
+    #: the phases phase logging tracks (``std_label_names`` entries, every routed one among them); empty: every label
+    phase_logging_phases: List[str] = field(default_factory=list)
     #: hold transitions while the task makes no progress: the ``infos`` channel (``"<key>/<name>"`` for
     #: ``infos[key][name]``) holding, per env, 1 on a step that made no progress (e.g. one_leg's
     #: ``eval_state/phase/still``). Such transitions are held back, written once progress resumes; if the episode is
@@ -389,9 +435,13 @@ class SACCfg(_CommonCfg):
     ACTOR_Q_REDUCTIONS = ("min", "mean")
     ENTROPY_OBSERVATIONS = ("current", "next")
     CRITIC_DISTRIBUTIONS = ("scalar", "categorical")
+    #: the fewest critics the learner builds (SAC's clipped double Q needs two)
+    MIN_CRITICS = 2
 
     def validate(self, cfg: Any) -> None:
         self._validate_common(self._name())
+        if self.state_preprocessor == "demo" and not self.demo_transitions:
+            raise ValueError(f"{self._name()}.state_preprocessor: demo is fitted on the demos: set demo_transitions")
         if self.lr_schedule not in ("constant", "cosine"):
             raise ValueError(
                 f"{self._name()}.lr_schedule must be 'constant' or 'cosine', got {self.lr_schedule!r}"
@@ -425,8 +475,8 @@ class SACCfg(_CommonCfg):
                 f"{self._name()}.periodic_reset_enabled needs periodic_reset_frequency > 0, got "
                 f"{self.periodic_reset_frequency}"
             )
-        if self.num_critics < 2:
-            raise ValueError(f"{self._name()}.num_critics must be >= 2, got {self.num_critics}")
+        if self.num_critics < self.MIN_CRITICS:
+            raise ValueError(f"{self._name()}.num_critics must be >= {self.MIN_CRITICS}, got {self.num_critics}")
         if not 1 <= self.critic_subset <= self.num_critics:
             raise ValueError(
                 f"{self._name()}.critic_subset must be in [1, num_critics={self.num_critics}], "
@@ -468,6 +518,8 @@ class SACCfg(_CommonCfg):
         if self.demo_batch_shared and not (self.demo_transitions and window and self.demo_storage == "sample"):
             raise ValueError(f"{self._name()}.demo_batch_shared shares the demo window's mixed batch: set demo_transitions, "
                              "a demo_sampling_start..end window and demo_storage: sample")
+        if self.entropy_lr_schedule and not self.learn_entropy:
+            raise ValueError(f"{self._name()}.entropy_lr_schedule schedules the temperature's LR: set learn_entropy: true")
         if self.action_l2_weight < 0:
             raise ValueError(f"{self._name()}.action_l2_weight must be >= 0, got {self.action_l2_weight}")
         if self.clone_demo_rows and not (self.demo_transitions and window and self.success_clone_weight > 0):
@@ -583,6 +635,31 @@ class SACCfg(_CommonCfg):
             seen.add((key, term.channel))
         if self.route_clock and not (self.route_labels or self.route_label):
             raise ValueError(f"{name}.route_clock counts a routed residual's own steps: set route_labels")
+        if self.phase_logging and not (self.route_labels or self.route_label):
+            raise ValueError(f"{name}.phase_logging logs routed residuals per phase: set route_labels")
+        if (self.phase_logging or self.phase_logging_phases) and self.std_by_label is None:
+            raise ValueError(f"{name}.phase_logging reads the phase from std_by_label: set it")
+        unknown = [p for p in self.phase_logging_phases if p not in self.std_label_names]
+        if unknown:
+            raise ValueError(f"{name}.phase_logging_phases {unknown} are not std_label_names {list(self.std_label_names)}")
+        if self.phase_logging_phases:
+            untracked = [r for r in self.route_labels if r not in self.phase_logging_phases]
+            if untracked:
+                raise ValueError(f"{name}.phase_logging_phases must include every route_labels phase; missing {untracked}")
+        experiment = getattr(cfg, "experiment", None) if cfg is not None else None
+        agents = int(getattr(experiment, "num_agents", 1) or 1)
+        if agents > 1 and (self.route_clock or self.learning_starts_rows > 0):
+            # each agent keeps its own schedule (clock, learning start, warm-ups, actor delay) and is stepped alone;
+            # these act on every agent at once, so they would tie the agents together
+            shared = sorted(k for k, on in {
+                "periodic_reset_enabled": self.periodic_reset_enabled, "retrain_every": self.retrain_every > 0,
+                # statistics that update during training act on every agent at once; frozen ones never couple them
+                "state_preprocessor (updating)": self.state_preprocessor != "none" and self.update_normalizer(),
+                "normalize_states": bool(getattr(self, "normalize_states", False)),
+            }.items() if on)
+            if shared:
+                raise ValueError(f"{name}: {shared} act on every agent at once; with experiment.num_agents {agents} and a "
+                                 "per-agent schedule (route_clock / learning_starts_rows) they would couple the agents: turn them off")
         if bool(self.hold_still_key) != bool(self.hold_stall_key):
             raise ValueError(f"{name}.hold_still_key and hold_stall_key go together: set both or neither")
         if not 0.0 <= self.reference_dropout <= 1.0:
@@ -622,6 +699,118 @@ class SACCfg(_CommonCfg):
 
     def _name(self) -> str:
         return "sac"
+
+
+@dataclass
+class DDPGCfg(SACCfg):
+    """Deep Deterministic Policy Gradient (``learners/ddpg.py``): a deterministic actor ``a = actor_action_scale *
+    tanh(mu(s))``, Gaussian exploration noise of a fixed (scheduled) std around it, a target actor and target critics
+    (Polyak ``polyak``), the critic regressed on ``r + gamma^n Q'(s', mu'(s'))`` and the actor on ``-Q(s, mu(s))`` --
+    no entropy. Everything but the entropy is SAC's machinery (the replay memory, n-step rows, demos, per-phase
+    routing and its clocks, held rows, logging, CUDA graphs), configured by the same fields. The defaults are plain
+    DDPG (one critic, no target smoothing); the TD3 / REDQ / ResFiT pieces (Ankile et al. 2025, arXiv:2509.19301:
+    an ensemble with a random-subset min target and the actor on its mean, target-policy smoothing, delayed actor
+    updates, a critic warm-up, uniform warm-up actions, its critic loss form) are the fields below."""
+
+    num_critics: int = 1
+    critic_subset: int = 1
+    actor_q_reduction: str = "mean"
+    #: SAC's entropy machinery, off and refused: DDPG has no temperature
+    learn_entropy: bool = False
+    initial_entropy_value: float = 0.0
+    backup_entropy: bool = False
+    #: the actor's observations as they come (SAC's running normalizer is opt-in here)
+    state_preprocessor: str = "none"
+    #: the actor's output: ``actor_action_scale * tanh(mu(s))`` (ResFiT: 0.1, the residual's reach in normalized
+    #: action units)
+    actor_action_scale: float = 1.0
+    #: the exploration noise's std, added to the actor's action when acting (not clipped unless
+    #: ``exploration_noise_clip``): linear from ``exploration_std`` to ``exploration_std_end`` over
+    #: ``exploration_std_steps`` env steps (0 or ``exploration_std_end`` None: constant). ResFiT: 0.05
+    exploration_std: float = 0.1
+    exploration_std_end: Optional[float] = None
+    exploration_std_steps: int = 0
+    exploration_noise_clip: Optional[float] = None
+    #: every action (acting, the target's next action, the actor's own) clamped to [-action_clip, action_clip]
+    #: (ResFiT: 1.0, its normalized range); None: no clamp
+    action_clip: Optional[float] = 1.0
+    #: the critic target's next action from the target actor (DDPG, TD3); false: from the actor itself
+    target_actor: bool = True
+    #: TD3's target-policy smoothing: the target's next action gets N(0, the exploration std) noise clipped to
+    #: +-target_noise_clip
+    target_policy_noise: bool = False
+    target_noise_clip: float = 0.3
+    #: "mse": the mean over critics of each one's squared TD error (DDPG, TD3); "mean_abs_squared": ResFiT's
+    #: ``(mean_k |Q_k - y|)^2`` -- the critics' mean absolute TD error, squared
+    critic_loss: str = "mse"
+    #: clamp the critic target to [q_target_min, q_target_max] (ResFiT's ``clip_q_target_to_reward_range``: [0, 1]);
+    #: None: unclamped
+    q_target_min: Optional[float] = None
+    q_target_max: Optional[float] = None
+    #: ResFiT's ``action_l2_reg_weight``: ``weight * mean_rows(sum_d a_d^2)`` on the actor's action, added to its loss
+    action_l2_reg_weight: float = 0.0
+    #: uniform warm-up actions in [-random_action_scale, random_action_scale] -- for a residual, the base plus that
+    #: noise (ResFiT: 0.2) -- while this learner has not started learning (``learning_starts`` / ``learning_starts_rows``
+    #: not reached) or for the first ``random_timesteps`` env steps. 0: the actor (with its noise) from the start
+    random_action_scale: float = 0.0
+    #: what a warm-up action is. "uniform": ResFiT's, ``U(-random_action_scale, random_action_scale)`` per dim, about 0.
+    #: "actor_gaussian": the actor's own deterministic action plus ``N(0, random_action_scale)`` per dim, clamped to
+    #: ``action_clip`` -- about the actor's starting point when 0 is not the residual's neutral action
+    #: (``model.actor.output_bias``)
+    random_action_mode: str = "uniform"
+    #: ResFiT's critic warm-up: once this learner may first update, this many critic-only gradient steps run at once,
+    #: before the next env step; the actor learns from the update after. 0: none
+    critic_warmup_updates: int = 0
+
+    ACTOR_Q_REDUCTIONS = ("min", "mean", "min_random_pair", "q1")
+    MIN_CRITICS = 1
+    CRITIC_LOSSES = ("mse", "mean_abs_squared")
+
+    def validate(self, cfg: Any) -> None:
+        super().validate(cfg)
+        name = self._name()
+        sac_only = {
+            "learn_entropy": self.learn_entropy, "backup_entropy": self.backup_entropy,
+            "initial_entropy_value": self.initial_entropy_value != 0.0, "target_entropy": self.target_entropy is not None,
+            "target_entropy_sigma": self.target_entropy_sigma is not None, "entropy_lr_schedule": self.entropy_lr_schedule,
+            "noise_repeat": self.noise_repeat, "unsquashed_actor": self.unsquashed_actor,
+            "progressive_exploration_steps": self.progressive_exploration_steps > 0,
+            "critic_distribution": self.critic_distribution != "scalar", "cross_batch_value": self.cross_batch_value,
+            "periodic_reset_enabled": self.periodic_reset_enabled, "retrain_every": self.retrain_every > 0,
+            "action_l2_weight": self.action_l2_weight > 0, "success_clone_weight": self.success_clone_weight > 0,
+            "failure_anchor_weight": self.failure_anchor_weight > 0, "demo_actor_clone": self.demo_actor_clone,
+            "reference_dropout": self.reference_dropout > 0,
+        }
+        used = sorted(k for k, on in sac_only.items() if on)
+        if used:
+            raise ValueError(f"{name}: {used} are SAC options DDPG does not implement; leave them at their defaults")
+        if self.actor_action_scale <= 0:
+            raise ValueError(f"{name}.actor_action_scale must be > 0, got {self.actor_action_scale}")
+        if self.exploration_std < 0 or (self.exploration_std_end is not None and self.exploration_std_end < 0):
+            raise ValueError(f"{name}.exploration_std (and _end) must be >= 0")
+        if self.exploration_std_steps < 0:
+            raise ValueError(f"{name}.exploration_std_steps must be >= 0, got {self.exploration_std_steps}")
+        for field_name in ("exploration_noise_clip", "action_clip"):
+            value = getattr(self, field_name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name}.{field_name} must be > 0 or null, got {value}")
+        if self.target_noise_clip <= 0:
+            raise ValueError(f"{name}.target_noise_clip must be > 0, got {self.target_noise_clip}")
+        if self.critic_loss not in self.CRITIC_LOSSES:
+            raise ValueError(f"{name}.critic_loss must be one of {self.CRITIC_LOSSES}, got {self.critic_loss!r}")
+        if (self.q_target_min is None) != (self.q_target_max is None):
+            raise ValueError(f"{name}.q_target_min and q_target_max go together: set both or neither")
+        if self.q_target_min is not None and not self.q_target_min < self.q_target_max:
+            raise ValueError(f"{name}.q_target_min ({self.q_target_min}) must be below q_target_max ({self.q_target_max})")
+        if self.action_l2_reg_weight < 0 or self.random_action_scale < 0 or self.critic_warmup_updates < 0:
+            raise ValueError(f"{name}: action_l2_reg_weight, random_action_scale and critic_warmup_updates must be >= 0")
+        if self.random_action_mode not in ("uniform", "actor_gaussian"):
+            raise ValueError(f"{name}.random_action_mode must be 'uniform' or 'actor_gaussian', got {self.random_action_mode!r}")
+        if self.actor_q_reduction == "min_random_pair" and self.num_critics < 2:
+            raise ValueError(f"{name}.actor_q_reduction min_random_pair needs num_critics >= 2")
+
+    def _name(self) -> str:
+        return "ddpg"
 
 
 def sac_critic_outputs(sac_cfg: Any) -> int:
@@ -671,6 +860,8 @@ class PPOCfg(_CommonCfg):
 
     def validate(self, cfg: Any) -> None:
         self._validate_common("ppo")
+        if self.state_preprocessor == "demo":
+            raise ValueError("ppo.state_preprocessor: demo is fitted on demo transitions, which PPO has none of: use none or running")
         if self.lr_schedule not in ("constant", "cosine"):
             raise ValueError(
                 f"ppo.lr_schedule must be 'constant' or 'cosine', got {self.lr_schedule!r}"

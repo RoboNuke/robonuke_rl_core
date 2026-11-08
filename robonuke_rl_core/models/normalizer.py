@@ -11,7 +11,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-__all__ = ["BlockRunningNorm", "BlockRewardScaler", "BlockReturnScaler"]
+__all__ = ["BlockRunningNorm", "BlockRewardScaler", "BlockReturnScaler", "InPlaceStandardScaler", "PerAgentPreprocessor",
+           "STATE_PREPROCESSORS"]
+
+#: ``<learner>.state_preprocessor`` values: no normalization, skrl's running scaler, or the same scaler fitted once on the
+#: demo rows (``PerAgentPreprocessor``)
+STATE_PREPROCESSORS = ("none", "running", "demo")
 
 
 class BlockRunningNorm(nn.Module):
@@ -336,3 +341,97 @@ class BlockReturnScaler(nn.Module):
                 torch.sqrt(self.running_variance[agent] + 1.0e-8), self.max_return[agent] / self.g_max
             ).view(1)
         )
+
+
+def _skrl_scaler():
+    from skrl.resources.preprocessors.torch import RunningStandardScaler
+
+    return RunningStandardScaler
+
+
+class InPlaceStandardScaler(_skrl_scaler()):
+    """skrl's ``RunningStandardScaler``, its statistics updated in place: skrl rebinds its buffers on every update, which a
+    captured CUDA graph (``sac.cuda_graph``) would not see. Same update rule, epsilon and clip; gradients pass (the
+    learner calls it with ``no_grad=False``: the critics' action goes through it into the actor's loss)."""
+
+    @torch.no_grad()
+    def _parallel_variance(self, input_mean: torch.Tensor, input_var: torch.Tensor, input_count: int) -> None:
+        delta = input_mean.to(self.running_mean) - self.running_mean
+        total = self.current_count + input_count
+        m2 = (self.running_variance * self.current_count + input_var.to(self.running_variance) * input_count
+              + delta**2 * self.current_count * input_count / total)
+        self.running_mean.add_(delta * input_count / total)
+        self.running_variance.copy_(m2 / total)
+        self.current_count.copy_(total)
+
+    @torch.no_grad()
+    def fit(self, x: torch.Tensor) -> None:
+        """Exactly ``x``'s mean and variance (no prior sample): the ``demo`` preprocessor's one-time fit."""
+        self.current_count.zero_()
+        self._parallel_variance(torch.mean(x, dim=0), torch.var(x, dim=0), x.shape[0])
+
+
+class PerAgentPreprocessor(nn.Module):
+    """One :class:`InPlaceStandardScaler` per agent (``<learner>.state_preprocessor``: ``running`` / ``demo``): rows
+    arrive agent-major, ``(num_agents * rows, size)``, and agent ``i``'s rows use, and with ``train`` update, agent ``i``'s
+    statistics only. ``update`` (``state_preprocessor_kwargs.update_normalizer_during_training``) gates every ``train``:
+    False leaves the statistics as they are (after the demo fit, frozen). Checkpoints per agent (``state_dict_for`` /
+    ``load_state_dict_into``), as :class:`BlockRunningNorm`'s."""
+
+    def __init__(self, num_agents: int, size: int, *, update: bool, epsilon: float = 1e-8, clip_threshold: float = 5.0,
+                 device=None) -> None:
+        super().__init__()
+        if num_agents < 1:
+            raise ValueError(f"num_agents must be >= 1, got {num_agents}")
+        self.num_agents = int(num_agents)
+        self.size = int(size)
+        self.update = bool(update)
+        self.scalers = nn.ModuleList(InPlaceStandardScaler(self.size, epsilon=float(epsilon), clip_threshold=float(clip_threshold),
+                                                           device=device) for _ in range(self.num_agents))
+
+    @property
+    def running_mean(self) -> torch.Tensor:
+        """Every agent's mean, stacked ``(num_agents, size)`` (read-only)."""
+        return torch.stack([s.running_mean for s in self.scalers])
+
+    @property
+    def running_variance(self) -> torch.Tensor:
+        return torch.stack([s.running_variance for s in self.scalers])
+
+    @property
+    def current_count(self) -> torch.Tensor:
+        return torch.stack([s.current_count for s in self.scalers])
+
+    def _blocks(self, x: torch.Tensor):
+        if x.shape[-1] != self.size:
+            raise ValueError(f"PerAgentPreprocessor(size={self.size}) got input with last dim {x.shape[-1]}")
+        if x.shape[0] % self.num_agents:
+            raise ValueError(f"input rows ({x.shape[0]}) must be divisible by num_agents ({self.num_agents})")
+        return x.view(self.num_agents, x.shape[0] // self.num_agents, self.size)
+
+    def __call__(self, x: torch.Tensor, train: bool = False, inverse: bool = False) -> torch.Tensor:
+        blocks = self._blocks(x)
+        out = [scaler(blocks[a], train=train and self.update, inverse=inverse, no_grad=False)
+               for a, scaler in enumerate(self.scalers)]
+        return torch.cat(out, dim=0) if self.num_agents > 1 else out[0]
+
+    def forward(self, x: torch.Tensor, train: bool = False, inverse: bool = False) -> torch.Tensor:
+        return self.__call__(x, train=train, inverse=inverse)
+
+    def fit(self, x: torch.Tensor) -> None:
+        """The ``demo`` preprocessor's one-time fit: every agent's statistics exactly ``x``'s (the same rows for each)."""
+        for scaler in self.scalers:
+            scaler.fit(x)
+
+    def state_dict_for(self, agent: int) -> dict:
+        s = self.scalers[agent]
+        return {k: getattr(s, k).detach().clone().cpu() for k in ("running_mean", "running_variance", "current_count")}
+
+    @torch.no_grad()
+    def load_state_dict_into(self, agent: int, state: dict) -> None:
+        missing = {"running_mean", "running_variance", "current_count"} - set(state)
+        if missing:
+            raise KeyError(f"normalizer state is missing keys: {sorted(missing)}")
+        s = self.scalers[agent]
+        for k in ("running_mean", "running_variance", "current_count"):
+            getattr(s, k).copy_(state[k].to(getattr(s, k).device).reshape(getattr(s, k).shape))

@@ -140,6 +140,83 @@ def test_sac_lr_warmup_counts_gradient_steps_and_works_with_a_constant_schedule(
     assert [c for _, c in seen] == pytest.approx([2.0e-3] * 4)
 
 
+def test_the_temperature_follows_the_lr_schedule_only_when_opted_in():
+    from robonuke_rl_core.learners.cfg import SACCfg
+    from robonuke_rl_core.optim import lr_at
+
+    for opted in (True, False):
+        learner = build_learner(
+            "sac", num_agents=2, envs_per_agent=2, lr_schedule="cosine", lr_end=1.5e-4, actor_lr=3e-4,
+            critic_lr=3e-4, entropy_lr=3e-4, gradient_steps=1, entropy_lr_schedule=opted,
+        )
+        fill_memory(learner)
+        seen = []
+        for _ in range(4):
+            learner.update(timestep=0, timesteps=8)  # 8 update rounds of 1 gradient step: the schedule's length
+            seen.append(float(learner.entropy_optimizer.lr[0]))
+        if opted:
+            # the actor's and critics' cosine, from entropy_lr to lr_end, step for step
+            assert seen == pytest.approx([lr_at(u, 8, 3e-4, 1.5e-4, "cosine") for u in range(4)])
+            assert seen[-1] < seen[0] and float(learner.critic_optimizer.lr[0]) == pytest.approx(seen[-1])
+        else:
+            assert seen == pytest.approx([3e-4] * 4)
+    with pytest.raises(ValueError, match="learn_entropy"):
+        SACCfg(entropy_lr_schedule=True, learn_entropy=False).validate(None)
+
+
+def test_the_temperature_step_logs_its_entropy_estimate_the_target_and_their_gap():
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2, target_entropy=-3.0, gradient_steps=1)
+    fill_memory(learner)
+    logged = []
+    learner.on_log.append(lambda agent, metrics, step: logged.append((agent, metrics)))
+    learner.update(timestep=0, timesteps=10)
+    per_agent = {agent: m for agent, m in logged if "entropy/current" in m}
+    assert set(per_agent) == {0, 1}
+    for agent, m in per_agent.items():
+        target, current, gap = (float(m[k]) for k in ("entropy/target", "entropy/current", "entropy/gap"))
+        assert target == -3.0
+        assert current == pytest.approx(-float(m["policy/log_prob"]), abs=1e-5)  # entropy_observations: current
+        assert gap == pytest.approx(current - target, abs=1e-6)
+        assert float(m["policy/mean_action"]) >= 0.0  # the noise-free action's size, with every update
+    off = build_learner("sac", num_agents=1, envs_per_agent=2, learn_entropy=False, gradient_steps=1)
+    fill_memory(off)
+    seen = []
+    off.on_log.append(lambda agent, metrics, step: seen.append(metrics))
+    off.update(timestep=0, timesteps=10)
+    assert seen and not any(k.startswith("entropy/") and k != "entropy/coefficient" for m in seen for k in m)
+
+
+def test_the_initial_policy_is_published_at_step_0_before_any_update():
+    import math
+
+    from helpers import OBS_DIM
+
+    learner = build_learner("sac", num_agents=2, envs_per_agent=3, target_entropy=-2.0, initial_entropy_value=0.01)
+    logged, flushed = [], []
+    learner.on_log.append(lambda agent, metrics, step: logged.append((agent, metrics, step)))
+    learner.on_flush.append(lambda step: flushed.append(step))
+    obs = torch.randn(6, OBS_DIM)
+    learner.act(obs, None, timestep=0, timesteps=100)
+    assert flushed == [0]  # published at once, as step 0
+    first = {agent: m for agent, m, step in logged if step == 0 and "policy/std" in m}
+    assert set(first) == {0, 1}
+    for m in first.values():
+        assert {"policy/std", "policy/log_prob", "policy/mean_action", "entropy/coefficient", "entropy/current",
+                "entropy/target", "entropy/gap", "lr/actor", "lr/critic", "lr/entropy"} <= set(m)
+        assert float(m["entropy/target"]) == -2.0 and float(m["entropy/coefficient"]) == pytest.approx(0.01)
+        assert float(m["entropy/current"]) == pytest.approx(-float(m["policy/log_prob"]))
+        assert math.isfinite(float(m["policy/std"])) and float(m["policy/std"]) > 0
+    learner.act(obs, None, timestep=0, timesteps=100)  # once only
+    learner.act(obs, None, timestep=1, timesteps=100)
+    assert flushed == [0]
+    evaluating = build_learner("sac", num_agents=1, envs_per_agent=2)
+    evaluating.enable_training_mode(False)
+    seen = []
+    evaluating.on_flush.append(lambda step: seen.append(step))
+    evaluating.act(torch.randn(2, OBS_DIM), None, timestep=0, timesteps=100)
+    assert seen == []  # an eval policy logs no training curve
+
+
 # ------------------------------------------------------------------ reward shaper
 def scale_rewards(rewards, timestep, timesteps):
     """A "module:name" shaper, the only way a callable enters a config."""
@@ -289,7 +366,7 @@ def test_ppo_gae_matches_a_per_env_reference_loop():
         num_agents=num_agents,
         envs_per_agent=envs_per_agent,
         rollout=rollout,
-        normalize_observations=False,
+        state_preprocessor="none",
         normalize_values=False,
         time_limit_bootstrap=False,
     )
@@ -343,7 +420,7 @@ def test_sac_bootstraps_through_a_timeout_but_not_a_terminal_state():
     Isaac Lab's Factory and Forge raise both flags at the limit, so reading ``terminated``
     alone would drop gamma*V(next) on every single episode.
     """
-    learner = build_learner("sac", num_agents=2, envs_per_agent=2, normalize_observations=False)
+    learner = build_learner("sac", num_agents=2, envs_per_agent=2, state_preprocessor="none")
     fill_memory(learner, steps=4)
     rows = 3
     sampled = dict(

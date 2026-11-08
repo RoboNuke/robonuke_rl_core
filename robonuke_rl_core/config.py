@@ -5,7 +5,12 @@ Load order: class defaults and task defaults -> most-base file -> ... -> passed 
 OmegaConf does the merging, type checks, required-field checks, CLI parsing and YAML output.
 There is no interpolation (``${...}``) in our configs. This module imports without Isaac Lab:
 Isaac Lab is imported only inside :func:`load_task_cfg`, :func:`task_cfg_to_dict` and
-:func:`apply_task_cfg`.
+:func:`apply_task_cfg`, and only for a task Isaac Sim simulates.
+
+``task.simulator`` says who simulates the task: ``isaac`` (the default), or ``standalone``, an env that brings its
+own simulator (MuJoCo) behind an Isaac Lab env's surface. The entry points read it from the files before anything
+else (:func:`simulator_of`) and start Isaac Sim only for ``isaac`` (:func:`start_simulator`); a standalone task's cfg
+comes from gym's registry (its ``env_cfg_entry_point``), a class that says ``SIMULATOR = "standalone"``.
 """
 
 from __future__ import annotations
@@ -37,6 +42,15 @@ from .configfile import (
 #: separately from the env cfg, ``meta`` and ``derived`` are written by the pipeline
 RESERVED = ("base", "task", "meta", "derived")
 RESOLVED_NAME = "resolved_config.yaml"
+#: ``task.simulator`` values: Isaac Sim, or an env that runs its own simulator (module docstring)
+ISAAC = "isaac"
+STANDALONE = "standalone"
+SIMULATORS = (ISAAC, STANDALONE)
+
+
+def _cfg_simulator(env_cfg: Any) -> str:
+    """The simulator a task cfg object declares: its class's ``SIMULATOR`` (Isaac Lab's cfgs: none, ``isaac``)."""
+    return str(getattr(type(env_cfg), "SIMULATOR", ISAAC))
 
 
 # ----------------------------------------------------------------------------- sections
@@ -109,8 +123,22 @@ def resolve_callable(ref: str) -> Any:
 
 
 # ---------------------------------------------------------------------------- task cfg
-def load_task_cfg(name: str) -> Any:
-    """The task's default env cfg object, from the Isaac Lab gym registry."""
+def load_task_cfg(name: str, simulator: str = ISAAC) -> Any:
+    """The task's default env cfg object: from the Isaac Lab gym registry, or for a standalone task from gym's
+    registry entry's ``env_cfg_entry_point`` (``"module:Class"``), which must declare ``SIMULATOR = "standalone"``."""
+    if simulator == STANDALONE:
+        import gymnasium as gym
+
+        if name not in gym.registry:
+            raise ValueError(f"task.simulator: standalone task {name!r} is not registered with gym (the project's setup())")
+        entry = gym.spec(name).kwargs.get("env_cfg_entry_point")
+        if not isinstance(entry, str) or ":" not in entry:
+            raise ValueError(f"task {name!r}: its gym registration needs kwargs env_cfg_entry_point='module:Class', got {entry!r}")
+        module, attr = entry.split(":", 1)
+        env_cfg = getattr(importlib.import_module(module), attr)()
+        if _cfg_simulator(env_cfg) != STANDALONE:
+            raise ValueError(f"task.simulator: standalone, but {entry} does not declare SIMULATOR = 'standalone'")
+        return env_cfg
     try:
         import isaaclab_tasks  # noqa: F401  (registers the tasks)
         from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
@@ -126,8 +154,13 @@ def task_cfg_to_dict(env_cfg: Any) -> dict:
     """Env cfg object -> plain dict, the way Isaac Lab's hydra integration does it.
 
     Works on a deep copy: Isaac Lab's space conversion edits the object in place, and this is
-    also called on the live env's cfg (see :func:`dump`).
+    also called on the live env's cfg (see :func:`dump`). A standalone task's cfg holds plain values: its own
+    ``to_dict``.
     """
+    if _cfg_simulator(env_cfg) == STANDALONE:
+        data = copy.deepcopy(env_cfg).to_dict()
+        data.pop("SIMULATOR", None)  # the class's marker (configclass's to_dict lists it), not a setting
+        return data
     from isaaclab.envs.utils.spaces import replace_env_cfg_spaces_with_strings
     from isaaclab.utils import replace_slices_with_strings
 
@@ -142,6 +175,9 @@ def apply_task_cfg(env_cfg: Any, data: dict) -> Any:
     (``task_cfg_to_dict`` serialized them), and Isaac Lab's ``from_dict`` refuses a value whose
     type differs from the attribute's current one.
     """
+    if _cfg_simulator(env_cfg) == STANDALONE:
+        env_cfg.from_dict(data)
+        return env_cfg
     from isaaclab.envs.utils.spaces import (
         replace_env_cfg_spaces_with_strings,
         replace_strings_with_env_cfg_spaces,
@@ -239,6 +275,7 @@ def _build(layers: List[tuple]) -> Config:
     #    model.actor / model.critic in step 4. Also per layer: no interpolation, no
     #    task.cfg.seed, and record every task.cfg path the layer sets.
     task_name = None
+    simulator = ISAAC
     model_architecture = None  # (value, which layer set it)
     task_overrides: Dict[str, str] = {}
     for where, layer in layers:
@@ -246,6 +283,9 @@ def _build(layers: List[tuple]) -> Config:
         name = OmegaConf.select(layer, "task.name")
         if name is not None:
             task_name = name
+        chosen = OmegaConf.select(layer, "task.simulator")
+        if chosen is not None:
+            simulator = str(chosen)
         architecture = OmegaConf.select(layer, "model.architecture")
         if architecture is not None:
             model_architecture = (architecture, where)
@@ -261,10 +301,17 @@ def _build(layers: List[tuple]) -> Config:
     if task_name is None:
         raise ValueError("no layer sets task.name; set it in a config file or with task.name=<id>")
 
+    if simulator not in SIMULATORS:
+        raise ValueError(f"task.simulator must be one of {SIMULATORS}, got {simulator!r}")
+
     # 4. the schema: sections from their dataclasses, task from the env cfg defaults
-    env_cfg = load_task_cfg(task_name)
+    env_cfg = load_task_cfg(task_name) if simulator == ISAAC else load_task_cfg(task_name, simulator)
+    if _cfg_simulator(env_cfg) != simulator:
+        raise ValueError(
+            f"task {task_name!r} is simulated by {_cfg_simulator(env_cfg)!r}, but task.simulator is {simulator!r}"
+        )
     task_defaults = task_cfg_to_dict(env_cfg)
-    root = OmegaConf.create({"task": {"name": MISSING, "cfg": task_defaults}})
+    root = OmegaConf.create({"task": {"name": MISSING, "simulator": ISAAC, "cfg": task_defaults}})
     for name, cls in SECTIONS.items():
         if name == "model" and model_architecture is not None:
             try:
@@ -469,6 +516,44 @@ def add_config_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
+def simulator_of(args: argparse.Namespace, overrides: Any = None) -> str:
+    """``task.simulator`` from the files the args name (:func:`add_config_args`: ``--config``'s chain, or
+    ``--from_run``'s resolved config) and the CLI, read before anything is imported: whether to start Isaac Sim."""
+    if args.config:
+        layers = [layer for _, layer in load_file_chain(args.config)]
+    else:
+        path = Path(args.from_run).expanduser()
+        layers = [_file_layer(path / RESOLVED_NAME if path.is_dir() else path)]
+    layers.append(_cli_layer(overrides))
+    simulator = str(OmegaConf.select(OmegaConf.merge(*layers), "task.simulator", default=ISAAC))
+    if simulator not in SIMULATORS:
+        raise ValueError(f"task.simulator must be one of {SIMULATORS}, got {simulator!r}")
+    return simulator
+
+
+_ACTIVE_SIMULATOR: Optional[str] = None
+
+
+def active_simulator() -> Optional[str]:
+    """What :func:`start_simulator` started in this process (None before it ran): a project's ``setup()`` skips its
+    Isaac-only registrations for a standalone task."""
+    return _ACTIVE_SIMULATOR
+
+
+def start_simulator(args: argparse.Namespace, simulator: str) -> Any:
+    """Isaac Sim's ``AppLauncher`` for ``isaac`` (its args added to the parser by the entry point), None for a
+    standalone task. A caller closes ``launcher.app`` only when it got one."""
+    global _ACTIVE_SIMULATOR
+    if simulator not in SIMULATORS:
+        raise ValueError(f"task.simulator must be one of {SIMULATORS}, got {simulator!r}")
+    _ACTIVE_SIMULATOR = simulator
+    if simulator == STANDALONE:
+        return None
+    from isaaclab.app import AppLauncher
+
+    return AppLauncher(args)
+
+
 def load_from_args(args: argparse.Namespace, overrides: Any = None) -> Config:
     """Dispatch on the args added by :func:`add_config_args`."""
     if bool(args.config) == bool(args.from_run):
@@ -480,7 +565,7 @@ def load_from_args(args: argparse.Namespace, overrides: Any = None) -> Config:
 
 # package sections are registered here, at the bottom of this file. The imports sit here, not
 # at the top, because the config classes they bring in import nothing from this module.
-from .learners.cfg import PPOCfg, SACCfg, TrainerCfg  # noqa: E402
+from .learners.cfg import DDPGCfg, PPOCfg, SACCfg, TrainerCfg  # noqa: E402
 from .losses.cfg import LossesCfg  # noqa: E402
 from .envs.cfg import ControllerCfg, WrappersCfg  # noqa: E402
 from .evaluation import EvalCfg  # noqa: E402
@@ -492,6 +577,7 @@ register_section("experiment", ExperimentCfg)
 register_section("wandb", WandbCfg)
 register_section("trainer", TrainerCfg)
 register_section("sac", SACCfg)
+register_section("ddpg", DDPGCfg)
 register_section("ppo", PPOCfg)
 register_section("model", SimbaModelCfg)  # the default; model.architecture swaps it
 register_section("memory", MemoryCfg)

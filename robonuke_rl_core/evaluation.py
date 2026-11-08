@@ -1003,7 +1003,7 @@ def register_eval_policy(learner: str, fn: Any, *, best_checkpoint: Optional[str
     """Let eval and debug load a project learner's checkpoint (call in ``setup``).
     ``best_checkpoint``: the file name the learner keeps its best in, so ``--checkpoint best``
     (the default) finds it."""
-    if learner in ("sac", "ppo"):
+    if learner in ("sac", "ppo", "ddpg"):
         raise ValueError(f"{learner!r} is the package's own learner; its eval policy is built in")
     if learner in EVAL_POLICY_BUILDERS:
         raise ValueError(f"an eval policy for learner {learner!r} is already registered")
@@ -1023,15 +1023,16 @@ def build_eval_policy(
     and no optimizer state is loaded.
     """
     from .learners.cfg import LEARNERS, sac_critic_outputs
+    from .learners.ddpg import DDPG
     from .learners.ppo import PPO
     from .learners.sac import SAC
     from .models.factory import build_models
 
-    classes = {"sac": SAC, "ppo": PPO}
+    classes = {"sac": SAC, "ppo": PPO, "ddpg": DDPG}
     learner_name = cfg.trainer.learner
     if learner_name in EVAL_POLICY_BUILDERS:
         return EVAL_POLICY_BUILDERS[learner_name](cfg, env, checkpoint, deterministic)
-    routes = list(getattr(cfg[learner_name], "route_labels", None) or []) if learner_name == "sac" else []
+    routes = list(getattr(cfg[learner_name], "route_labels", None) or []) if learner_name in ("sac", "ddpg") else []
     if routes:
         return _build_routed_eval_policy(cfg, env, checkpoint, deterministic, routes)
     return _build_single_eval_policy(cfg, env, checkpoint, deterministic)
@@ -1040,11 +1041,12 @@ def build_eval_policy(
 def _build_single_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic: bool, learner_cfg: Any = None) -> tuple:
     """:func:`build_eval_policy` for one learner (``learner_cfg``: its section, by default the run's)."""
     from .learners.cfg import LEARNERS, sac_critic_outputs
+    from .learners.ddpg import DDPG
     from .learners.ppo import PPO
     from .learners.sac import SAC
     from .models.factory import build_models
 
-    classes = {"sac": SAC, "ppo": PPO}
+    classes = {"sac": SAC, "ppo": PPO, "ddpg": DDPG}
     learner_name = cfg.trainer.learner
     if learner_cfg is None:
         learner_cfg = cfg[learner_name]
@@ -1058,7 +1060,7 @@ def _build_single_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic
     controller_cfg = getattr(cfg, "controller", None)
     # the critics are loaded too, so they are built for the run's critic action (register_critic_action)
     transform = None
-    if learner_name == "sac":
+    if learner_name in ("sac", "ddpg"):
         from .learners.sac import critic_action_space, critic_action_transform
 
         transform = critic_action_transform(cfg, env)
@@ -1072,13 +1074,13 @@ def _build_single_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic
         1,  # one agent
         env.device,
         controller_cfg,
-        num_critics=int(learner_cfg.num_critics) if learner_name == "sac" else 2,
-        critic_outputs=sac_critic_outputs(learner_cfg) if learner_name == "sac" else 1,
+        num_critics=int(learner_cfg.num_critics) if learner_name in ("sac", "ddpg") else 2,
+        critic_outputs=sac_critic_outputs(learner_cfg) if learner_name in ("sac", "ddpg") else 1,
         critic_action_space=critic_space,
     )
     extra = (
         {"model_cfg": cfg.model, "controller_cfg": controller_cfg, "critic_action_space": critic_space}
-        if learner_name == "sac"
+        if learner_name in ("sac", "ddpg")
         else {}
     )
     learner = classes[learner_name](
@@ -1101,6 +1103,8 @@ def _build_single_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic
         learner.enable_models_training_mode(False)
 
     def policy(observations: torch.Tensor, states: Optional[torch.Tensor]) -> torch.Tensor:
+        if hasattr(learner, "eval_actions"):  # a learner with its own acting rule (DDPG: its scaled, clamped mean)
+            return learner.eval_actions(observations, deterministic)
         with torch.no_grad():
             inputs = {"observations": learner.normalize_observations(observations)}
             actions, outputs = learner.policy.act(inputs, role="policy")
@@ -1159,7 +1163,7 @@ class _RoutedEvalPolicy:
 
 
 def _build_routed_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic: bool, routes) -> tuple:
-    """:func:`build_eval_policy` for a routed SAC: ``checkpoint`` is one phase's file,
+    """:func:`build_eval_policy` for a routed SAC or DDPG: ``checkpoint`` is one phase's file,
     ``<run>/<phase>/checkpoints/<name>``; every phase's file of that name is loaded."""
     import copy
     from pathlib import Path
@@ -1168,8 +1172,9 @@ def _build_routed_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic
     base = path.parent.parent.parent
     parts = {}
     metadata = {}
+    section = cfg[cfg.trainer.learner]  # the routed learner's own section (sac or ddpg)
     for route in routes:
-        route_cfg = copy.deepcopy(cfg.sac)
+        route_cfg = copy.deepcopy(section)
         route_cfg.route_label = route
         route_cfg.route_labels = []
         route_cfg.demo_transitions = None  # eval stores and samples nothing
@@ -1177,5 +1182,5 @@ def _build_routed_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic
             cfg, env, base / route / "checkpoints" / path.name, deterministic, learner_cfg=route_cfg
         )
         parts[route] = (policy, learner)
-    routed = _RoutedEvalPolicy(parts, cfg.sac.std_label_names, deterministic)
+    routed = _RoutedEvalPolicy(parts, section.std_label_names, deterministic)
     return routed, routed, metadata

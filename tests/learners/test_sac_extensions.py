@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from helpers import ACT_DIM, OBS_DIM, build_learner, fill_memory
-from robonuke_rl_core.learners.cfg import SACCfg
+from robonuke_rl_core.learners.cfg import SACCfg, StatePreprocessorKwargsCfg
 
 from test_independence import UNTOUCHED, AGENT_UNDER_TEST, assert_same, make_extreme, snapshot
 
@@ -166,7 +166,7 @@ def _critic_target(learner, rows: int = 4):
 
 def test_without_backup_entropy_the_target_has_no_entropy_bonus():
     """The two targets differ by exactly gamma * alpha * log_pi(a'|s') on non-terminal rows."""
-    learner = build_learner("sac", num_agents=1, normalize_observations=False, initial_entropy_value=0.5)
+    learner = build_learner("sac", num_agents=1, state_preprocessor="none", initial_entropy_value=0.5)
     fill_memory(learner)
     torch.manual_seed(1)
     with_bonus, log_prob = _critic_target(learner)
@@ -496,7 +496,7 @@ def _transform_step(learner, transform):
 
 
 def test_a_critic_action_transform_feeds_every_critic_call_with_the_raw_observations():
-    learner = build_learner("sac", num_agents=1, gradient_steps=1, policy_delay=1)
+    learner = build_learner("sac", num_agents=1, gradient_steps=1, policy_delay=1, state_preprocessor="none")
     seen = []
 
     def transform(observations, actions):
@@ -517,7 +517,7 @@ def test_an_asymmetric_learner_hands_the_transform_the_critic_states_not_the_obs
     observations, so it can read what is in the state alone."""
     from helpers import STATE_DIM
 
-    learner = build_learner("sac", num_agents=1, asymmetric=True, gradient_steps=1, policy_delay=1)
+    learner = build_learner("sac", num_agents=1, asymmetric=True, gradient_steps=1, policy_delay=1, state_preprocessor="none")
     seen = []
 
     def transform(critic_inputs, actions):
@@ -572,7 +572,7 @@ def test_the_transform_sees_the_states_of_demo_rows_too(tmp_path):
 
 
 def test_without_a_transform_the_critics_take_the_agents_action():
-    learner = build_learner("sac", num_agents=1, gradient_steps=1, policy_delay=1)
+    learner = build_learner("sac", num_agents=1, gradient_steps=1, policy_delay=1, state_preprocessor="none")
     taken, _ = _transform_step(learner, None)
     assert all(actions.abs().max() <= 1.0 for _, actions in taken)  # the squashed policy's own
 
@@ -786,7 +786,7 @@ def test_demo_rows_fold_within_their_episodes_and_an_unmarked_end_is_refused():
 
 
 def test_with_n_step_the_memory_gets_one_folded_row_per_env_per_step_and_the_target_its_discount():
-    learner = build_learner("sac", num_agents=2, n_step=3, normalize_observations=False)
+    learner = build_learner("sac", num_agents=2, n_step=3, state_preprocessor="none")
     stored = []
     add = learner.memory.add_samples
     learner.memory.add_samples = lambda **values: (stored.append(values), add(**values))[1]
@@ -896,3 +896,83 @@ def test_metrics_by_label_needs_the_labels():
 
     with pytest.raises(ValueError, match="std_by_label"):
         SACCfg(metrics_by_label=["residual/position_mm"]).validate(None)
+
+
+def test_the_demo_preprocessor_fits_once_on_the_demos_and_stays_frozen(tmp_path):
+    # state_preprocessor: demo -- the observation and critic-action preprocessors get exactly the demos' mean and
+    # variance at init, the same for every agent, and (update_normalizer_during_training false) no update moves them
+    torch.manual_seed(3)
+    obs = torch.randn(64, OBS_DIM) * 3 + 2
+    acts = torch.rand(64, ACT_DIM) * 2 - 1
+    learner = _demo_learner(tmp_path, state_preprocessor="demo",
+                            demo_transitions=write_demos(tmp_path / "fit.pt", rows=64, observations=obs, actions=acts))
+    norm, cnorm = learner.observation_normalizer, learner.critic_action_normalizer
+    for a in range(2):
+        torch.testing.assert_close(norm.scalers[a].running_mean.float(), obs.mean(0), atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(norm.scalers[a].running_variance.float(), obs.var(0), atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(cnorm.scalers[a].running_mean.float(), acts.mean(0), atol=1e-4, rtol=1e-4)
+    before = (norm.scalers[0].running_mean.clone(), cnorm.scalers[0].running_mean.clone())
+    fill_memory(learner)
+    learner.update(timestep=10, timesteps=100)
+    assert torch.equal(norm.scalers[0].running_mean, before[0]) and torch.equal(cnorm.scalers[0].running_mean, before[1])
+    # the critics' action is z-scored by those stats
+    x = torch.rand(2 * 4, ACT_DIM) * 2 - 1
+    expected = ((x - acts.mean(0)) / (acts.var(0).sqrt() + 1e-8)).clamp(-5, 5)
+    torch.testing.assert_close(learner._critic_actions({}, "observations", x), expected, atol=1e-3, rtol=1e-3)
+    assert "critic_actions" in learner._checkpoint_normalizers()
+
+
+def test_the_demo_preprocessor_keeps_updating_when_asked(tmp_path):
+    learner = _demo_learner(tmp_path, state_preprocessor="demo",
+                            state_preprocessor_kwargs=StatePreprocessorKwargsCfg(update_normalizer_during_training=True))
+    before = learner.observation_normalizer.scalers[0].running_mean.clone()
+    fill_memory(learner)
+    learner.update(timestep=10, timesteps=100)
+    assert not torch.equal(learner.observation_normalizer.scalers[0].running_mean, before)
+
+
+def test_the_running_preprocessor_updates_and_none_has_no_normalizer(tmp_path):
+    learner = build_learner("sac", num_agents=2, state_preprocessor="running")
+    before = learner.observation_normalizer.scalers[1].running_mean.clone()
+    fill_memory(learner)
+    learner.update(timestep=10, timesteps=100)
+    assert not torch.equal(learner.observation_normalizer.scalers[1].running_mean, before)
+    assert build_learner("sac", num_agents=2, state_preprocessor="none").observation_normalizer is None
+
+
+def test_the_preprocessor_config_is_checked():
+    with pytest.raises(ValueError, match="demo_transitions"):
+        SACCfg(state_preprocessor="demo").validate(None)
+    with pytest.raises(ValueError, match="state_preprocessor"):
+        SACCfg(state_preprocessor="once").validate(None)
+
+
+def test_a_demo_loader_builds_the_transitions_from_the_file(tmp_path):
+    # register_demo_loader: the learner hands the loaded file and its route to the loader and uses what it returns
+    raw = tmp_path / "raw.pt"
+    torch.save({"episodes": [torch.randn(16, OBS_DIM)]}, raw)
+    seen = []
+
+    def loader(data, route):
+        seen.append((sorted(data), route))
+        obs = data["episodes"][0]
+        rows = obs.shape[0]
+        return {"transitions": {"observations": obs, "actions": torch.zeros(rows, ACT_DIM), "rewards": torch.zeros(rows, 1),
+                                "next_observations": obs, "terminated": torch.zeros(rows, 1, dtype=torch.bool),
+                                "truncated": torch.zeros(rows, 1, dtype=torch.bool)}, "meta": {}}
+
+    import robonuke_rl_core.learners.sac as sac_module
+
+    original = sac_module.SAC._load_demo_transitions
+
+    def load_with_loader(self):
+        self.demo_loader = loader
+        return original(self)
+
+    sac_module.SAC._load_demo_transitions = load_with_loader
+    try:
+        learner = _demo_learner(tmp_path, demo_transitions=str(raw))
+    finally:
+        sac_module.SAC._load_demo_transitions = original
+    assert seen == [(["episodes"], None)]
+    assert learner._demo["observations"].shape == (16, OBS_DIM)

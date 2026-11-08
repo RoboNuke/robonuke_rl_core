@@ -13,7 +13,7 @@ from helpers import ACT_DIM, OBS_DIM, build_learner, fill_memory
 FLASH = dict(
     architecture="flashsac", critic_distribution="categorical", critic_num_bins=11, adaptive_reward_scaling=True,
     weight_normalization=True, target_entropy_sigma=0.15, initial_entropy_value=0.01, entropy_loss_form="alpha",
-    cross_batch_value=True, noise_repeat=True, normalize_observations=False, gradient_steps=2, policy_delay=2,
+    cross_batch_value=True, noise_repeat=True, state_preprocessor="none", gradient_steps=2, policy_delay=2,
 )
 
 

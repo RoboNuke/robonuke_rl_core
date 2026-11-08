@@ -75,7 +75,7 @@ def write(tmp_path, extra: str = "", name: str = "exp.yaml"):
 def test_every_section_loads_with_its_defaults(tmp_path):
     cfg = load_config(write(tmp_path))
     assert set(cfg.sections) == {
-        "experiment", "wandb", "trainer", "sac", "ppo", "model", "memory", "losses", "eval",
+        "experiment", "wandb", "trainer", "sac", "ppo", "ddpg", "model", "memory", "losses", "eval",
         "controller", "wrappers", "hpc",
     }
     assert cfg.trainer.learner == "sac"
@@ -171,7 +171,7 @@ def test_ppo_rules(tmp_path, overrides, needle):
         (["model.actor.min_log_std=3.0"], "min_log_std"),
         (["model.actor.squash=false"], "squash"),  # trainer.learner is sac here
         (["model.critic.num_layers=0"], "num_layers"),
-        (["model.critic.output_init_scale=0.0"], "output_init_scale"),
+        (["model.critic.output_init_scale=-0.1"], "output_init_scale"),
     ],
 )
 def test_mlp_rules(tmp_path, overrides, needle):
@@ -242,8 +242,8 @@ def test_a_registered_project_learner_is_accepted_and_duplicates_raise():
         learner_cfg.TrainerCfg(learner="bc", total_timesteps=1).validate(None)
     learner_cfg.register_learner("bc")
     try:
-        assert learner_cfg.known_learners() == ("sac", "ppo", "bc")
-        assert learner_cfg.LEARNERS == ("sac", "ppo")  # the package's own set is unchanged
+        assert learner_cfg.known_learners() == ("sac", "ppo", "ddpg", "bc")
+        assert learner_cfg.LEARNERS == ("sac", "ppo", "ddpg")  # the package's own set is unchanged
         with pytest.raises(ValueError, match="already registered"):
             learner_cfg.register_learner("bc")
         with pytest.raises(ValueError, match="already registered"):

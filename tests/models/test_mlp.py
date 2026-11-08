@@ -239,7 +239,7 @@ def valid_fields(**overrides) -> dict:
         ({"num_layers": 0}, "num_layers"),
         ({"hidden_size": 0}, "hidden_size"),
         ({"init": "he"}, "init"),
-        ({"output_init_scale": 0.0}, "output_init_scale"),
+        ({"output_init_scale": -0.1}, "output_init_scale"),
         ({"activation": "Swish"}, "activation"),
     ],
 )

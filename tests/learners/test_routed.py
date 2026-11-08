@@ -184,7 +184,7 @@ def test_holding_works_through_an_n_step_window():
 
 
 def test_a_routed_residual_logs_its_steps_memory_and_updates():
-    learner = _held_learner(route_clock=True, learning_starts=0, batch_size=2)
+    learner = _held_learner(route_clock=True, learning_starts=0, batch_size=2, trainer_overrides={"write_interval": 1})
     learner.enable_training_mode(True)
     seen = []
     learner.on_log.append(lambda agent, metrics, step: seen.append(metrics))
@@ -238,15 +238,18 @@ def PT(route, channel, weight):
     return PotentialTermCfg(route=route, channel=channel, weight=weight)
 
 
-def _shaped_learner(**extra):
-    return build_learner("sac", num_agents=1, envs_per_agent=1, rollout=64, std_by_label="eval_state/phase/id",
+def _shaped_learner(learner="sac", **extra):
+    if learner == "ddpg":
+        extra.setdefault("architecture", "mlp")
+    return build_learner(learner, num_agents=1, envs_per_agent=1, rollout=64, std_by_label="eval_state/phase/id",
                          std_label_names=NAMES, route_label="insert", discount_factor=0.9,
                          potential_terms=[PT("insert", "eval_state/phase/tip_mm", 0.1), PT("screw", "eval_state/phase/x", 1.0)],
                          **extra)
 
 
-def test_potential_shaping_adds_gamma_phi_next_minus_phi_to_the_local_reward():
-    learner = _shaped_learner()
+@pytest.mark.parametrize("learner_name", ["sac", "ddpg"])  # DDPG stores through SAC's record_transition
+def test_potential_shaping_adds_gamma_phi_next_minus_phi_to_the_local_reward(learner_name):
+    learner = _shaped_learner(learner_name)
     learner.enable_training_mode(True)
     _shaped_step(learner, 0, 2, tip=30.0)  # the first label: Phi(s) = -3, nothing stored
     _shaped_step(learner, 1, 2, tip=20.0)  # 0.9 * -2 - -3 = 1.2
@@ -316,3 +319,20 @@ def test_a_demo_file_must_carry_the_learners_shaping_and_its_own_success_flags(t
                 "meta": {"potential_terms": terms, "discount_factor": 0.9}}, no_flags)
     with pytest.raises(KeyError, match="success"):
         _shaped_learner(demo_transitions=str(no_flags), demo_storage="memory", success_clone_weight=1.0)
+
+
+def test_a_routed_residual_logs_its_progress_every_interval_before_it_learns():
+    """The route counters go out every write_interval from the first step, also while the residual waits for its
+    learning_starts_rows (no update metrics yet): how close it is to starting."""
+    learner = _held_learner(route_clock=True, learning_starts_rows=1000, batch_size=2, trainer_overrides={"write_interval": 2})
+    learner.enable_training_mode(True)
+    seen = []
+    learner.on_log.append(lambda agent, metrics, step: seen.append((step, dict(metrics))))
+    for t in range(6):
+        _held_step(learner, t, 2, still=0)
+        learner.post_interaction(timestep=t, timesteps=100)
+    logged = [(step, m) for step, m in seen if "route/steps" in m]
+    assert [step for step, _ in logged] == [1, 3, 5]  # every second step, none skipped
+    assert [float(m["route/memory_rows"]) for _, m in logged] == [1.0, 3.0, 5.0]
+    assert all(float(m["route/updates"]) == 0.0 for _, m in logged)  # nothing learned yet
+    assert not any("loss/critic" in m for _, m in seen)

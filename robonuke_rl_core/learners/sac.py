@@ -3,7 +3,7 @@
 Ported from RoboNuke/generalized_hybrid_vic_action_space ``learning/sac.py``, minus AMP,
 the distributed branches, the auxiliary-loss manager, the contact/rotation supervision and
 the per-axis action metrics. Changed for per-agent independence: gradients are clipped per
-agent and the observation/state normalizers are per agent (``BlockRunningNorm``).
+agent and the observation/state/critic-action preprocessors are per agent (``state_preprocessor``, ``models/normalizer.py``).
 
 Beyond classic SAC, all off by default:
 
@@ -40,6 +40,7 @@ reduces with a constant factor, so agent ``i``'s update never depends on agent `
 from __future__ import annotations
 
 import contextlib
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import gymnasium
@@ -56,7 +57,28 @@ from .cfg import sac_critic_outputs
 from .cuda_graph import StepGraphs
 from .n_step import NStepWindow, n_step_rows
 
-__all__ = ["SAC", "register_critic_action", "critic_action_transform", "critic_action_space", "categorical_projection"]
+__all__ = ["SAC", "register_critic_action", "critic_action_transform", "critic_action_space", "categorical_projection",
+           "register_demo_loader", "demo_loader"]
+
+#: ``fn(cfg, env) -> loader | None``, registered by a project in its training script's ``setup()``: a loader
+#: ``(data, route_label) -> transitions`` turns a demo file that does not hold ready transitions (``data``, the file's
+#: dict as loaded; a project's raw demo episodes, say) into this learner's ``{"transitions": {...}, "meta": {...}}``, with
+#: the env's own code -- ``route_label`` the learner's (None unrouted). At most one builder may answer; without one the
+#: file must already be ``{"transitions": ..., "meta": ...}``
+DEMO_LOADER_BUILDERS: List[Any] = []
+
+
+def register_demo_loader(fn: Any) -> None:
+    """Add a :data:`DEMO_LOADER_BUILDERS` entry; ``scripts/train.py`` asks each once its env is built."""
+    DEMO_LOADER_BUILDERS.append(fn)
+
+
+def demo_loader(cfg: Any, env: Any) -> Any:
+    """The one loader a registered builder returns for this run, or None."""
+    found = [f for f in (fn(cfg, env) for fn in DEMO_LOADER_BUILDERS) if f is not None]
+    if len(found) > 1:
+        raise ValueError(f"{len(found)} registered demo-loader builders answered for this run; at most one may")
+    return found[0] if found else None
 
 #: ``fn(cfg, env) -> transform | None``, registered by a project in its training script's
 #: ``setup()``. A transform ``(critic_inputs, actions) -> actions`` gives the critics another action
@@ -116,7 +138,18 @@ def categorical_projection(probs: torch.Tensor, atoms: torch.Tensor, min_value: 
     return projected
 
 
+def masked_lerp_(targets, sources, weight: float, keep: torch.Tensor) -> None:
+    """``target <- target + weight * (source - target)``, in place, for the agents ``keep`` marks only (every tensor's
+    leading dimension is the agent); the others are left untouched. Device ops only (a captured graph replays it)."""
+    for target, source in zip(targets, sources):
+        w = keep.to(target.dtype).mul(weight).view((-1,) + (1,) * (target.dim() - 1))
+        target.lerp_(source, w)
+
+
 class SAC(LearnerBase):
+    #: the learner has an entropy temperature (``entropy/coefficient``); DDPG has none
+    HAS_TEMPERATURE = True
+
     def __init__(self, *, model_cfg=None, controller_cfg=None, critic_action_space=None, **kwargs) -> None:
         """``model_cfg`` and ``controller_cfg`` are only needed when
         ``sac.periodic_reset_enabled`` rebuilds models — a rebuild has to reproduce the same
@@ -131,6 +164,8 @@ class SAC(LearnerBase):
         #: observations, or the states when asymmetric; or None: the critics take the agent's
         #: action as it is
         self.critic_action_transform: Optional[Any] = None
+        #: ``(data, route_label) -> {"transitions", "meta"}`` (:func:`demo_loader`), set before ``init()`` like the transform
+        self.demo_loader: Optional[Any] = None
 
         self._num_critics = int(self.cfg.num_critics)
         required = ("policy", "critics", "target_critics")
@@ -217,14 +252,13 @@ class SAC(LearnerBase):
             pmf = lengths ** (-float(self.cfg.noise_repeat_zeta_s))
             self._zeta_cdf = torch.cumsum(pmf / pmf.sum(), dim=0)
 
-        if self.cfg.normalize_observations:
-            self.observation_normalizer = self.make_normalizer(self.observation_space)
-            self.state_normalizer = (
-                self.make_normalizer(self.state_space) if self._asymmetric else None
-            )
-        else:
-            self.observation_normalizer = None
-            self.state_normalizer = None
+        # state_preprocessor (none: no normalizer)
+        self.observation_normalizer = self.make_normalizer(self.observation_space)
+        self.state_normalizer = self.make_normalizer(self.state_space) if self._asymmetric else None
+        #: the critics' action preprocessor (state_preprocessor, as the observations'), at the width the critics were
+        #: built with (critic_action_space: a registered critic action transform's), here so an eval-built learner
+        #: loads it from the checkpoint too
+        self.critic_action_normalizer = self.make_preprocessor(self._space_width(self._critic_action_space or self.action_space))
 
         # loaded with the replay memory (``_create_memory_tensors``): eval builds this learner
         # with no memory and never needs the demos
@@ -274,8 +308,12 @@ class SAC(LearnerBase):
         self.target_critics.update_parameters(self.critics, polyak=1)
 
     def _polyak(self) -> None:
-        """``target <- target + polyak * (critic - target)`` over every tensor in one launch."""
+        """``target <- target + polyak * (critic - target)`` over every tensor in one launch; with more than one agent
+        only for the agents due (:attr:`_keep_critic`)."""
         with torch.no_grad():
+            if self._masked:
+                masked_lerp_(self.target_critics.parameters(), self.critics.parameters(), float(self.cfg.polyak), self._keep_critic)
+                return
             torch._foreach_lerp_(
                 list(self.target_critics.parameters()),
                 list(self.critics.parameters()),
@@ -311,6 +349,10 @@ class SAC(LearnerBase):
             data = torch.load(path, map_location=self.device, weights_only=False)
         except FileNotFoundError:
             raise FileNotFoundError(f"sac.demo_transitions: no file {path}") from None
+        loader = getattr(self, "demo_loader", None)
+        if loader is not None:
+            # a registered demo loader (register_demo_loader) builds the transitions from the file with the env's code
+            data = loader(data, self.cfg.route_label)
         if not isinstance(data, dict) or "transitions" not in data:
             raise ValueError(
                 f"sac.demo_transitions ({path}) must be a dict with a 'transitions' dict of "
@@ -456,31 +498,47 @@ class SAC(LearnerBase):
         return max(self.memory.written()) > self.memory.capacity
 
     def _online_rows_available(self) -> bool:
-        """``demo_storage: memory_critic``: every agent holds at least one online row (host side, outside any graph)."""
+        """``demo_storage: memory_critic``: every agent this update steps holds at least one online row (host side,
+        outside any graph)."""
+        due = [a for a, d in enumerate(self._agent_due) if d] or list(range(self.num_agents))
         if self._memory_wrapped():
-            return min(self.memory.count_where("is_demo", 0.0)) > 0
+            counts = self.memory.count_where("is_demo", 0.0)
+            return min(counts[a] for a in due) > 0
         fills = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
-        return min(f - d for f, d in zip(fills, self._demo_rows)) > 0
+        return min(fills[a] - self._demo_rows[a] for a in due) > 0
+
+    def _due_fill(self) -> int:
+        """The smallest memory fill among the agents this update steps: what a block batch's online share is sized by,
+        so an agent with little (or no) data of its own never shrinks another agent's batch."""
+        fills = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
+        due = [int(fills[a]) for a, d in enumerate(self._agent_due) if d]
+        return min(due) if due else int(self.memory.size)
 
     def _online_rows_ready(self) -> bool:
-        """``learning_starts_rows``: every agent's memory holds that many online rows (cached once true)."""
+        """``learning_starts_rows``: every agent's memory holds that many online rows."""
+        return all(self._agent_online_rows_ready())
+
+    def _agent_online_rows_ready(self):
+        """``learning_starts_rows``, per agent: its memory holds that many of its own online rows (cached once true)."""
         need = int(self.cfg.learning_starts_rows)
-        if not need or getattr(self, "_rows_ready", False):
-            return True
-        if self.memory is None or self.memory.size == 0:
-            return False
+        if not need:
+            return [True] * self.num_agents
+        if all(self._agent_rows_ready):
+            return list(self._agent_rows_ready)
+        if self.memory is None or self.memory.size == 0 and self.memory._agent_size is None:
+            return list(self._agent_rows_ready)
         if "is_demo" in self._tensors_names:
             counts = self.memory.count_where("is_demo", 0.0)
         else:
             counts = list(self.memory._agent_size or [int(self.memory.size)] * self.num_agents)
-        self._rows_ready = min(counts) >= need
-        return self._rows_ready
+        self._agent_rows_ready = [r or int(c) >= need for r, c in zip(self._agent_rows_ready, counts)]
+        return list(self._agent_rows_ready)
 
     def _mixed_batch(self, rows: int, graph: bool = False) -> Dict[str, torch.Tensor]:
         """The critic's batch inside the demo window: per agent, ``min(rows // 2, stored)``
         online rows, the rest demo rows. Draw shapes depend only on the step count, never on
         the data, and each agent draws its own demo rows, so agents stay independent."""
-        n_online = min(rows // 2, int(self.memory.size))
+        n_online = min(rows // 2, self._due_fill())
         n_demo = rows - n_online
         names = self._demo_names() + (["discounts"] if self._n_step() > 1 else [])
         demo_rows = next(iter(self._demo.values())).shape[0]
@@ -540,6 +598,19 @@ class SAC(LearnerBase):
             weight_decay=self.cfg.weight_decay,
         )
         self._updates = 0
+        n = self.num_agents
+        #: per-agent schedule: each agent's gradient steps, its own route clock and its rows-ready flag, so agents whose
+        #: data comes at different rates (route_clock, learning_starts_rows) start, update and delay their actors on their
+        #: own; with more than one agent every optimizer step and target update is masked to the agents due
+        #: (:attr:`_keep_critic`, :attr:`_keep_actor`: device buffers a captured graph reads)
+        self._agent_updates = [0] * n
+        if not hasattr(self, "_agent_route_steps"):  # the clocks and the data outlive a rebuild of the optimizers
+            self._agent_route_steps = [0] * n
+            self._agent_route_now = [False] * n
+            self._agent_rows_ready = [False] * n
+        self._agent_due = [True] * n
+        self._keep_critic = torch.ones(n, dtype=torch.bool, device=self.device)
+        self._keep_actor = torch.ones(n, dtype=torch.bool, device=self.device)
         if getattr(self, "_graphs", None) is not None:
             self._graphs.clear()  # captured against the replaced optimizers
 
@@ -550,17 +621,37 @@ class SAC(LearnerBase):
         return -(-steps // int(self.cfg.update_every))  # ceil
 
     def _set_learning_rates(self, timesteps: int) -> None:
-        """The LR for this gradient step, from the update count alone (never from the data)."""
+        """The LR for this gradient step, from the update count alone (never from the data); with more than one agent,
+        each agent's from its own count."""
         cfg = self.cfg
         if cfg.lr_schedule == "constant" and not (cfg.actor_lr_warmup or cfg.critic_lr_warmup):
             return
         total = max(1, self._update_rounds(timesteps) * int(cfg.gradient_steps))
-        self.policy_optimizer.set_lr(
-            lr_at(self._updates, total, cfg.actor_lr, cfg.lr_end, cfg.lr_schedule, warmup=cfg.actor_lr_warmup)
-        )
-        self.critic_optimizer.set_lr(
-            lr_at(self._updates, total, cfg.critic_lr, cfg.lr_end, cfg.lr_schedule, warmup=cfg.critic_lr_warmup)
-        )
+        counts = [self._updates] if self.num_agents == 1 else list(self._agent_updates)
+
+        def at(*args, **kwargs):
+            values = [lr_at(c, total, *args, **kwargs) for c in counts]
+            return values[0] if self.num_agents == 1 else torch.tensor(values, dtype=torch.float64, device=self.device)
+
+        if cfg.entropy_lr_schedule and cfg.learn_entropy:
+            # entropy_lr_schedule: the temperature on the same schedule (FlashSAC), from entropy_lr, no warm-up
+            self.entropy_optimizer.set_lr(at(cfg.entropy_lr, cfg.lr_end, cfg.lr_schedule))
+        self.policy_optimizer.set_lr(at(cfg.actor_lr, cfg.lr_end, cfg.lr_schedule, warmup=cfg.actor_lr_warmup))
+        self.critic_optimizer.set_lr(at(cfg.critic_lr, cfg.lr_end, cfg.lr_schedule, warmup=cfg.critic_lr_warmup))
+
+    @property
+    def _masked(self) -> bool:
+        """More than one agent: every optimizer step and target update is masked to the agents due."""
+        return self.num_agents > 1
+
+    def _set_due(self, due) -> None:
+        """The agents this update steps (host list; mirrored to the device mask a captured graph reads)."""
+        self._agent_due = [bool(d) for d in due]
+        self._keep_critic.copy_(torch.tensor(self._agent_due, dtype=torch.bool))
+
+    def _agent_actor_may_learn(self, agent: int, timestep: int) -> bool:
+        """Whether agent ``agent``'s actor may take steps in this update (by default the learner-wide rule)."""
+        return self._actor_may_learn(timestep)
 
     def _create_memory_tensors(self) -> None:
         if self.memory is None:
@@ -617,8 +708,15 @@ class SAC(LearnerBase):
             # 1 on a demo row: the critics train on it, the actor's loss skips it
             self.memory.create_tensor(name="is_demo", size=1, dtype=torch.float32)
             self._tensors_names.append("is_demo")
+        # a critic action transform set after construction (without critic_action_space) may be wider than the agent's
+        # action: the critics' action preprocessor follows its width
+        width = getattr(self.critic_action_transform, "critic_action_width", None)
+        if width is not None and self.critic_action_normalizer is not None and self.critic_action_normalizer.size != int(width):
+            self.critic_action_normalizer = self.make_preprocessor(int(width))
         if self.cfg.demo_transitions:
             self._demo = self._load_demo_transitions()
+            if self.cfg.state_preprocessor == "demo":
+                self._fit_normalizers_on_demos(self._demo)
             if self.cfg.demo_storage in ("memory", "memory_critic"):
                 self._write_demos_to_memory(self._demo)
                 self._demo = None  # ordinary memory rows from here on
@@ -634,6 +732,27 @@ class SAC(LearnerBase):
             return observations
         return self.observation_normalizer(observations, train=train)
 
+    def _fit_normalizers_on_demos(self, demo: Dict[str, torch.Tensor]) -> None:
+        """``state_preprocessor: demo``: every preprocessor fitted once, exactly, on all the demo rows (the same rows for
+        every agent): the observations, the states (asymmetric) and the critics' action (the critic action transform of
+        the demo rows' own actions and side inputs). Later ``train=True`` calls update them only with
+        ``update_normalizer_during_training``."""
+        A = self.num_agents
+
+        def per_agent(x: torch.Tensor) -> torch.Tensor:  # (rows, w) -> (A * rows, w), agent-major as the preprocessors split
+            return x.repeat(A, 1)
+
+        with torch.no_grad():
+            self.observation_normalizer.fit(demo["observations"])
+            if self.state_normalizer is not None:
+                self.state_normalizer.fit(demo["states"])
+            flat = {k: per_agent(v) for k, v in demo.items() if torch.is_tensor(v) and v.dim() == 2}
+            raw = self._critic_actions(flat, "observations", flat["actions"].float(), normalize=False)
+        self.critic_action_normalizer.fit(raw[: demo["observations"].shape[0]])
+        print(f"[sac] state_preprocessor: demo -- observations, {'states, ' if self.state_normalizer is not None else ''}critic "
+              f"actions ({raw.shape[-1]}) fitted on {demo['observations'].shape[0]} demo rows"
+              + ("" if self.cfg.update_normalizer() else ", frozen"), flush=True)
+
     def normalize_states(self, states: torch.Tensor, train: bool = False) -> torch.Tensor:
         if self.state_normalizer is None:
             return states
@@ -645,6 +764,8 @@ class SAC(LearnerBase):
         return int(self.cfg.warmup_episodes) > getattr(self, "_finished_episodes", 0)
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
+        if self.training and timestep == 0 and not getattr(self, "_initial_logged", False):
+            self._log_initial_policy(observations)
         if self.training and self._warming_up():
             width = self._space_width(self.action_space)
             return torch.zeros((observations.shape[0], width), device=self.device), {}
@@ -660,6 +781,37 @@ class SAC(LearnerBase):
         self.emit_selection(outputs, timestep)
         self._emit_std_by_label(outputs, timestep)
         return self._explore_progressively(actions, timestep), outputs
+
+    def _log_initial_policy(self, observations: torch.Tensor) -> None:
+        """The policy as it starts, before any update, published at step 0: on the first training observations, its
+        ``policy/std`` and ``policy/log_prob`` (of its own sampled actions), ``policy/mean_action`` (the mean |tanh
+        mean|, the action it would take without noise), the temperature (``entropy/coefficient``), the entropy
+        estimate, target and gap as the temperature step would see them (``entropy/*``, with ``learn_entropy``) and
+        the learning rates -- the update's metrics, so every curve starts at the initial policy."""
+        self._initial_logged = True
+        if not self.on_log:
+            return
+        rows = observations.shape[0] // self.num_agents
+        with torch.no_grad(), self._batch_mode(self.policy, False):
+            _, outputs = self.policy.act({"observations": self.normalize_observations(observations)}, role="policy")
+        metrics = {
+            "policy/log_prob": outputs["log_prob"].view(self.num_agents, rows).mean(dim=1),
+            "entropy/coefficient": self._entropy_coefficient.reshape(-1),
+            "lr/actor": self.policy_optimizer.lr.to(torch.float32),
+            "lr/critic": self.critic_optimizer.lr.to(torch.float32),
+        }
+        if "log_std" in outputs:
+            metrics["policy/std"] = outputs["log_std"].exp().reshape(self.num_agents, rows, -1).mean(dim=(1, 2))
+        if "mean_actions" in outputs:
+            metrics["policy/mean_action"] = outputs["mean_actions"].abs().reshape(self.num_agents, rows, -1).mean(dim=(1, 2))
+        if self.cfg.learn_entropy:
+            current = -metrics["policy/log_prob"]
+            target = torch.full_like(current, float(self._target_entropy))
+            metrics.update({"entropy/current": current, "entropy/target": target, "entropy/gap": current - target,
+                            "lr/entropy": self.entropy_optimizer.lr.to(torch.float32)})
+        self.emit_per_agent(metrics, 0)
+        for hook in self.on_flush:  # published now, as wandb step 0
+            hook(0)
 
     def _repeated_noise(self, rows: int) -> torch.Tensor:
         """``noise_repeat``: FlashSAC's ``_sample_flashsac_actions`` per agent. Every step a
@@ -766,6 +918,19 @@ class SAC(LearnerBase):
         )
         return torch.where(keep, actions, torch.zeros_like(actions))
 
+    def _emit_interval_metrics(self, timestep: int) -> None:
+        """A routed residual's progress, every ``write_interval`` from the first step (before it learns too): the agent
+        steps that started in its phase (an agent step is residual.steps_per_chunk env steps), its replay rows (demos
+        included) and its gradient updates."""
+        if not self.cfg.route_label:
+            return
+        sizes = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
+        self.emit_per_agent({
+            "route/steps": torch.tensor([float(v) for v in self._agent_route_steps], device=self.device),
+            "route/memory_rows": torch.tensor([float(v) for v in sizes], device=self.device),
+            "route/updates": torch.tensor([float(v) for v in self._agent_updates], device=self.device),
+        }, timestep)
+
     def record_transition(
         self,
         *,
@@ -821,8 +986,15 @@ class SAC(LearnerBase):
         if self.cfg.route_label:
             # route_clock: this step is one of this residual's own when an env starts it in the route's label
             index = self.cfg.std_label_names.index(self.cfg.route_label)
-            self._route_step_now = start_labels is not None and bool((start_labels == index).any())
-            self._route_steps = getattr(self, "_route_steps", 0) + int(self._route_step_now)
+            if start_labels is None:
+                now = [False] * self.num_agents
+            else:  # per agent: one of its envs starts this step in the route's label
+                now = (start_labels.reshape(self.num_agents, -1) == index).any(dim=1).tolist()
+            self._agent_route_now = [bool(v) for v in now]
+            self._agent_route_steps = [c + int(v) for c, v in zip(self._agent_route_steps, self._agent_route_now)]
+            # learner-wide views (periodic reset / retrain, the legacy metrics): any agent's step, the furthest clock
+            self._route_step_now = any(self._agent_route_now)
+            self._route_steps = max(self._agent_route_steps)
         if self.cfg.demo_storage == "memory_critic":
             extra["is_demo"] = torch.zeros(observations.shape[0], 1, device=self.device)
         if self.cfg.hold_still_key:
@@ -1033,31 +1205,38 @@ class SAC(LearnerBase):
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
         if self._warming_up() and not self.cfg.warmup_trains_critics:
             return  # warmup_episodes: no update until the base's episodes have finished
-        if not self._online_rows_ready():
-            return  # learning_starts_rows: not yet this much of its own data
+        ready = self._agent_online_rows_ready()  # learning_starts_rows: each agent its own data
+        start, every = int(self.cfg.learning_starts), int(self.cfg.update_every)
         if self.cfg.route_clock:
-            # this residual's own steps only: nothing while its phase is not running
-            if not getattr(self, "_route_step_now", False):
+            # each agent on its own steps in this residual's phase: nothing for an agent whose envs are not in it
+            if not any(self._agent_route_now):
                 return
-            clock = self._route_steps - 1
-            since_start = clock - int(self.cfg.learning_starts)
-            if since_start >= 0 and since_start % int(self.cfg.update_every) == 0:
-                self.enable_models_training_mode(True)
-                self.update(timestep=timestep, timesteps=timesteps)
-                self.enable_models_training_mode(False)
+            due = []
+            for agent in range(self.num_agents):
+                since = self._agent_route_steps[agent] - 1 - start
+                due.append(ready[agent] and self._agent_route_now[agent] and since >= 0 and since % every == 0)
+            self._run_update(due, timestep, timesteps)
             self._maybe_periodic_reset(timestep)
-            self._maybe_retrain(clock, timesteps, logged_at=timestep)
+            self._maybe_retrain(self._route_steps - 1, timesteps, logged_at=timestep)
             return
         # learning_starts is the first update of anything (the critics); the actor joins at
         # policy_learning_starts. From there one round of gradient_steps every update_every
         # env steps (policy_delay keeps counting gradient steps)
-        since_start = timestep - int(self.cfg.learning_starts)
-        if since_start >= 0 and since_start % int(self.cfg.update_every) == 0:
-            self.enable_models_training_mode(True)
-            self.update(timestep=timestep, timesteps=timesteps)
-            self.enable_models_training_mode(False)
+        since = timestep - start
+        due = [r and since >= 0 and since % every == 0 for r in ready]
+        self._run_update(due, timestep, timesteps)
         self._maybe_periodic_reset(timestep)
         self._maybe_retrain(timestep, timesteps)
+
+    def _run_update(self, due, timestep: int, timesteps: int) -> None:
+        """One update for the agents ``due`` marks (none: nothing); the others are left exactly as they are."""
+        if not any(due):
+            return
+        self._set_due(due)
+        self.enable_models_training_mode(True)
+        self.update(timestep=timestep, timesteps=timesteps)
+        self.enable_models_training_mode(False)
+        self._set_due([True] * self.num_agents)
 
     # ------------------------------------------------------------------ losses
     def _target_min(self, target_qs: torch.Tensor, rows: int) -> torch.Tensor:
@@ -1083,7 +1262,7 @@ class SAC(LearnerBase):
         with torch.no_grad(), self._batch_mode(self.policy, False):
             next_actions, outputs = self.policy.act(next_inputs, role="policy")
             next_critic_actions = self._critic_actions(sampled, "next_observations", next_actions)
-        critic_actions = self._critic_actions(sampled, "observations", sampled["actions"])
+        critic_actions = self._critic_actions(sampled, "observations", sampled["actions"], train=True)
         if self.cfg.cross_batch_value:
             # FlashSAC: [s, a] ++ [s', a'] in one call for both; the target reads the next half,
             # the critics their current half
@@ -1306,7 +1485,7 @@ class SAC(LearnerBase):
     #: the critic's own input for each actor-side key, when the learner is asymmetric
     _CRITIC_INPUT_KEYS = {"observations": "states", "next_observations": "next_states"}
 
-    def _critic_actions(self, sampled, key: str, actions: torch.Tensor) -> torch.Tensor:
+    def _critic_actions(self, sampled, key: str, actions: torch.Tensor, train: bool = False, normalize: bool = True) -> torch.Tensor:
         """What the critics take as the action: the agent's own, or :attr:`critic_action_transform`
         of it with the batch's raw critic input (device ops only, so a CUDA graph captures it).
         ``key`` names the actor-side tensor (``observations`` / ``next_observations``); an
@@ -1314,7 +1493,7 @@ class SAC(LearnerBase):
         same rows instead, online and demo rows alike, so it can read what is in the critic state
         and not in the actor's observation. ``sampled`` is read only when there is a transform."""
         if self.critic_action_transform is None:
-            return actions
+            return self._normalize_critic_actions(actions, train) if normalize else actions
         side_names = getattr(self, "_side_inputs", {})
         declared = set(getattr(self.critic_action_transform, "side_inputs", None) or {})
         if declared != set(side_names):
@@ -1336,7 +1515,13 @@ class SAC(LearnerBase):
                 f"the critic action transform returned {tuple(out.shape)} for actions {tuple(actions.shape)}; "
                 f"expected width {width}"
             )
-        return out
+        return self._normalize_critic_actions(out, train) if normalize else out
+
+    def _normalize_critic_actions(self, actions: torch.Tensor, train: bool = False) -> torch.Tensor:
+        """The critics' action through its preprocessor (``state_preprocessor``; ``train``: the stored batch's, which
+        updates the statistics when they update during training), or as it is without one."""
+        norm = getattr(self, "critic_action_normalizer", None)
+        return actions if norm is None else norm(actions, train=train)
 
     # ------------------------------------------------------------------ update
     def update(self, *, timestep: int, timesteps: int) -> None:
@@ -1345,12 +1530,22 @@ class SAC(LearnerBase):
 
     def _update(self, *, timestep: int, timesteps: int) -> None:
         rows = self.cfg.batch_size  # per agent; the memory returns N * batch_size rows
-        if (self.cfg.store_labels or self.cfg.route_label) and int(self.memory.size) == 0:
-            return  # no transition of a stored phase yet for some agent: nothing to learn from
-        # warmup_trains_critics: the actor stays frozen until the warm-up episodes have ended
-        policy_on = timestep >= self._policy_learning_starts() and not self._warming_up()
-        if policy_on and self.cfg.demo_storage == "memory_critic" and not self._online_rows_available():
-            policy_on = False  # only demos so far: the critics train, the actor waits for its own data
+        if self.cfg.store_labels or self.cfg.route_label:
+            # an agent with no transition of its stored phase yet has nothing to learn from: it is not stepped (the
+            # others are, on their own data)
+            fills = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
+            due = [d and int(f) > 0 for d, f in zip(self._agent_due, fills)]
+            if not any(due):
+                return
+            if due != self._agent_due:
+                self._set_due(due)
+        # warmup_trains_critics: the actor stays frozen until the warm-up episodes have ended; each agent's actor only
+        # when that agent is due and its own actor may learn
+        due = list(self._agent_due)
+        agent_policy_on = [d and self._agent_actor_may_learn(agent, timestep) for agent, d in enumerate(due)]
+        if any(agent_policy_on) and self.cfg.demo_storage == "memory_critic" and not self._online_rows_available():
+            agent_policy_on = [False] * self.num_agents  # only demos so far: the critics train, the actors wait
+        policy_on = any(agent_policy_on)
         demo_on = self._demo_active(timestep)
         # a graph replays fixed shapes: a mixed batch's online share is fixed only once the
         # memory holds half a batch; aux losses are captured only when every term is graph-safe
@@ -1360,7 +1555,7 @@ class SAC(LearnerBase):
         graph = (
             self._graphs is not None
             and self.aux_loss_graph_safe()
-            and (not demo_on or int(self.memory.size) >= rows // 2)
+            and (not demo_on or self._due_fill() >= rows // 2)
             and not (self.cfg.demo_storage == "memory_critic" and self._memory_wrapped())
         )
         if graph:
@@ -1369,14 +1564,19 @@ class SAC(LearnerBase):
         last_critic, last_actor = {}, {}
         for gradient_step in range(self.cfg.gradient_steps):
             self._set_learning_rates(timesteps)
-            # the actor (and temperature) step on every policy_delay-th gradient step
-            actor_step = policy_on and (self._updates + 1) % self.cfg.policy_delay == 0
+            # the actor (and temperature) step on every policy_delay-th gradient step, counted per agent
+            agent_actor = [on and (self._agent_updates[agent] + 1) % self.cfg.policy_delay == 0
+                           for agent, on in enumerate(agent_policy_on)]
+            actor_step = any(agent_actor)
+            if self._masked:
+                self._keep_actor.copy_(torch.tensor(agent_actor, dtype=torch.bool))
             mode = (demo_on, policy_on, actor_step)
             if graph:
                 out = self._graphs.run(mode, lambda: self._gradient_step(mode, rows, timestep, graph=True))
             else:
                 out = self._gradient_step(mode, rows, timestep, graph=False)
-            self._updates += 1
+            self._agent_updates = [u + int(d) for u, d in zip(self._agent_updates, due)]
+            self._updates = max(self._agent_updates)
             last_critic = out["critic"]
             if actor_step:
                 last_actor = out["actor"]
@@ -1388,10 +1588,14 @@ class SAC(LearnerBase):
             self._emit_update_metrics(
                 timestep=timestep,
                 rows=rows,
-                demo_rows=(rows - min(rows // 2, int(self.memory.size))) if demo_on else 0,
+                demo_rows=(rows - min(rows // 2, self._due_fill())) if demo_on else 0,
                 **last_critic,
                 **last_actor,
             )
+
+    def _actor_may_learn(self, timestep: int) -> bool:
+        """Whether this update's gradient steps may include the actor's (``policy_learning_starts``, the warm-up)."""
+        return timestep >= self._policy_learning_starts() and not self._warming_up()
 
     def _gradient_step(self, mode, rows: int, timestep: int, graph: bool) -> Dict[str, Dict[str, torch.Tensor]]:
         """One critic step, the actor and temperature step when ``mode`` says so, the targets'
@@ -1441,7 +1645,7 @@ class SAC(LearnerBase):
         critic_grad_norms = clip_grad_norm_per_agent(
             self.critics, self.num_agents, self.cfg.grad_norm_clip
         )
-        self.critic_optimizer.step()
+        self.critic_optimizer.step(self._keep_critic if self._masked else None)
         self._normalize_weights(self.critics)
 
         actor = {}
@@ -1509,7 +1713,7 @@ class SAC(LearnerBase):
         policy_grad_norms = clip_grad_norm_per_agent(
             self.policy, self.num_agents, self.cfg.grad_norm_clip
         )
-        self.policy_optimizer.step()
+        self.policy_optimizer.step(self._keep_actor if self._masked else None)
         self._normalize_weights(self.policy)
 
         if self.cfg.learn_entropy:
@@ -1517,8 +1721,10 @@ class SAC(LearnerBase):
             if entropy_log_prob is None:
                 raise RuntimeError("entropy_observations: next needs the critic step's next_log_prob")
             entropy_loss = self._update_entropy(entropy_log_prob, rows)
+            # the entropy estimate the temperature step compared with the target, per agent
+            entropy_estimate = -entropy_log_prob.detach().view(self.num_agents, rows).mean(dim=1)
         else:
-            entropy_loss = None
+            entropy_loss = entropy_estimate = None
         with torch.no_grad():
             per_agent_loss = self.per_agent_mean(
                 self.expand_per_agent(self._entropy_coefficient, rows) * log_prob - q_pi, rows
@@ -1529,6 +1735,8 @@ class SAC(LearnerBase):
             "policy_loss": per_agent_loss,
             "log_std": outputs["log_std"].detach() if "log_std" in outputs else None,
             "entropy_loss": entropy_loss,
+            "entropy_estimate": entropy_estimate,
+            "mean_actions": outputs["mean_actions"].detach() if "mean_actions" in outputs else None,
             "actor_aux_metrics": {
                 **{k: v.detach() for k, v in ctx.aux_metrics.items()},
                 **(outputs.get("parts_metrics") or {}),
@@ -1551,7 +1759,7 @@ class SAC(LearnerBase):
             )
         self.entropy_optimizer.zero_grad()
         entropy_loss.sum().backward()  # a sum of per-agent terms: no cross-agent gradient
-        self.entropy_optimizer.step()
+        self.entropy_optimizer.step(self._keep_actor if self._masked else None)
         with torch.no_grad():
             # in place: a captured graph keeps reading this tensor
             self._entropy_coefficient.copy_(torch.exp(self.log_entropy_coefficient))
@@ -1573,6 +1781,8 @@ class SAC(LearnerBase):
         policy_loss=None,
         log_std=None,
         entropy_loss=None,
+        entropy_estimate=None,
+        mean_actions=None,
         aux_metrics=None,
         actor_aux_metrics=None,
     ) -> None:
@@ -1598,17 +1808,13 @@ class SAC(LearnerBase):
                 "q/q2_mean": self.per_agent_mean(critic_2_values, rows),
                 "q/target_mean": self.per_agent_mean(target_values, rows),
                 "grad_norm/critic": critic_grad_norms,
-                "entropy/coefficient": self._entropy_coefficient.reshape(-1),
                 "lr/actor": self.policy_optimizer.lr.to(torch.float32),
                 "lr/critic": self.critic_optimizer.lr.to(torch.float32),
             }
-            if self.cfg.route_label:
-                # how much practice this residual has had: the agent steps that started in its phase (an agent step is
-                # residual.steps_per_chunk env steps), its replay rows (demos included) and its gradient updates
-                metrics["route/steps"] = torch.full((self.num_agents,), float(getattr(self, "_route_steps", 0)), device=self.device)
-                sizes = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
-                metrics["route/memory_rows"] = torch.tensor([float(v) for v in sizes], device=self.device)
-                metrics["route/updates"] = torch.full((self.num_agents,), float(self._updates), device=self.device)
+            if self.HAS_TEMPERATURE:
+                metrics["entropy/coefficient"] = self._entropy_coefficient.reshape(-1)
+            if self.cfg.learn_entropy:
+                metrics["lr/entropy"] = self.entropy_optimizer.lr.to(torch.float32)
             if self.return_scaler is not None:
                 # what the critics' rewards are divided by (adaptive_reward_scaling)
                 metrics["reward/scale_denominator"] = self.return_scaler.denominator.reshape(-1).clone()
@@ -1627,8 +1833,17 @@ class SAC(LearnerBase):
             if entropy_loss is not None:
                 # the temperature's loss, i.e. how hard alpha is being pushed
                 metrics["loss/entropy"] = entropy_loss
+            if entropy_estimate is not None:
+                # what the temperature step saw: the batch's entropy estimate (-mean log pi, on entropy_observations),
+                # the target it chases, and their gap (> 0: alpha falls, < 0: alpha rises, at Adam's ~fixed rate)
+                target = torch.full_like(entropy_estimate, float(self._target_entropy))
+                metrics["entropy/current"] = entropy_estimate
+                metrics["entropy/target"] = target
+                metrics["entropy/gap"] = entropy_estimate - target
             if log_std is not None:
                 metrics["policy/std"] = log_std.exp().view(self.num_agents, rows, -1).mean(dim=(1, 2))
+            if mean_actions is not None:
+                metrics["policy/mean_action"] = mean_actions.abs().view(self.num_agents, rows, -1).mean(dim=(1, 2))
             if self.aux_loss_graph_safe():  # otherwise the hook emitted them every gradient step
                 metrics.update(aux_metrics or {})
                 metrics.update(actor_aux_metrics or {})
@@ -1775,7 +1990,43 @@ class SAC(LearnerBase):
             normalizers["rewards"] = self.reward_normalizer
         if self.return_scaler is not None:
             normalizers["returns"] = self.return_scaler
+        if getattr(self, "critic_action_normalizer", None) is not None:
+            normalizers["critic_actions"] = self.critic_action_normalizer
         return normalizers
+
+    def save_checkpoints(self, step: int):
+        """The numbered checkpoints, then (``save_memory_with_checkpoints``) each agent's replay memory beside them."""
+        paths = super().save_checkpoints(step)
+        if self.cfg.save_memory_with_checkpoints:
+            for agent in range(self.num_agents):
+                self.save_memory(agent, step)
+        return paths
+
+    def save_memory(self, agent: int, step: int) -> Path:
+        """Write agent ``agent``'s replay memory to ``<checkpoint dir>/memory_<step>.pt``: ``{"rows": {name: (rows,
+        dim) tensor}, "meta": {...}}``, the rows in the order they were written (oldest first: the ring buffer unrolled
+        from the agent's write pointer once it wrapped). Not announced to the ``on_checkpoint`` hooks, so a logger does
+        not upload it."""
+        memory = self.memory
+        size = memory._agent_size[agent] if memory._agent_size is not None else int(memory.size)
+        pointer = memory._agent_pointer[agent] if memory._agent_pointer is not None else int(memory.pointer)
+        capacity = int(memory.capacity)
+        wrapped = size >= capacity
+        order = torch.arange(size, device=memory.device)
+        if wrapped:
+            order = (order + pointer) % capacity
+        rows = {name: tensor[agent, order].detach().cpu() for name, tensor in memory.tensors.items()}
+        written = memory._agent_written[agent] if memory._agent_written is not None else None
+        meta = {
+            "step": int(step), "agent": int(agent), "rows": int(size), "capacity": capacity, "wrapped": bool(wrapped),
+            "rows_ever_written": written, "n_step": int(self.cfg.n_step), "discount_factor": float(self.cfg.discount_factor),
+            "route_label": self.cfg.route_label, "demo_rows_in_memory": (self._demo_rows[agent] if getattr(self, "_demo_rows", None) else 0),
+        }
+        directory = self.checkpoint_dir(agent)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"memory_{int(step)}.pt"
+        torch.save({"rows": rows, "meta": meta}, path)
+        return path
 
     def _checkpoint_extras(self, agent: int) -> Dict[str, Any]:
         return {

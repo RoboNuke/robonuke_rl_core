@@ -88,18 +88,13 @@ class PPO(LearnerBase):
         )
         self._updates = 0
 
-        if self.cfg.normalize_observations:
-            self.observation_normalizer = self.make_normalizer(self.observation_space)
-            self.state_normalizer = (
-                self.make_normalizer(self.state_space) if self._asymmetric else None
-            )
-        else:
-            self.observation_normalizer = None
-            self.state_normalizer = None
+        # state_preprocessor (none: no normalizer)
+        self.observation_normalizer = self.make_normalizer(self.observation_space)
+        self.state_normalizer = self.make_normalizer(self.state_space) if self._asymmetric else None
         # per agent, unlike V's single shared value scaler
         self.value_normalizer = (
             BlockRunningNorm(
-                self.num_agents, 1, clip_threshold=self.cfg.normalizer_clip, device=self.device
+                self.num_agents, 1, clip_threshold=self.cfg.state_preprocessor_kwargs.clip_threshold, device=self.device
             )
             if self.cfg.normalize_values
             else None

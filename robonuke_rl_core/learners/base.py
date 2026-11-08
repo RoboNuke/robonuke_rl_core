@@ -294,16 +294,21 @@ class LearnerBase(Agent):
             out[name] = shaped.to(dtype=torch.float32, device=self.device)
         return out
 
-    def make_normalizer(self, space) -> BlockRunningNorm:
-        """A per-agent input normalizer sized to ``space``."""
+    def make_normalizer(self, space):
+        """The per-agent input preprocessor sized to ``space`` (``state_preprocessor``), or None for ``none``."""
         from skrl.utils.spaces.torch import compute_space_size
 
-        return BlockRunningNorm(
-            self.num_agents,
-            compute_space_size(space, occupied_size=True),
-            clip_threshold=self.cfg.normalizer_clip,
-            device=self.device,
-        )
+        return self.make_preprocessor(compute_space_size(space, occupied_size=True))
+
+    def make_preprocessor(self, size: int):
+        """A ``state_preprocessor`` of width ``size`` (one scaler per agent, ``models/normalizer.py``), or None."""
+        from ..models.normalizer import PerAgentPreprocessor
+
+        if self.cfg.state_preprocessor == "none":
+            return None
+        kw = self.cfg.state_preprocessor_kwargs
+        return PerAgentPreprocessor(self.num_agents, int(size), update=self.cfg.update_normalizer(), epsilon=float(kw.epsilon),
+                                    clip_threshold=float(kw.clip_threshold), device=self.device)
 
     # ------------------------------------------------------------------ hooks
     def emit(self, agent_idx: int, metrics: Dict[str, torch.Tensor], step: int) -> None:
@@ -673,6 +678,7 @@ class LearnerBase(Agent):
         step = timestep + 1
         write_interval = self.trainer_cfg.write_interval
         if write_interval > 0 and step % write_interval == 0:
+            self._emit_interval_metrics(timestep)
             self._flush_episode_stats(timestep)
             for hook in self.on_flush:
                 hook(timestep)
@@ -684,6 +690,10 @@ class LearnerBase(Agent):
 
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
         raise NotImplementedError
+
+    def _emit_interval_metrics(self, timestep: int) -> None:
+        """Learner metrics published every ``write_interval`` whether or not anything updated (a routed residual's
+        progress toward its start). None by default."""
 
     def stats_metrics(self) -> Dict[str, torch.Tensor]:
         """``stats/*``: what the last update cost, in wall time and in memory.

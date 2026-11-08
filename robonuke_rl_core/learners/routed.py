@@ -66,6 +66,8 @@ class RoutedSAC:
         self.env_reset_requested = False
         #: each env's label at the observation the next action is chosen for (None before the env published one)
         self._labels: Optional[torch.Tensor] = None
+        #: ``sac.phase_logging``'s :class:`~robonuke_rl_core.learners.phase_logging.PhaseLogger` (set by train.py)
+        self.phase_logger: Any = None
 
     # ------------------------------------------------------------------ the trainer's interface
     def init(self, *, trainer_cfg: Optional[Dict[str, Any]] = None) -> None:
@@ -105,7 +107,12 @@ class RoutedSAC:
     def record_transition(self, *, infos, **kwargs) -> None:
         for learner in self.learners.values():
             learner.record_transition(infos=infos, **kwargs)
-        self._labels = self._labels_from(infos)
+        labels = self._labels_from(infos)
+        if self.phase_logger is not None:
+            # the phase each env's step started in, and the one it ended in
+            self.phase_logger.observe(self._labels, labels, kwargs["rewards"], kwargs["terminated"], kwargs["truncated"],
+                                      infos, int(kwargs["timestep"]))
+        self._labels = labels
 
     def post_interaction(self, *, timestep: int, timesteps: int) -> None:
         for learner in self.learners.values():

@@ -215,3 +215,137 @@ def test_a_routed_step_with_critic_only_demos_replays_to_the_eager_step(tmp_path
     # the actor's batch is drawn from the online rows only
     batch = eager._sample_online(16, graph=True)
     assert float(batch["is_demo"].sum()) == 0.0
+
+
+@pytest.mark.parametrize("demos", [False, True])  # True: ResFiT's half-demo batch, the actor on the same batch
+def test_a_ddpg_step_with_resfit_settings_replays_to_the_eager_step(tmp_path, demos):
+    """DDPG with ResFiT's pieces (10 critics, the target's min over a random 2, the actor on their mean, target
+    smoothing, (mean_k |Q_k - y|)^2, AdamW with clipping, a LayerNorm MLP, the target actor's Polyak) is captured
+    and replays to what the same step does eagerly."""
+    if not torch.cuda.is_available():
+        pytest.fail("this GPU test needs CUDA")
+    from robonuke_rl_core.learners.cfg import DDPGCfg
+    from robonuke_rl_core.learners.ddpg import DDPG
+    from robonuke_rl_core.models.cfg import MlpActorCfg, MlpCriticCfg, MlpModelCfg
+
+    device = torch.device("cuda")
+    box = lambda d: gymnasium.spaces.Box(-np.inf, np.inf, (d,), np.float32)  # noqa: E731
+    obs, state, act = box(6), box(9), box(2)
+    extra = {}
+    if demos:
+        rows = 24
+        demo = {
+            "observations": torch.randn(rows, 6), "next_observations": torch.randn(rows, 6),
+            "states": torch.randn(rows, 9), "next_states": torch.randn(rows, 9),
+            "actions": torch.rand(rows, 2) * 2 - 1, "rewards": torch.zeros(rows, 1),
+            "terminated": torch.tensor([[False]] * (rows - 1) + [[True]]), "truncated": torch.zeros(rows, 1, dtype=torch.bool),
+        }
+        demo["rewards"][-1] = 1.0
+        # one episode in order: each row's next observation is the next row's (n-step windows read them so)
+        for name in ("observations", "states"):
+            demo["next_" + name][:-1] = demo[name][1:]
+        path = tmp_path / "demo.pt"
+        torch.save({"transitions": demo}, path)
+        extra = dict(demo_transitions=str(path), demo_storage="sample", demo_sampling_start=0, demo_sampling_end=10**9,
+                     demo_batch_shared=True)
+    cfg = DDPGCfg(batch_size=16, gradient_steps=4, policy_delay=4, num_critics=10, critic_subset=2, actor_q_reduction="mean",
+                  critic_loss="mean_abs_squared", target_policy_noise=True, target_noise_clip=0.3, exploration_std=0.05,
+                  actor_action_scale=0.1, n_step=3, polyak=0.005, weight_decay=0.01, grad_norm_clip=1.0,
+                  learning_starts=0, **extra)
+    model = MlpModelCfg(actor=MlpActorCfg(hidden_size=32, num_layers=2, layer_norm=True, init="default", output_init_scale=0.0),
+                        critic=MlpCriticCfg(hidden_size=32, num_layers=2, layer_norm=True, init="default"))
+    torch.manual_seed(0)
+    models = build_models("ddpg", model, obs, state, act, 2, device, num_critics=10)
+    memory = MultiRandomMemory(capacity=64, num_envs=2, num_agents=2, device=device)
+    learner = DDPG(models=models, memory=memory, observation_space=obs, state_space=state, action_space=act,
+                   device=device, cfg=cfg, trainer_cfg=TrainerCfg(learner="ddpg", total_timesteps=100),
+                   num_agents=2, num_envs=2, model_cfg=model)
+    learner.init()
+    learner.enable_training_mode(True)
+    for name, tensor in memory.tensors.items():
+        tensor.copy_(torch.zeros_like(tensor) if tensor.dtype == torch.bool else torch.randn_like(tensor))
+    memory.size = 64
+    memory.sync_size()
+
+    eager, graphed = learner, copy.deepcopy(learner)
+    graphed._graphs = StepGraphs(warmup=1)
+    mode = (demos, True, True)  # (demo rows, critic, actor)
+    step = lambda learner: (lambda: learner._gradient_step(mode, 16, 10, graph=True))  # noqa: E731
+    for _ in range(4):
+        state_rng = torch.cuda.get_rng_state()
+        graphed._graphs.run(mode, step(graphed))
+        torch.cuda.set_rng_state(state_rng)
+        step(eager)()
+    torch.cuda.synchronize()
+    assert graphed._graphs.captured == 1
+    assert eager._checkpoint_model_keys() == ["policy", "target_policy", "critics", "target_critics"]
+    for key in eager._checkpoint_model_keys():
+        for agent in range(2):
+            a, b = getattr(eager, key).agent_state_dict(agent), getattr(graphed, key).agent_state_dict(agent)
+            for name in a:
+                assert torch.allclose(a[name], b[name], atol=1e-5), (key, agent, name)
+    # the actor moved off its zero last layer, and the target actor followed by Polyak
+    out = eager.policy.agent_state_dict(0)
+    assert any(float(v.abs().sum()) > 0 for k, v in out.items() if "mean" in k or k.endswith("weight"))
+
+
+def test_a_masked_multi_agent_ddpg_step_replays_to_the_eager_step_and_leaves_the_skipped_agent_alone():
+    """Three agents, the middle one not due: a captured-and-replayed masked step equals the eager one, and the skipped
+    agent's weights, targets and optimizer state stay exactly as they were (per-agent schedules, SAC._run_update)."""
+    if not torch.cuda.is_available():
+        pytest.fail("this GPU test needs CUDA")
+    from robonuke_rl_core.learners.cfg import DDPGCfg
+    from robonuke_rl_core.learners.ddpg import DDPG
+    from robonuke_rl_core.models.cfg import MlpActorCfg, MlpCriticCfg, MlpModelCfg
+
+    device = torch.device("cuda")
+    box = lambda d: gymnasium.spaces.Box(-np.inf, np.inf, (d,), np.float32)  # noqa: E731
+    obs, state, act = box(6), box(9), box(2)
+    cfg = DDPGCfg(batch_size=16, gradient_steps=1, policy_delay=1, num_critics=4, critic_subset=2, n_step=1,
+                  learning_starts=0, weight_decay=0.01, grad_norm_clip=1.0)
+    model = MlpModelCfg(actor=MlpActorCfg(hidden_size=32, num_layers=2, layer_norm=True, output_init_scale=0.5),
+                        critic=MlpCriticCfg(hidden_size=32, num_layers=2, layer_norm=True))
+    torch.manual_seed(0)
+    models = build_models("ddpg", model, obs, state, act, 3, device, num_critics=4)
+    memory = MultiRandomMemory(capacity=64, num_envs=3, num_agents=3, device=device)
+    learner = DDPG(models=models, memory=memory, observation_space=obs, state_space=state, action_space=act, device=device,
+                   cfg=cfg, trainer_cfg=TrainerCfg(learner="ddpg", total_timesteps=100), num_agents=3, num_envs=3, model_cfg=model)
+    learner.init()
+    learner.enable_training_mode(True)
+    for name, tensor in memory.tensors.items():
+        tensor.copy_(torch.zeros_like(tensor) if tensor.dtype == torch.bool else torch.randn_like(tensor))
+    memory.size = 64
+    memory.sync_size()
+    keep = torch.tensor([True, False, True], device=device)
+    learner._keep_critic.copy_(keep)
+    learner._keep_actor.copy_(keep)
+
+    def snap(lr, agent):
+        out = {f"{n}.{k}": v.clone() for n in ("policy", "target_policy", "critics", "target_critics")
+               for k, v in getattr(lr, n).agent_state_dict(agent).items()}
+        for o in ("policy_optimizer", "critic_optimizer"):
+            opt = getattr(lr, o)
+            out[f"{o}.t"] = opt.t[agent].clone()
+            out.update({f"{o}.m{i}": m[agent].clone() for i, m in enumerate(opt.exp_avg)})
+        return out
+
+    skipped = snap(learner, 1)
+    eager, graphed = learner, copy.deepcopy(learner)
+    graphed._graphs = StepGraphs(warmup=1)
+    mode = (False, True, True)
+    step = lambda lr: (lambda: lr._gradient_step(mode, 16, 10, graph=True))  # noqa: E731
+    for _ in range(4):
+        rng = torch.cuda.get_rng_state()
+        graphed._graphs.run(mode, step(graphed))
+        torch.cuda.set_rng_state(rng)
+        step(eager)()
+    torch.cuda.synchronize()
+    assert graphed._graphs.captured == 1
+    for agent in range(3):
+        a, b = snap(eager, agent), snap(graphed, agent)
+        for k in a:
+            assert torch.allclose(a[k].float(), b[k].float(), atol=1e-5), (agent, k)
+    for lr in (eager, graphed):
+        now = snap(lr, 1)
+        assert all(torch.equal(now[k], skipped[k]) for k in skipped)  # the skipped agent: untouched, bit for bit
+    assert not torch.equal(snap(eager, 0)["policy.mean.weight"], skipped["policy.mean.weight"])

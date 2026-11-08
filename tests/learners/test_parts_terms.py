@@ -38,7 +38,7 @@ def test_each_transition_gets_its_episodes_outcome_when_it_ends():
 
 def test_the_clone_and_anchor_terms_pull_toward_the_successes_actions_and_toward_zero():
     learner = build_learner("sac", num_agents=1, envs_per_agent=2, rollout=8, success_clone_weight=1.0,
-                            failure_anchor_weight=1.0, normalize_observations=False)
+                            failure_anchor_weight=1.0, state_preprocessor="none")
     learner._outcomes[:4] = torch.tensor([1.0, 0.0, -1.0, 1.0])
     sampled = {"episode_ids": torch.tensor([[0.0], [1.0], [2.0], [3.0]]),
                "actions": torch.tensor([[0.5, 0.5], [0.5, 0.5], [0.5, 0.5], [-0.5, 0.0]])}
@@ -147,7 +147,7 @@ def test_store_labels_keeps_only_transitions_starting_in_a_listed_phase():
 
 def test_a_time_limit_is_terminal_when_not_bootstrapped():
     learner = build_learner("sac", num_agents=1, envs_per_agent=2, rollout=4, bootstrap_time_limits=False,
-                            backup_entropy=False, normalize_observations=False)
+                            backup_entropy=False, state_preprocessor="none")
     n = 2
     sampled = {"observations": torch.randn(n, OBS_DIM), "next_observations": torch.randn(n, OBS_DIM),
                "actions": torch.zeros(n, ACT_DIM), "rewards": torch.tensor([[1.0], [2.0]]),

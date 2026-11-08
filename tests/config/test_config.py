@@ -99,6 +99,10 @@ def _fake_apply(env_cfg: Any, data: dict) -> Any:
     return _deserialize_spaces(env_cfg)
 
 
+#: the real task functions, before fake_task replaces them per test
+_REAL = {name: getattr(cfgmod, name) for name in ("load_task_cfg", "task_cfg_to_dict", "apply_task_cfg")}
+
+
 @pytest.fixture(autouse=True)
 def fake_task(monkeypatch):
     """Replace the three Isaac Lab functions with the strict fake."""
@@ -599,3 +603,75 @@ def test_an_extra_file_may_not_set_the_task_seed(tmp_path):
     with pytest.raises(ValueError) as err:
         load_from_run(tmp_path / "run", extra_files=[extra])
     assert "task.cfg.seed" in str(err.value)
+
+
+# ------------------------------------------------------------------ task.simulator
+@dataclass
+class StandaloneEnvCfg:
+    seed: int | None = None
+    horizon: int = 200
+    scene: FakeScene = field(default_factory=FakeScene)
+
+    def to_dict(self):
+        return {"seed": self.seed, "horizon": self.horizon, "scene": dataclasses.asdict(self.scene),
+                "SIMULATOR": "standalone"}
+
+    def from_dict(self, data):
+        self.horizon = data["horizon"]
+        self.scene = FakeScene(**data["scene"])
+
+
+StandaloneEnvCfg.SIMULATOR = "standalone"
+
+
+def _standalone_yaml(tmp_path, simulator="standalone"):
+    path = tmp_path / "standalone.yaml"
+    path.write_text(
+        "experiment:\n  seed: 7\nwandb:\n  entity: e\n  project: p\n  group: g\ntask:\n  name: Fake-Standalone-v0\n"
+        + (f"  simulator: {simulator}\n" if simulator else "")
+        + "  cfg:\n    horizon: 50\n"
+    )
+    return path
+
+
+def test_simulator_of_reads_the_files_and_the_cli_before_anything_loads(tmp_path):
+    import argparse
+
+    args = argparse.Namespace(config=str(_standalone_yaml(tmp_path)), from_run=None)
+    assert cfgmod.simulator_of(args) == "standalone"
+    assert cfgmod.simulator_of(args, ["task.simulator=isaac"]) == "isaac"
+    assert cfgmod.simulator_of(argparse.Namespace(config=str(_standalone_yaml(tmp_path, None)), from_run=None)) == "isaac"
+    with pytest.raises(ValueError, match="task.simulator"):
+        cfgmod.simulator_of(args, ["task.simulator=mujoco"])
+
+
+def test_a_standalone_task_loads_from_the_gym_registry_without_isaac_lab(tmp_path, monkeypatch):
+    import gymnasium as gym
+
+    # the real functions (fake_task replaced them); their standalone path imports no Isaac Lab
+    monkeypatch.setattr(cfgmod, "load_task_cfg", _REAL["load_task_cfg"])
+    monkeypatch.setattr(cfgmod, "task_cfg_to_dict", _REAL["task_cfg_to_dict"])
+    monkeypatch.setattr(cfgmod, "apply_task_cfg", _REAL["apply_task_cfg"])
+    gym.register(id="Fake-Standalone-v0", entry_point="gymnasium.envs.classic_control:CartPoleEnv",
+                 kwargs={"env_cfg_entry_point": f"{__name__}:StandaloneEnvCfg"})
+    gym.register(id="Fake-Undeclared-v0", entry_point="gymnasium.envs.classic_control:CartPoleEnv",
+                 kwargs={"env_cfg_entry_point": f"{__name__}:FakeEnvCfg"})
+    try:
+        cfg = load_config(_standalone_yaml(tmp_path))
+        assert isinstance(cfg.task_cfg, StandaloneEnvCfg)
+        assert cfg.task_cfg.horizon == 50 and cfg.task_cfg.seed == 7
+        assert cfg.root.task.simulator == "standalone"
+        assert "SIMULATOR" not in cfg.root.task.cfg  # the class's marker, not a setting
+        # task.simulator: standalone names a class that must say so
+        with pytest.raises(ValueError, match="SIMULATOR"):
+            load_config(_standalone_yaml(tmp_path), ["task.name=Fake-Undeclared-v0"])
+    finally:
+        gym.registry.pop("Fake-Standalone-v0", None)
+        gym.registry.pop("Fake-Undeclared-v0", None)
+
+
+def test_start_simulator_starts_nothing_for_a_standalone_task():
+    import argparse
+
+    assert cfgmod.start_simulator(argparse.Namespace(), "standalone") is None
+    assert cfgmod.active_simulator() == "standalone"

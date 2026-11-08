@@ -20,16 +20,20 @@ from robonuke_rl_core.learners.base import CHECKPOINT_EXTENSION, run_dirs
 pytestmark = pytest.mark.gpu
 
 HERE = Path(__file__).resolve().parent
-LEARNERS = ["sac", "ppo"]
+LEARNERS = ["sac", "ppo", "ddpg"]
 
 
 def build_learner(cfg, env, learner_name: str, dirs):
+    from robonuke_rl_core.learners.ddpg import DDPG
     from robonuke_rl_core.learners.ppo import PPO
     from robonuke_rl_core.learners.sac import SAC
     from robonuke_rl_core.memory.multi_random import MultiRandomMemory
+    from robonuke_rl_core.models.cfg import MlpModelCfg
     from robonuke_rl_core.models.factory import build_models
 
-    classes = {"sac": SAC, "ppo": PPO}
+    classes = {"sac": SAC, "ppo": PPO, "ddpg": DDPG}
+    # DDPG's builder is the MLP's (the shared GPU config's model is SimBa's)
+    model_cfg = MlpModelCfg() if learner_name == "ddpg" else cfg.model
     learner_cfg = cfg[learner_name]
     num_agents = cfg.experiment.num_agents
     # asymmetric actor-critic when the env advertises a state space
@@ -37,12 +41,13 @@ def build_learner(cfg, env, learner_name: str, dirs):
 
     models = build_models(
         learner_name,
-        cfg.model,
+        model_cfg,
         env.observation_space,
         state_space,
         env.action_space,
         num_agents,
         env.device,
+        **({"num_critics": int(learner_cfg.num_critics)} if learner_name == "ddpg" else {}),
     )
     capacity = (
         int(learner_cfg.rollouts) * (env.num_envs // num_agents)
@@ -52,7 +57,7 @@ def build_learner(cfg, env, learner_name: str, dirs):
     memory = MultiRandomMemory(
         capacity=capacity, num_envs=env.num_envs, num_agents=num_agents, device=env.device
     )
-    extra = {"model_cfg": cfg.model} if learner_name == "sac" else {}
+    extra = {"model_cfg": model_cfg} if learner_name in ("sac", "ddpg") else {}
     return classes[learner_name](
         models=models,
         memory=memory,

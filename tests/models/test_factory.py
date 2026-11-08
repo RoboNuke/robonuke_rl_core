@@ -33,6 +33,10 @@ LEARNERS = sorted({learner for _, learner in MODEL_BUILDERS})
 ARCHITECTURES = sorted({architecture for architecture, _ in MODEL_BUILDERS})
 #: architectures that serve one learner only (FlashSAC's network is SAC's)
 SINGLE_LEARNER = {"flashsac": "sac"}
+#: learners only some architectures serve (DDPG's deterministic actor is the MLP's)
+LEARNER_ARCHITECTURES = {"ddpg": ("mlp",)}
+#: the models that take the actor's observation, not the critic's state
+ACTORS = ("policy", "target_policy")
 CASES = sorted(MODEL_BUILDERS)
 
 
@@ -184,8 +188,10 @@ def test_build_models_raises_on_an_unknown_learner():
 @pytest.mark.parametrize("architecture, learner", CASES)
 def test_asymmetric_critics_take_the_state_space(architecture, learner):
     models = make(architecture, learner, asymmetric=True)
-    assert models["policy"].num_observations == OBS_DIM
-    critics = [name for name in models if name != "policy"]
+    for name in ACTORS:
+        if name in models:
+            assert models[name].num_observations == OBS_DIM, name
+    critics = [name for name in models if name not in ACTORS]
     assert critics
     for name in critics:
         assert models[name].num_observations == STATE_DIM, name
@@ -198,7 +204,7 @@ def test_the_builders_cover_the_registered_learners():
     # every (architecture, learner) pair has a builder, but a single-learner architecture's only its own
     expected = {
         (arch, learner) for arch in MODEL_ARCHITECTURES for learner in CONFIGURED
-        if SINGLE_LEARNER.get(arch, learner) == learner
+        if SINGLE_LEARNER.get(arch, learner) == learner and arch in LEARNER_ARCHITECTURES.get(learner, (arch,))
     }
     assert set(MODEL_BUILDERS) == expected
 

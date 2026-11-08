@@ -60,6 +60,14 @@ python scripts/debug.py --run entity/project/run_id --resets --headless \
     --num_resets 10 --out resets.mp4
 ```
 
+**`task.simulator`** (`isaac`, the default, or `standalone`) says who simulates the task. `standalone` is an env that
+brings its own simulator (MuJoCo, ...) behind an Isaac Lab env's surface; `train.py` reads the field from the files
+before anything else (`config.simulator_of`) and then never starts Isaac Sim (`config.start_simulator`). Its task cfg
+comes from gym's registry entry's `env_cfg_entry_point` (`"module:Class"`), a class that declares
+`SIMULATOR = "standalone"` (set after the class when it is a `configclass`), serialized with its own
+`to_dict` / `from_dict`. A project's `setup()` can skip Isaac-only registrations with
+`config.active_simulator() == "standalone"`. `eval.py` and `debug.py` still always start Isaac Sim.
+
 `--run` takes `entity/project/<run id or exact run name>` and pulls the config and checkpoint
 from that run's files; `--local` takes a run directory instead. `--checkpoint` accepts `best`
 (the default: `ckpt_best.ckpt`, or the file a project learner registered as its best with
@@ -143,7 +151,7 @@ that) back to the same run under `videos/<eval-config-stem>_<timestamp>/` (an ev
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |
-| `learner` | str | required | which learner runs: `sac` or `ppo`. Only that section is used; both are dumped |
+| `learner` | str | required | which learner runs: `sac`, `ppo` or `ddpg`. Only that section is used; all are dumped |
 | `total_timesteps` | int | required | env steps to train for |
 | `write_interval` | int | `1000` | env steps between episode-stat flushes through the `on_log` hooks (0 disables) |
 | `success_window` | int | `0` | `0`: `episode/success` is the mean over the episodes that finished in the write interval. `N > 0`: the mean over each agent's last `N` finished episodes, republished at every flush (a rolling window, not cleared between intervals), so a short `write_interval` still gives a meaningful rate. Nothing is published before an agent's first episode ends. `episode/best_success_rate` and the best-checkpoint rule are unchanged (per interval) |
@@ -164,11 +172,12 @@ Soft Actor-Critic. `batch_size` and the memory are per agent.
 | `warmup_episodes` | int | `0` | run the first this many episodes (counted over every env) on zero actions -- for a residual, the base alone with no exploration noise -- storing them as ordinary transitions, with no updates until they have finished, so the memory starts with the base's own outcomes. 0 is off |
 | `warmup_trains_critics` | bool | `False` | with `warmup_episodes`: the critics train on the warm-up's transitions (from `learning_starts`) while the actor stays frozen until the warm-up has ended. False: nothing trains during the warm-up |
 | `learning_starts_rows` | int | `0` | no update at all (critics or actor) until every agent's memory holds this many of its own online rows (demo rows not counted), however long that takes: a routed residual starts training only once its phase has given it the data. 0 is off (`learning_starts` alone) |
+| `save_memory_with_checkpoints` | bool | `False` | debugging: with every numbered checkpoint, also write each agent's replay memory to `memory_<step>.pt` beside it: `{"rows": {field: (rows, dim)}, "meta": {...}}`, every stored field (observations, states, actions, rewards, terminated, next_*, side inputs), oldest row first. Large (hundreds of MB per checkpoint at 300k rows) and never uploaded. With `demo_storage: sample` the demos are not in it; with `memory` / `memory_critic` they are its first rows (`meta.demo_rows_in_memory`). DDPG has it too |
 | `learning_starts` | int | `0` | env steps before the first update |
 | `weight_decay` | float | `0.0` | AdamW decoupled weight decay (not applied to the temperature) |
 | `grad_norm_clip` | float | `0.0` | per-agent gradient-norm clip; each agent is clipped by its own norm (0 disables) |
-| `normalize_observations` | bool | `True` | per-agent running normalization of observations (and states, when asymmetric) |
-| `normalizer_clip` | float | `5.0` | normalized values are clipped to +-this |
+| `state_preprocessor` | str | `"running"` | the input normalizer, as skrl's `state_preprocessor` (`models/normalizer.py`, one per agent): `none`; `running` (skrl's `RunningStandardScaler`, its statistics from the training batches); `demo` (the same scaler fitted once, when the learner starts, exactly on all of `demo_transitions`' rows; Q learners only, needs `demo_transitions`). It standardizes the actor's observations, the critics' states (asymmetric) and, for SAC / DDPG, the critics' action (the critic action transform's output, or the agent's action; checkpointed as `critic_actions`) |
+| `state_preprocessor_kwargs` | map | | skrl's `state_preprocessor_kwargs`: `update_normalizer_during_training` (null: `running` true, `demo` false -- frozen after its fit; true lets the training batches keep updating the statistics), `clip_threshold` (`5.0`, the standardized value is clipped to +-this), `epsilon` (`1e-8`, added to the std) |
 | `rewards_shaper` | str or null | `null` | `"module:name"` of `f(rewards, timestep, timesteps) -> rewards`; applied to stored rewards, not to episode stats |
 | `normalize_rewards` | bool | `False` | scale the stored reward by its **per-agent** running std (ResiP's `RunningMeanStdClip`: `r / sqrt(var + 1e-8)`, no mean subtraction; the variance is updated from every env step's batch of rewards), after the shaper and before the n-step fold. `episode/return` and `reward/step` keep the raw reward. The scaler's stats ride the checkpoint (`normalizers.rewards`) |
 | `reward_clip` | float | `5.0` | the scaled reward is clipped to +-this (only with `normalize_rewards`) |
@@ -183,6 +192,7 @@ Soft Actor-Critic. `batch_size` and the memory are per agent.
 | `lr_end` | float | `1.5e-4` | floor of the cosine schedule |
 | `actor_lr_warmup` | int | `0` | linear LR warm-up of the actor over this many **gradient steps** (`lr * step / warmup`, so the first runs at 0, as diffusers' cosine-with-warmup does); the schedule proper then runs over the remaining steps. 0 is none |
 | `critic_lr_warmup` | int | `0` | the same for the critics |
+| `entropy_lr_schedule` | bool | `False` | the temperature's LR follows `lr_schedule` too, from `entropy_lr` to `lr_end` over the same gradient-step count as the actor and critics, no warm-up (FlashSAC schedules all three optimizers alike); logged as `lr/entropy`. False: a constant `entropy_lr`. Needs `learn_entropy` |
 | `learn_entropy` | bool | `True` | learn the temperature per agent |
 | `initial_entropy_value` | float | `0.2` | starting temperature |
 | `target_entropy` | float or null | `null` | target entropy; `null` means `-|A|` |
@@ -233,18 +243,22 @@ Soft Actor-Critic. `batch_size` and the memory are per agent.
 | `parts_term_reduction` | str | `sum` | how PARTS' clone and anchor terms reduce over the action dims: `sum` (eq. 4's squared norm; grows with the action width, 4x for a 4-step chunk) or `mean` (TD3+BC's per-dim mean squared error, so `actor_q_scale` and the lambdas keep TD3+BC's balance at any width). The Q term's size is logged as `actor/q_term` beside `actor/clone_loss` and `actor/anchor_loss` |
 | `demo_storage` | str | `sample` | where the demos go. `sample`: a separate set mixed into the critic's batches in `demo_sampling_start..end` (symmetric sampling). `memory`: written into the replay memory once, before the first env step, as ordinary transitions, overwritten when the memory wraps like any other row (the window must be empty); with the PARTS terms each demo episode gets an episode id, a success when it holds a positive reward, so the clone term reads it like any other row (not with `demo_actor_clone`). `memory_critic`: written into the replay memory the same way, each row flagged as a demo: the critics sample every row, the actor samples its own full batch from the online rows only, so it never sees a demo and its batch is never thinned by them. A squashed actor's clone target is clipped to [-1, 1] |
 | `demo_actor_clone` | bool | `False` | the demos in the actor too (needs `demo_transitions` and `success_clone_weight > 0`): each actor step also clones `batch_size` demo rows, their action clipped to the actor's [-1, 1], as successes, weighted by `success_clone_weight` (`actor/demo_clone_loss`). The critics take the demos through `demo_sampling_start..end` as before; demos may carry the critic-action transform's side inputs |
-| `route_labels` | list[str] | `[]` | PARTS' per-phase residuals: one complete SAC per listed `std_label_names` group (its own actor, critics, targets, optimizers, replay memory, every other setting of this section), driven by `RoutedSAC`. Each env acts with the SAC of the group its observation is in (`std_by_label`), zeros elsewhere. Each SAC stores only transitions starting in its group, with a local reward: 1 and terminal when the next label is a later `std_label_names` entry, terminal with 0 when the episode ends first. Learner metrics are logged as `<group>/<name>` (including `<group>/route/steps`, the agent steps that started in the group, `<group>/route/memory_rows` and `<group>/route/updates`: how much practice each residual has had), env and episode metrics once; checkpoints go in `<run>/<group>/checkpoints`; a `{route}` in `demo_transitions` is filled per group. Empty: one SAC |
+| `route_labels` | list[str] | `[]` | PARTS' per-phase residuals: one complete SAC per listed `std_label_names` group (its own actor, critics, targets, optimizers, replay memory, every other setting of this section), driven by `RoutedSAC`. Each env acts with the SAC of the group its observation is in (`std_by_label`), zeros elsewhere. Each SAC stores only transitions starting in its group, with a local reward: 1 and terminal when the next label is a later `std_label_names` entry, terminal with 0 when the episode ends first. Learner metrics are logged as `<group>/<name>` (including `<group>/route/steps`, the agent steps that started in the group, `<group>/route/memory_rows` and `<group>/route/updates`: how much practice each residual has had, published every `write_interval` from the first step, before the residual learns too), env and episode metrics once; checkpoints go in `<run>/<group>/checkpoints`; a `{route}` in `demo_transitions` is filled per group. Empty: one SAC |
 | `route_label` | str \| None | `None` | set by the routing on each per-group SAC (`route_labels`); not set in a config |
 | `potential_terms` | list | `[]` | potential-based reward shaping (Ng et al. 1999) per routed residual: entries `{route, channel, weight}` (`route` a route label, `"*"` for an unrouted SAC; a channel at most once per route). Every stored reward gains `gamma Phi(s') - Phi(s)` (`discount_factor`), `Phi = -sum weight * value` over the channels the env published with each observation (`"<key>/<name>"` reads `infos[key][name]`, e.g. one_leg's `eval_state/phase/tip_mm`): a dense reward for closing the distance. `Phi(s')` is the next observation's on an attempt's last transition too (not 0), so an attempt that ends far off pays for it; no shaping on the step after an env's episode ended or a forced reset. A residual with no entry is unshaped. A missing or non-finite channel fails. Empty: off |
 | `retrain_every` | int | `0` | PARTS' success-reweighted retraining every `retrain_every` env steps (0: off): the replay memory keeps every transition of a successful episode (`outcome_metric`, or the local outcome with `route_labels`), of running ones, and of a random `retrain_failure_fraction` of the failed ones (whole episodes), then the networks, optimizers and temperature start fresh and run `retrain_gradient_steps` updates on that memory before online training resumes on it. Logged: `retrain/kept_rows` |
 | `retrain_failure_fraction` | float | `0.1` | the share of failed episodes the retraining keeps, in [0, 1] |
 | `retrain_gradient_steps` | int | `0` | offline updates per retraining; >= 1 with `retrain_every` |
 | `route_clock` | bool | `False` | a routed residual (`route_labels`) counts `learning_starts`, `update_every` and `retrain_every` in its own steps (the env steps whose starting label is its route) and updates only on those: nothing while its phase is not running, nor in phases without a residual |
+| `phase_logging` | bool | `False` | per-phase logging for routed residuals (`learners/phase_logging.py`; needs `route_labels` and `std_by_label`). A phase attempt is an env's stay in one label: it succeeds if the label moves to a later one, or if its episode ends with `episode/success`. A routed phase publishes every `trainer.write_interval` of **its own** steps: `<phase>_episode/{success, best_success_rate, length, length_min, length_max, return, return_min, return_max, count, out_of_bounds}` (success over the last `trainer.success_window` attempts when set), its residual's learner metrics as `<phase>_<family>/<name>`, the per-phase residual metrics (`metrics_by_label`) as `<phase>_residual/<name>`, and `<phase>_step` (its step count; each run plots `<phase>_*` against it). Each residual's progress is on the env steps instead, every `trainer.write_interval` env steps: `route/<phase>_steps` (its phase's steps so far), `route/<phase>_memory_rows`, `route/<phase>_updates`. A phase without a residual goes into the episodes' interval as `episode/<phase>_success`, `episode/<phase>_length`, `episode/<phase>_steps`. The env's `phase/*` episode metrics fold into `episode/` (`phase/reached` -> `episode/phase_reached`; `phase/end`, `phase/passed_*`, `phase/<name>_step` dropped). Every name has one `/` (`episode/length/max` -> `episode/length_max`) |
+| `phase_logging_phases` | list of str | `[]` | the labels phase logging tracks, every `route_labels` phase among them (one_leg: `[corner, grasp, insert, screw]`, leaving out `success`). Empty: every `std_label_names` label |
 | `hold_still_key` | str \| None | `None` | hold transitions while the task makes no progress: the `infos` channel (`"<key>/<name>"` for `infos[key][name]`, e.g. `eval_state/phase/still`) that is 1 per env on a step without progress. Held transitions are written once progress resumes; when the episode ends for lack of progress (`hold_stall_key`), only the first held one is written, as a terminal failure, and the rest are dropped. Works through `n_step` windows. With `hold_stall_key` |
 | `hold_stall_key` | str \| None | `None` | the `infos` channel that is 1 per env on the step an episode is ended for lack of progress (e.g. `eval_state/phase/stalled`). With `hold_still_key` |
 | `reference_dropout` | float | `0.0` | PARTS' reference dropout: in each actor update, zero the actor observation's last `reference_columns` columns (a residual's observed base action) for this fraction of the batch rows, so the correction is not learned from the reference alone. 0 is off |
 | `reference_columns` | int | `0` | how many trailing actor-observation columns `reference_dropout` zeroes; >= 1 with it |
 | `bootstrap_time_limits` | bool | `True` | bootstrap through a time limit (`truncated` without `terminated`): `r + gamma Q(s', a')`. False makes every episode's last transition terminal (`r` alone): Isaac Lab resets an env inside the step that ends it and returns the next episode's first observation, so `s'` there is not the state the episode reached (skrl and Isaac Lab's SB3 wrapper bootstrap from that reset observation too; SB3 itself needs the true `terminal_observation`, which Isaac Lab cannot give) |
+
+A project can also build the demo transitions at load, with the env's own code (`learners.sac.register_demo_loader(fn)` in its training script's `setup()`): `train.main` calls `fn(cfg, env)` once the env is built, and a returned `loader(data, route_label) -> {"transitions": ..., "meta": ...}` turns the loaded `demo_transitions` file (a project's raw demo episodes, say) into the learner's transitions; `route_label` is the learner's own (None unrouted). At most one builder may answer; without one the file must already hold `transitions`. The `demo` state preprocessor is then fitted on what the loader returns.
 
 The critics take the agent's action unless a project registered a critic-action transform
 (`learners.sac.register_critic_action`, see `CLAUDE.md`): then every critic call (loss, target,
@@ -257,7 +271,73 @@ read what the critic state carries and the actor's observation does not. Two opt
 script registers the builder too) and `side_inputs` `{name: width}`: per-transition tensors the env
 publishes as `infos[name]` and `infos["next_" + name]` every step, stored in the memory and handed to the
 transform as a third argument `{name: tensor}` (the `next_` ones for the target) — never a critic input.
-Not with demo transitions.
+A demo transitions file must then carry every side input and its `next_` value as well (checked at load).
+
+## ddpg
+
+Deep Deterministic Policy Gradient (`learners/ddpg.py`, a subclass of SAC's learner). The actor is deterministic,
+`a = actor_action_scale * tanh(mu(s))`. Exploration is Gaussian noise of a fixed or scheduled std. There is a target
+actor and there are target critics (both Polyak `polyak`). The critic regresses on `r + gamma^n Q'(s', mu'(s'))` and the
+actor minimizes `-Q(s, mu(s))`. There is no entropy term.
+
+Every field of the `sac` table applies here unchanged: the memory, n-step rows, demos, per-phase routing and its
+clocks, `gradient_steps` / `policy_delay` / `update_every`, `learning_starts(_rows)`, the learning rates and their
+schedules, `weight_decay`, `grad_norm_clip`, CUDA graphs and logging. The exceptions are SAC's entropy, noise and
+regularizer options, which DDPG refuses at load: `learn_entropy`, `backup_entropy`, `initial_entropy_value`,
+`target_entropy(_sigma)`, `entropy_lr_schedule`, `noise_repeat`, `unsquashed_actor`, `progressive_exploration_steps`,
+`critic_distribution: categorical`, `cross_batch_value`, `periodic_reset_enabled`, `retrain_every`,
+`action_l2_weight`, `success_clone_weight`, `failure_anchor_weight`, `demo_actor_clone` and `reference_dropout`.
+`potential_terms` works as in SAC (the shaping is added where transitions are stored, which DDPG shares). Only `model.architecture: mlp` builds DDPG's models (`policy`, `target_policy`, `critics`,
+`target_critics`). `model.actor.squash` must be true. The actor's log-std parameters are built but never trained.
+
+The defaults are plain DDPG: one critic and no target smoothing. The TD3, REDQ and ResFiT pieces (Ankile et al. 2025,
+arXiv:2509.19301) are opt-in through the fields below. `configs/experiments/ResFiT/` in `hybrid_demos` sets them all.
+
+Fields whose default differs from `sac`'s:
+
+| field | type | default | what it does |
+| --- | --- | --- | --- |
+| `num_critics` | int | `1` | Q critics; 1 is DDPG, 2 TD3, 10 REDQ / ResFiT |
+| `critic_subset` | int | `1` | critics the target's min is taken over, drawn at random every update (REDQ / ResFiT: 2 of 10) |
+| `actor_q_reduction` | str | `"mean"` | how the actor's loss combines the critics: `mean` (REDQ / ResFiT), `min`, `min_random_pair` (min over a random 2) or `q1` (TD3: the first critic) |
+| `learn_entropy` | bool | `False` | refused if true |
+| `initial_entropy_value` | float | `0.0` | refused if nonzero |
+| `backup_entropy` | bool | `False` | refused if true |
+| `state_preprocessor` | str | `"none"` | SAC's input normalizer (`none`, `running`, `demo`), opt-in here |
+
+DDPG's own fields:
+
+| field | type | default | what it does |
+| --- | --- | --- | --- |
+| `actor_action_scale` | float | `1.0` | the actor's output is `actor_action_scale * tanh(mu)`. ResFiT: 0.1, the residual's reach in normalized action units |
+| `exploration_std` | float | `0.1` | std of the Gaussian noise added to the actor's action when acting (ResFiT: 0.05). Also the std of the target-smoothing noise |
+| `exploration_std_end` | float or null | `null` | the std at the end of a linear schedule. Null: constant |
+| `exploration_std_steps` | int | `0` | env steps the schedule runs over; 0: constant |
+| `exploration_noise_clip` | float or null | `null` | clamp the exploration noise to ±this. Null: unclipped (ResFiT) |
+| `action_clip` | float or null | `1.0` | every action (acting, the target's next action, the actor's own in its loss, straight-through) is clamped to ±this. Null: no clamp |
+| `target_actor` | bool | `True` | the critic target's next action comes from the target actor (DDPG, TD3). False: from the actor itself |
+| `target_policy_noise` | bool | `False` | TD3's target-policy smoothing: the target's next action gets N(0, exploration std) noise, clipped to ±`target_noise_clip` (ResFiT: on) |
+| `target_noise_clip` | float | `0.3` | the smoothing noise's clip |
+| `critic_loss` | str | `"mse"` | `mse`: the mean over critics of each one's squared TD error. `mean_abs_squared`: ResFiT's `(mean_k \|Q_k - y\|)^2` |
+| `q_target_min` | float or null | `null` | clamp the critic target to [`q_target_min`, `q_target_max`] (ResFiT's `clip_q_target_to_reward_range`). Set both or neither |
+| `q_target_max` | float or null | `null` | see `q_target_min` |
+| `action_l2_reg_weight` | float | `0.0` | ResFiT's `action_l2_reg_weight`: `weight * mean_rows(sum_d a_d^2)` added to the actor's loss |
+| `random_action_scale` | float | `0.0` | uniform actions in ±this until this learner starts learning (`learning_starts` / `learning_starts_rows`, per route with `route_clock`) or for the first `random_timesteps` env steps. For a residual, the base plus that noise (ResFiT: 0.2). 0: the actor with its noise from the start |
+| `random_action_mode` | str | `"uniform"` | what a warm-up action is: `uniform` (ResFiT's, `U(-random_action_scale, random_action_scale)` about 0) or `actor_gaussian` (the actor's own deterministic action plus `N(0, random_action_scale)`, clamped to `action_clip`: about the actor's starting point, for a residual whose neutral action is not 0, `model.actor.output_bias`) |
+| `critic_warmup_updates` | int | `0` | ResFiT's critic warm-up: when this learner may first update, this many critic-only gradient steps run at once, before the next env step. The actor learns from the next update on. Per route with `route_clock` |
+
+Metrics, on top of SAC's (no `entropy/*`): `policy/exploration_std` (the current noise std; also `policy/std`),
+`policy/mean_action` (mean |deterministic action|) and `q/ensemble_std` (the critics' spread over the batch).
+
+**Several agents (`experiment.num_agents` > 1) keep separate schedules.** Each agent has its own `route_clock` (its
+envs' steps in the phase), its own `learning_starts_rows` (its own online rows), and its own update and `policy_delay`
+counts and LR schedule. DDPG adds its own uniform warm-up (`random_action_scale`) and critic warm-up burst
+(`critic_warmup_updates`) per agent. An update steps only the agents that are due. Every optimizer step and every
+target update (critics and the target actor) is masked to those agents, so an agent that is not due keeps its weights,
+targets, optimizer moments and step counts exactly. A block batch's online share is sized by the due agents' data
+alone. With such a schedule, `periodic_reset_enabled`, `retrain_every` and a `state_preprocessor` whose statistics update during training (`running`, or `update_normalizer_during_training`) act on
+every agent at once, so they are refused. The agents share one random-number stream (batch draws, exploration noise),
+so they are independent in what they learn and when, but not bit-reproducible in isolation.
 
 ## ppo
 
@@ -271,8 +351,8 @@ Proximal Policy Optimization. The rollout buffer is `rollouts` steps per env;
 | `learning_starts` | int | `0` | env steps before the first update |
 | `weight_decay` | float | `0.0` | AdamW decoupled weight decay |
 | `grad_norm_clip` | float | `0.0` | per-agent gradient-norm clip for the policy and the value net (0 disables) |
-| `normalize_observations` | bool | `True` | per-agent running normalization of observations (and states, when asymmetric) |
-| `normalizer_clip` | float | `5.0` | normalized values are clipped to +-this |
+| `state_preprocessor` | str | `"running"` | the input normalizer, as skrl's `state_preprocessor` (`models/normalizer.py`, one per agent): `none`; `running` (skrl's `RunningStandardScaler`, its statistics from the training batches); `demo` (the same scaler fitted once, when the learner starts, exactly on all of `demo_transitions`' rows; Q learners only, needs `demo_transitions`). It standardizes the actor's observations, the critics' states (asymmetric) and, for SAC / DDPG, the critics' action (the critic action transform's output, or the agent's action; checkpointed as `critic_actions`) |
+| `state_preprocessor_kwargs` | map | | skrl's `state_preprocessor_kwargs`: `update_normalizer_during_training` (null: `running` true, `demo` false -- frozen after its fit; true lets the training batches keep updating the statistics), `clip_threshold` (`5.0`, the standardized value is clipped to +-this), `epsilon` (`1e-8`, added to the std) |
 | `rewards_shaper` | str or null | `null` | `"module:name"` of `f(rewards, timestep, timesteps) -> rewards` |
 | `normalize_rewards` | bool | `False` | scale the stored reward by its **per-agent** running std (ResiP's `RunningMeanStdClip`: `r / sqrt(var + 1e-8)`, no mean subtraction; the variance is updated from every env step's batch of rewards), after the shaper and before the `time_limit_bootstrap` term is added. `episode/return` and `reward/step` keep the raw reward. The scaler's stats ride the checkpoint (`normalizers.rewards`) |
 | `reward_clip` | float | `5.0` | the scaled reward is clipped to +-this (only with `normalize_rewards`) |
@@ -350,8 +430,9 @@ max_log_std: log(5)}` and `critic: {activation: Tanh, layer_norm: true, init: xa
 | `actor.hidden_size` | int | `256` | width of every hidden layer |
 | `actor.num_layers` | int | `2` | hidden layers (each `Linear -> activation`, or `Linear -> LayerNorm -> activation` with `layer_norm`) |
 | `actor.activation` | str | `"ReLU"` | a `torch.nn` activation class name: `ReLU`, `SiLU`, `Tanh`, `ELU`, `GELU`, ... (checked at load) |
-| `actor.init` | str | `"orthogonal"` | hidden-layer init: `orthogonal` (gain `sqrt(2)`, the CleanRL / Policy Decorator convention) or `kaiming` (`kaiming_normal_` fan-in, ResiP's `layer_init`), the output heads orthogonal; or `xavier` (SERL's `default_init`: `xavier_uniform` on every layer, the heads with gain `output_init_scale`). Biases zero |
-| `actor.output_init_scale` | float | `0.01` | the gain of the mean head's init (and of the log-std head's when state dependent): ResiP's and Policy Decorator's 0.01 starts the policy near zero action; SERL's 1.0 |
+| `actor.init` | str | `"orthogonal"` | hidden-layer init: `default` (PyTorch's own `nn.Linear` init on the hidden layers, ResFiT's; the heads orthogonal with gain `output_init_scale`, or zero at 0), `orthogonal` (gain `sqrt(2)`, the CleanRL / Policy Decorator convention) or `kaiming` (`kaiming_normal_` fan-in, ResiP's `layer_init`), the output heads orthogonal; or `xavier` (SERL's `default_init`: `xavier_uniform` on every layer, the heads with gain `output_init_scale`). Biases zero |
+| `actor.output_init_scale` | float | `0.01` | the gain of the mean head's init (and of the log-std head's when state dependent): ResiP's and Policy Decorator's 0.01 starts the policy near zero action; SERL's 1.0; 0 zeroes the head's weights (ResFiT's residual starts at exactly zero) |
+| `actor.output_bias` | float or null | `null` | the mean head's initial bias, every dim (null: zero); with `output_init_scale: 0` the squashed actor starts at `tanh(output_bias)` for every state (hybrid_demos' `residual.action_frame: multiply` starts at its no-change multiplier). MLP actor only |
 | `actor.init_log_std` | float | `0.0` | the log std every action dim starts at, whatever the bound (ResiP: `-1.0`) |
 | `actor.learn_std` | bool | `True` | `false` freezes the state-independent log std at `init_log_std` (ResiP): it is a buffer, not a parameter, so no optimizer touches it, though the checkpoint carries it. Needs `use_state_dependent_std: false` |
 | `actor.use_state_dependent_std` | bool | `False` | a second head predicts the log std from the state (classic SAC) instead of one learned value per dim |
@@ -363,8 +444,8 @@ max_log_std: log(5)}` and `critic: {activation: Tanh, layer_norm: true, init: xa
 | `critic.hidden_size` | int | `256` | width of every hidden layer of the Q critics (SAC) or the value net (PPO) |
 | `critic.num_layers` | int | `2` | hidden layers |
 | `critic.activation` | str | `"ReLU"` | a `torch.nn` activation class name |
-| `critic.init` | str | `"orthogonal"` | `orthogonal`, `kaiming` or `xavier`, as the actor's |
-| `critic.output_init_scale` | float | `1.0` | the gain of the value head's init (ResiP: 1.0) |
+| `critic.init` | str | `"orthogonal"` | `default`, `orthogonal`, `kaiming` or `xavier`, as the actor's |
+| `critic.output_init_scale` | float | `1.0` | the gain of the value head's init (ResiP: 1.0); 0 zeroes it |
 | `critic.layer_norm` | bool | `False` | a LayerNorm between every hidden layer's Linear and its activation (SERL's `use_layer_norm`) |
 
 Fields for `architecture: flashsac` (`models/flashsac.py`, SAC only): FlashSAC's network (arXiv:2604.04539) --
@@ -585,7 +666,7 @@ an unattended run must not be killed by its logging.
 | `cpus` | int | `12` | `-c`, CPUs per task |
 | `signal` | str | `"TERM@300"` | `--signal`; SLURM warns the job this far ahead of the walltime kill. The job `exec`s python, so the signal reaches the training process and not bash |
 | `exp_log_dir` | str | `"exp_logs"` | where `.out` / `.err` land, relative to the project root; logs go to `{exp_log_dir}/{project}/{name}_%j.out` |
-| `train_script` | str | `"scripts/train.py"` | the entry script `launch_train` / `launch_sweep` run, relative to the project root (checked to exist before anything is queued); a project-registered learner names its own, e.g. `scripts/train_bc.py`, since `train.main` runs sac / ppo only |
+| `train_script` | str | `"scripts/train.py"` | the entry script `launch_train` / `launch_sweep` run, relative to the project root (checked to exist before anything is queued); a project-registered learner names its own, e.g. `scripts/train_bc.py`, since `train.main` runs sac / ppo / ddpg only |
 | `sif_image` | str | `""` | path to the `.sif` on the cluster (`~` is expanded). Nothing is installed into it — the job binds both repos and puts them on `PYTHONPATH` — so the existing `ghvic.sif` is used as-is; see `examples/hpc.yaml`. **Required at submit** |
 | `apptainer_bin` | str | `"apptainer"` | or `"singularity"` |
 | `container_python` | str | `"python"` | the python inside the image |

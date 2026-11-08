@@ -56,8 +56,9 @@ __all__ = [
 #: hidden-layer initializations: ``orthogonal`` (gain sqrt(2), the CleanRL / Policy Decorator
 #: convention), ``kaiming`` (``kaiming_normal_`` fan-in, ResiP's ``layer_init``) -- the output
 #: layer orthogonal with the configured gain -- or ``xavier`` (SERL's ``default_init``,
-#: ``xavier_uniform`` on every layer, the output layers' with the configured gain); biases zero
-INITS = ("orthogonal", "kaiming", "xavier")
+#: ``xavier_uniform`` on every layer, the output layers' with the configured gain); biases zero -- or ``default``
+#: (PyTorch's own ``nn.Linear`` init for the hidden layers, ResFiT's actor), the output layer orthogonal
+INITS = ("orthogonal", "kaiming", "xavier", "default")
 #: how the log std is kept in ``[min_log_std, max_log_std]``: a hard ``clip``, the soft
 #: ``tanh`` map ``min + 0.5 (max - min) (tanh(x) + 1)``, or ``none``
 LOG_STD_BOUNDS = ("clip", "tanh", "none")
@@ -87,8 +88,8 @@ def check_mlp_critic_fields(prefix: str, hidden_size: int, num_layers: int, acti
         raise ValueError(f"{prefix}.activation: {exc}") from None
     if init not in INITS:
         raise ValueError(f"{prefix}.init must be one of {INITS}, got {init!r}")
-    if float(output_init_scale) <= 0.0:
-        raise ValueError(f"{prefix}.output_init_scale must be > 0, got {output_init_scale}")
+    if float(output_init_scale) < 0.0:
+        raise ValueError(f"{prefix}.output_init_scale must be >= 0 (0: an all-zero output layer), got {output_init_scale}")
 
 
 def check_mlp_actor_fields(
@@ -107,9 +108,12 @@ def check_mlp_actor_fields(
     max_log_std: float,
     squash: bool,
     layer_norm: bool = False,
+    output_bias: Optional[float] = None,
 ) -> None:
     """The actor's rules, shared by the config's ``validate`` and the model's constructor."""
     check_mlp_critic_fields(prefix, hidden_size, num_layers, activation, init, output_init_scale)
+    if output_bias is not None and not math.isfinite(float(output_bias)):
+        raise ValueError(f"{prefix}.output_bias must be a finite number or null, got {output_bias}")
     if log_std_bound not in LOG_STD_BOUNDS:
         raise ValueError(f"{prefix}.log_std_bound must be one of {LOG_STD_BOUNDS}, got {log_std_bound!r}")
     if not learn_std and use_state_dependent_std:
@@ -139,6 +143,8 @@ def _init_hidden(linear: nn.Linear, init: str) -> None:
         nn.init.kaiming_normal_(linear.weight, mode="fan_in", nonlinearity="relu")
     elif init == "xavier":
         nn.init.xavier_uniform_(linear.weight)
+    elif init == "default":
+        return  # PyTorch's own nn.Linear init (kaiming-uniform weights, uniform biases)
     else:
         raise ValueError(f"init must be one of {INITS}, got {init!r}")
     nn.init.zeros_(linear.bias)
@@ -146,8 +152,10 @@ def _init_hidden(linear: nn.Linear, init: str) -> None:
 
 def _init_output(linear: nn.Linear, scale: float, init: str = "orthogonal") -> None:
     """The output layer, zero bias: ResiP's and CleanRL's orthogonal with gain ``scale``, or (``init: xavier``)
-    SERL's xavier-uniform with that gain."""
-    if init == "xavier":
+    SERL's xavier-uniform with that gain. ``scale`` 0: all zeros (ResFiT's residual actor: exactly zero at init)."""
+    if float(scale) == 0.0:
+        nn.init.zeros_(linear.weight)
+    elif init == "xavier":
         nn.init.xavier_uniform_(linear.weight, float(scale))
     else:
         nn.init.orthogonal_(linear.weight, float(scale))
@@ -204,11 +212,15 @@ class MlpActorNet(nn.Module):
         min_log_std: float,
         max_log_std: float,
         layer_norm: bool = False,
+        output_bias: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.trunk = _trunk(obs_dim, hidden_size, num_layers, activation, init, layer_norm)
         self.mean = nn.Linear(hidden_size, action_dim)
         _init_output(self.mean, output_init_scale, init)
+        if output_bias is not None:  # model.actor.output_bias: the mean starts there (with a zero output layer, everywhere)
+            with torch.no_grad():
+                self.mean.bias.fill_(float(output_bias))
         self.use_state_dependent_std = bool(use_state_dependent_std)
         self.log_std_bound = str(log_std_bound)
         self.min_log_std = float(min_log_std)
@@ -291,6 +303,7 @@ class MlpActor(EnsembleModel, GaussianMixin, Model):
         max_log_std: float = 2.0,
         squash: bool = True,
         layer_norm: bool = False,
+        output_bias: Optional[float] = None,
         **layout,
     ) -> None:
         if layout:
@@ -304,7 +317,7 @@ class MlpActor(EnsembleModel, GaussianMixin, Model):
             hidden_size=hidden_size, num_layers=num_layers, activation=activation, init=init,
             output_init_scale=output_init_scale, init_log_std=init_log_std, learn_std=learn_std,
             use_state_dependent_std=use_state_dependent_std, log_std_bound=log_std_bound,
-            min_log_std=min_log_std, max_log_std=max_log_std, squash=squash,
+            min_log_std=min_log_std, max_log_std=max_log_std, squash=squash, output_bias=output_bias,
         )
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
         # the bound is the net's own (log_std_bound); skrl's clamp stays off
@@ -333,6 +346,7 @@ class MlpActor(EnsembleModel, GaussianMixin, Model):
                 min_log_std=float(min_log_std),
                 max_log_std=float(max_log_std),
                 layer_norm=bool(layer_norm),
+                output_bias=None if output_bias is None else float(output_bias),
             )
 
         self.net = VmapEnsemble(build, num_agents, device=device)

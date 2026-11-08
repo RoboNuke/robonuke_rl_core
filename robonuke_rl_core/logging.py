@@ -66,6 +66,7 @@ class MetricAccumulator:
         num_agents: int,
         device: Optional[Any] = None,
         distributions: Iterable[str] = (),
+        sep: str = "/",
     ) -> None:
         if num_agents < 1:
             raise ValueError(f"num_agents must be >= 1, got {num_agents}")
@@ -74,6 +75,8 @@ class MetricAccumulator:
         #: names that also publish ``<name>/min`` and ``<name>/max`` — for a metric whose
         #: spread across envs says as much as its average (a return, an episode length, a Q)
         self.distributions = set(distributions)
+        #: what joins a distribution's name and ``min`` / ``max`` (``"_"``: one ``/`` per name, phase logging's)
+        self.sep = str(sep)
         self._sums: List[Dict[str, torch.Tensor]] = [{} for _ in range(self.num_agents)]
         #: finite entries seen, as a device tensor: counting them needs the NaN mask
         self._counts: List[Dict[str, torch.Tensor]] = [{} for _ in range(self.num_agents)]
@@ -94,6 +97,9 @@ class MetricAccumulator:
                 continue  # an interval with nothing in it publishes nothing
 
             detached = value.detach().to(torch.float64)
+            if self.device is not None:
+                # a value from elsewhere (phase logging's host-side counts): every sum lives on one device
+                detached = detached.to(self.device)
             finite = torch.isfinite(detached)
             zero = torch.zeros((), dtype=detached.dtype, device=detached.device)
             total = torch.where(finite, detached, zero).sum()
@@ -115,11 +121,13 @@ class MetricAccumulator:
                     else (torch.minimum(seen[0], low), torch.maximum(seen[1], high))
                 )
 
-    def flush(self) -> List[Dict[str, float]]:
-        """Mean per (agent, name) for the interval, then clear. One sync for everything."""
-        keys = [(agent, name) for agent in range(self.num_agents) for name in self._sums[agent]]
+    def flush(self, agents: Optional[Iterable[int]] = None) -> List[Dict[str, float]]:
+        """Mean per (agent, name) for the interval, then clear. One sync for everything. ``agents``: only these agents'
+        (the others keep accumulating; their entries in the result are empty)."""
+        chosen = list(range(self.num_agents)) if agents is None else [int(a) for a in agents]
+        keys = [(agent, name) for agent in chosen for name in self._sums[agent]]
         if not keys:
-            self._clear()
+            self._clear(chosen)
             return [{} for _ in range(self.num_agents)]
         # one sync for everything: the sums, then the counts, then each distribution's extremes
         tensors = [self._sums[agent][name] for agent, name in keys]
@@ -139,13 +147,13 @@ class MetricAccumulator:
         rest = values[2 * len(keys) :]
         for index, (agent, name) in enumerate(spread):
             if counts[(agent, name)] > 0:
-                out[agent][f"{name}/min"] = rest[2 * index]
-                out[agent][f"{name}/max"] = rest[2 * index + 1]
-        self._clear()
+                out[agent][f"{name}{self.sep}min"] = rest[2 * index]
+                out[agent][f"{name}{self.sep}max"] = rest[2 * index + 1]
+        self._clear(chosen)
         return out
 
-    def _clear(self) -> None:
-        for agent in range(self.num_agents):
+    def _clear(self, agents: Optional[Iterable[int]] = None) -> None:
+        for agent in (range(self.num_agents) if agents is None else agents):
             self._sums[agent] = {}
             self._counts[agent] = {}
             self._extremes[agent] = {}
@@ -191,6 +199,7 @@ class WandbLogger:
         device: Optional[Any] = None,
         distributions: Iterable[str] = (),
         backend: Any = None,
+        flat_names: bool = False,
     ) -> None:
         names = list(run_names)
         if not names:
@@ -206,9 +215,11 @@ class WandbLogger:
 
         self.run_names = names
         self.accumulator = MetricAccumulator(
-            len(names), device=device, distributions=distributions or DISTRIBUTIONS
+            len(names), device=device, distributions=distributions or DISTRIBUTIONS, sep="_" if flat_names else "/"
         )
         self._last_step = 0
+        #: per agent, a row logged with :meth:`log_now` and not yet committed: ``(step, values)``
+        self._pending: List[Optional[tuple]] = [None] * len(names)
         self.runs = [
             backend.init(
                 entity=entity,
@@ -259,6 +270,7 @@ class WandbLogger:
         config_path: Optional[Any] = None,
         device: Optional[Any] = None,
         backend: Any = None,
+        flat_names: bool = False,
     ) -> "WandbLogger":
         """Build from a resolved config: one run per name in ``cfg.derived['run_names']``."""
         return cls(
@@ -272,6 +284,7 @@ class WandbLogger:
             config_path=config_path,
             device=device,
             backend=backend,
+            flat_names=flat_names,
         )
 
     def _require_concurrent_runs(self, runs: int) -> None:
@@ -294,15 +307,52 @@ class WandbLogger:
         self.accumulator.add(agent, metrics)
 
     def flush(self, step: int) -> None:
-        """The ``on_flush`` hook: publish the interval's means at ``step``."""
+        """The ``on_flush`` hook: publish the interval's means at ``step`` (with a :meth:`log_now` row of the same step
+        merged in)."""
         for agent, values in enumerate(self.accumulator.flush()):
+            pending = self._pending[agent]
+            if pending is not None and pending[0] < int(step):
+                self._commit(agent)
+                pending = None
+            if pending is not None:
+                values = {**pending[1], **values}
+                self._pending[agent] = None
             if values:
                 # commit now: wandb otherwise holds a row logged at an explicit step until a
                 # later step arrives, so every point would show up one interval late
                 self.runs[agent].log(values, step=int(step), commit=True)
 
+    def log_now(self, agent: int, values: Dict[str, float], step: int) -> None:
+        """Publish ``values`` for ``agent`` at ``step`` outside the interval (phase logging's per-phase points): held
+        until a later step or the next :meth:`flush`, so a flush at the same step publishes one row."""
+        self._last_step = max(self._last_step, int(step))
+        pending = self._pending[agent]
+        if pending is not None and pending[0] < int(step):
+            self._commit(agent)
+            pending = None
+        if pending is None:
+            self._pending[agent] = (int(step), dict(values))
+        else:
+            pending[1].update(values)
+
+    def _commit(self, agent: int) -> None:
+        step, values = self._pending[agent]
+        self._pending[agent] = None
+        if values:
+            self.runs[agent].log(values, step=step, commit=True)
+
+    def define_phase_axes(self, phases: Iterable[str]) -> None:
+        """Plot each phase's ``<phase>_*`` metrics against its own ``<phase>_step`` in every run."""
+        for run in self.runs:
+            for phase in phases:
+                run.define_metric(f"{phase}_step")
+                run.define_metric(f"{phase}_*", step_metric=f"{phase}_step")
+
     def close(self) -> None:
         """Publish whatever is still pending (at the last step seen) and finish every run."""
         self.flush(self._last_step)
+        for agent in range(len(self.runs)):
+            if self._pending[agent] is not None:
+                self._commit(agent)
         for run in self.runs:
             run.finish()

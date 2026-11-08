@@ -79,7 +79,7 @@ def test_a_learned_std_does_move():
 
 def test_the_soft_bound_holds_through_sac_updates_on_wild_inputs():
     learner = build_learner(
-        "sac", architecture="mlp", num_agents=2, envs_per_agent=2, normalize_observations=False,
+        "sac", architecture="mlp", num_agents=2, envs_per_agent=2, state_preprocessor="none",
         model_overrides={"use_state_dependent_std": True, "log_std_bound": "tanh", "min_log_std": -5.0, "max_log_std": 1.0},
     )
     fill_memory(learner)
