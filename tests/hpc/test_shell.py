@@ -73,9 +73,24 @@ def test_the_job_script_binds_both_repos_and_puts_them_on_pythonpath():
     text = S.job_script().read_text()
     assert '"${RNK_PKG_ROOT}:${RNK_PKG_ROOT}"' in text
     assert '"${RNK_PROJECT_ROOT}:${RNK_PROJECT_ROOT}"' in text
-    assert '--env PYTHONPATH="${RNK_PKG_ROOT}:${RNK_PROJECT_ROOT}' in text
+    assert 'container_pythonpath="${RNK_PKG_ROOT}:${RNK_PROJECT_ROOT}${extra_pythonpath}"' in text
+    assert '--env PYTHONPATH="${container_pythonpath}"' in text
     # the package must come first, so the bound clone wins over anything baked in
     assert text.index("RNK_PKG_ROOT}:${RNK_PROJECT_ROOT}") > 0
+    # and the login shell's PYTHONPATH never leaks into the container
+    assert "${PYTHONPATH" not in text
+
+
+def test_the_job_script_checks_the_gpu_it_landed_on():
+    """A MIG slice cannot run Kit and a V100 cannot run cu128 kernels; both are decided on the
+    node, so the script must read nvidia-smi and name the config fix. Behaviour is driven in
+    test_job_script.py; this pins the vocabulary."""
+    text = S.job_script().read_text()
+    assert "nvidia-smi -L" in text
+    assert "--query-gpu=name,compute_cap" in text
+    assert "hpc.constraint" in text  # the MIG message names the fix
+    assert "RNK_SIF_SM70" in text and "7.0" in text
+    assert "touch" in text  # hpc-share purges idle files
 
 
 def test_the_job_script_execs_so_slurms_signal_reaches_python():
@@ -111,7 +126,7 @@ def test_the_chain_script_forwards_the_termination_signal():
     assert "kill -" in text
 
 
-def test_the_image_build_script_parses_and_pins_isaac_lab():
+def test_the_image_build_script_parses_and_reads_the_lock():
     from pathlib import Path
 
     script = Path(__file__).resolve().parents[2] / "hpc" / "build_image.sh"
@@ -121,7 +136,8 @@ def test_the_image_build_script_parses_and_pins_isaac_lab():
     )
     assert done.returncode == 0, done.stderr
     text = script.read_text()
-    assert "ISAACLAB_COMMIT" in text  # a version bump is a deliberate act
-    assert "APPTAINER_TMPDIR" in text and "Lustre" in text  # the build trap V hit
-    assert "pip install --no-cache-dir -e ." in text  # editable, so the bind works
-    assert "verifying" in text  # and it proves the image imports before anyone queues work
+    assert "env.lock.env" in text and "ISAACLAB_COMMIT" in text  # a version bump is a deliberate act
+    assert "APPTAINER_TMPDIR" in text and "LOCAL" in text  # the build trap V hit: never Lustre
+    assert "APPTAINER_CACHEDIR" in text  # never the 25 GB home
+    assert "general.def.in" in text and "unrendered token" in text  # the template is rendered, fully
+    assert ".verified" in text  # it proves the image runs before anyone queues work

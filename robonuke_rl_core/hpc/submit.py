@@ -276,6 +276,19 @@ def chain_script() -> Path:
     return Path(__file__).resolve().parent / "hpc_job_chain.bash"
 
 
+def expand_bind(bind: str) -> str:
+    """``~`` expanded on every side of a ``host:container[:opts]`` mount, not only the first.
+
+    ``Path("~/a:~/b").expanduser()`` expands the leading ``~`` alone and leaves a literal ``~``
+    in the container path, which apptainer then creates as a directory named ``~``.
+    """
+    parts = bind.split(":")
+    for index in range(min(2, len(parts))):
+        if parts[index].startswith("~"):
+            parts[index] = str(Path(parts[index]).expanduser())
+    return ":".join(parts)
+
+
 def job_env(
     hpc: HpcCfg, *, package_root: Path, project_root: Path, extra: Optional[Dict[str, str]] = None
 ) -> Dict[str, str]:
@@ -286,9 +299,13 @@ def job_env(
         "RNK_PKG_ROOT": str(package_root),
         "RNK_PROJECT_ROOT": str(project_root),
         "RNK_SIF": str(Path(hpc.sif_image).expanduser()),
+        # the image for a compute-capability-7.0 GPU; empty means RNK_SIF everywhere
+        "RNK_SIF_SM70": str(Path(hpc.sif_image_sm70).expanduser()) if hpc.sif_image_sm70 else "",
         "RNK_APPTAINER_BIN": hpc.apptainer_bin,
         "RNK_CACHE_HOME": str(Path(hpc.cache_home).expanduser()),
-        "RNK_BINDS": ",".join(str(Path(b).expanduser()) if b.startswith("~") else b for b in hpc.binds),
+        "RNK_BINDS": ",".join(expand_bind(b) for b in hpc.binds),
+        # bound at their own paths and appended to the container PYTHONPATH after the two repos
+        "RNK_EXTRA_REPOS": ",".join(str(Path(repo).expanduser()) for repo in hpc.extra_repos),
         "RNK_PYTHON": hpc.container_python,
     }
     env.update(extra or {})
@@ -323,6 +340,8 @@ def sbatch_command(
                 "code in a file and pass the file's path."
             )
     exports = ",".join(["ALL"] + [f"{key}={value}" for key, value in env.items()])
+    # --constraint only when set: an empty one is not "no constraint" to sbatch, it is an error
+    constraint = [f"--constraint={hpc.constraint}"] if hpc.constraint else []
     return [
         "sbatch",
         "-A", hpc.account,
@@ -332,6 +351,7 @@ def sbatch_command(
         "--mem", hpc.mem,
         "-c", str(hpc.cpus),
         "--signal", hpc.signal,
+        *constraint,
         "-J", job_name,
         "-o", str(out_path),
         "-e", str(err_path),
@@ -382,6 +402,13 @@ def preflight(submits: Sequence[SubmitConfig], *, dry_run: bool) -> None:
             raise SubmitError(
                 f"{submit.path}: hpc.sif_image {submit.hpc.sif_image!r} is not a file. Build "
                 "it with hpc/build_image.sh, or point the field at the built image."
+            )
+        sm70 = submit.hpc.sif_image_sm70
+        if not dry_run and sm70 and not Path(sm70).expanduser().is_file():
+            raise SubmitError(
+                f"{submit.path}: hpc.sif_image_sm70 {sm70!r} is not a file. It is the image the "
+                "job switches to on a compute-capability-7.0 GPU; build it, point the field at "
+                "it, or leave the field empty to use hpc.sif_image everywhere."
             )
 
 

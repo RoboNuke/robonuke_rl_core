@@ -88,10 +88,9 @@ def test_the_image_the_jobs_will_use_exists(config):
     """A path check, not a container run: the job cannot start without this file."""
     path = Path(config.hpc.sif_image).expanduser()
     assert path.is_file(), (
-        f"hpc.sif_image={path} is not a file. The intended image is the existing "
-        "~/hpc-share/isaac/ghvic.sif (see examples/hpc.yaml) -- these tests reuse it, they do "
-        "not build or inspect one. hpc/build_image.sh is only for making a fresh image if "
-        "that one ever stops being enough."
+        f"hpc.sif_image={path} is not a file. The image is built on the cluster by "
+        "hpc/install_hpc.sh (hpc/build_image.sh per flavor; see examples/hpc.yaml) -- these "
+        "tests reuse it, they do not build or inspect one."
     )
 
 

@@ -16,6 +16,7 @@ nothing — an interval with no finished episodes leaves a gap in the chart rath
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -204,6 +205,17 @@ class WandbLogger:
         names = list(run_names)
         if not names:
             raise ValueError("WandbLogger needs at least one run name")
+        # The environment wins over the config. The HPC job script exports WANDB_MODE=offline
+        # when the job has no usable key; an explicit `mode=` to wandb.init would beat that
+        # env var and send an unattended job online to die, so the env var is applied here.
+        env_mode = os.environ.get("WANDB_MODE", "")
+        if env_mode and env_mode != mode:
+            print(
+                f"[wandb] WANDB_MODE={env_mode} is set in the environment; it overrides "
+                f"wandb.mode={mode!r}",
+                flush=True,
+            )
+            mode = env_mode
         if mode not in MODES:
             raise ValueError(f"wandb mode must be one of {MODES}, got {mode!r}")
         if backend is None:

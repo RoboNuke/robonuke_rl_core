@@ -304,3 +304,29 @@ def test_every_flush_is_committed_at_once():
     log(0, {"loss": torch.tensor(1.0)}, step=10)
     log.flush(10)
     assert fake.runs[0].commits == [True]
+
+
+# ------------------------------------------------------------------ WANDB_MODE precedence
+def test_the_environments_wandb_mode_beats_the_configs(monkeypatch, capsys):
+    """The HPC job exports WANDB_MODE=offline when it has no usable key. An explicit `mode=`
+    to wandb.init beats that env var, so the logger must apply the env var itself -- or an
+    unattended job goes online with no key and dies over its logging."""
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    log, backend = logger(mode="online")
+    assert all(run.kwargs["mode"] == "offline" for run in backend.runs)
+    out = capsys.readouterr().out
+    assert "WANDB_MODE=offline" in out and "wandb.mode='online'" in out
+
+
+def test_without_wandb_mode_in_the_environment_the_config_decides(monkeypatch, capsys):
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    log, backend = logger(mode="online")
+    assert all(run.kwargs["mode"] == "online" for run in backend.runs)
+    assert "WANDB_MODE" not in capsys.readouterr().out
+
+
+def test_an_environment_wandb_mode_the_logger_does_not_know_still_fails_loud(monkeypatch):
+    monkeypatch.setenv("WANDB_MODE", "dryrun")
+    with pytest.raises(ValueError) as err:
+        logger(mode="online")
+    assert "dryrun" in str(err.value)

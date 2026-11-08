@@ -27,6 +27,8 @@ def test_the_resource_defaults_are_the_documented_ones():
     assert cfg.apptainer_bin == "apptainer"
     assert cfg.exp_log_dir == "exp_logs"
     assert cfg.binds == []
+    # the node-feature, second-image and extra-repo knobs are all off by default
+    assert (cfg.constraint, cfg.sif_image_sm70, cfg.extra_repos) == ("", "", [])
 
 
 @pytest.mark.parametrize(
@@ -41,6 +43,12 @@ def test_the_resource_defaults_are_the_documented_ones():
         ("signal", "300", "hpc.signal"),
         ("binds", ["/a /b:/c"], "hpc.binds[0]"),
         ("binds", [""], "hpc.binds[0]"),
+        ("constraint", "vram80g | v100", "hpc.constraint"),
+        ("constraint", "vram80g\n", "hpc.constraint"),
+        ("sif_image_sm70", "/images/general cu126.sif", "hpc.sif_image_sm70"),
+        ("extra_repos", ["/home/me/furniture lab"], "hpc.extra_repos[0]"),
+        ("extra_repos", [""], "hpc.extra_repos[0]"),
+        ("extra_repos", ["/ok", "/bad one"], "hpc.extra_repos[1]"),
     ],
 )
 def test_each_format_rule_fails_on_a_bad_value(field, value, needle):
@@ -60,9 +68,18 @@ def test_the_signal_forms_slurm_accepts(value):
     HpcCfg(signal=value).validate(None)
 
 
+@pytest.mark.parametrize("value", ["vram80g", "vram80g|vram140g|v100", "a100&vram80g", "[v100|h100]"])
+def test_the_constraint_forms_slurm_accepts(value):
+    """Slurm's own OR / AND syntax passes: the only rule here is no whitespace."""
+    HpcCfg(constraint=value).validate(None)
+
+
 def test_an_unset_value_is_not_an_error():
     """validate checks formats only, and only on values that are set."""
-    HpcCfg(time="", signal="", account="", sif_image="").validate(None)
+    HpcCfg(
+        time="", signal="", account="", sif_image="", constraint="", sif_image_sm70="",
+        extra_repos=[],
+    ).validate(None)
 
 
 def test_the_section_is_registered_and_round_trips():

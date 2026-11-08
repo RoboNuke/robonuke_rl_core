@@ -888,20 +888,50 @@ experiment of a project-registered learner names that project's own entry script
   job is submitted; a bad config aborts the whole submit naming the file, the field and the
   value. After that gate a *submission* failure is reported and the batch continues.
 * **Bind the code, install nothing.** The image supplies the stack (Isaac Sim, Isaac Lab,
-  torch and the package's dependencies) and nothing else: the job binds **both** repos at
-  their own paths and puts them on `PYTHONPATH`, the package first, then `cd`s to the project
-  root. So updating either repo on the cluster is a `git pull`, and any image carrying the
-  stack works as-is — today that is the existing `ghvic.sif` built for
-  `generalized_hybrid_vic_action_space`, which this reuses unmodified. `hpc/build_image.sh`
-  exists to make a fresh one if that ever stops being true, not as a prerequisite.
+  torch and every pip package of the `general` env) and nothing else: the job binds the
+  package, the project and `hpc.extra_repos` at their own paths and puts them on
+  `PYTHONPATH`, the package first, then `cd`s to the project root. So updating a repo on the
+  cluster is a `git pull`, and the image changes only when the env does.
+
+### The image
+
+The image **is the `general` conda env**, reproduced, and everything about it lives in the
+top-level `hpc/` directory:
+
+| file | role |
+| --- | --- |
+| `hpc/export_env.sh` | run **locally** when the env changes on purpose: `pip freeze` of `general` → `requirements-cu128.lock` (every wheel pinned; editable installs dropped, conda-built lines re-pinned), `requirements-cu126.lock` (torch rebuilt for sm_70, its nvidia-* pins read from the cu126 wheel's metadata) and `env.lock.env` (python version, Isaac Lab commit). All three are committed |
+| `hpc/general.def.in` | the definition, rendered per flavor: ubuntu 22.04, Miniforge, `conda create -n general python=<version>`, `pip install --no-deps -r <lock>` (the env's pins do not satisfy Isaac Sim's own declared requirements, so pip's resolver would refuse the set; `--no-deps` installs the lock exactly and a check proves every pin), Isaac Lab cloned at the recorded commit, the NVIDIA Vulkan ICD + EGL vendor JSONs (`--nv` binds the driver libraries but not these, and without them Kit has no renderer), and Kit's `kit/{cache,data,logs}` as symlinks into the bound HOME (they run to GBs; the image is read-only) |
+| `hpc/build_image.sh <flavor>` | compute-node build: renders the def, `apptainer build --fakeroot` (this cluster has no subuid mapping; apptainer falls back to a root-mapped namespace + the fakeroot command, which works), `%test`, then with a GPU: torch sees it and has its kernels, Kit boots headless; writes `<image>.verified` |
+| `hpc/build_image.sbatch` | the SLURM wrapper (`RNK_HPC_DIR` tells it where the package is, sbatch spools the script) |
+| `hpc/install_hpc.sh` | the one-shot, re-runnable cluster install from a login node: preflight (accounts, partition features, quotas), the `~/hpc-share/robonuke/` layout, the three research clones with `runs/` `wandb/` `exp_logs/` redirected off the quota'd home, a login-node conda env for the launchers, both image builds as jobs, `hpc.env` + the `hpc:` block to paste, then the verification below |
+| `hpc/verify_partitions.sh` + `hpc/smoke/` | one job per partition through the **real** `hpc_job.bash`, running `smoke.py` in tiers (a torch + kernels, b Kit boots, c Forge env steps, d short `train.py`, e camera + mp4), one table from `report.py`. Tier e needs RT cores and is informational; a–d decide |
+
+Two flavors because the cluster has two GPU generations: `cu128` for H100/H200 (dgxh), L40S
+(tiamat) and RTX 6000 (eecs2); `cu126` for the V100s of dgx2, whose sm_70 the cu128 torch
+wheels do not carry. `hpc.sif_image_sm70` names the second one and `hpc_job.bash` switches to
+it when the GPU it landed on is compute capability 7.0. `hpc.constraint` (whole-GPU node
+features) keeps jobs off the MIG-sliced dgxh node: a MIG device has no graphics, so Kit cannot
+start on it, and the job script refuses one with a message naming the fix.
+
+**Video is a driver matter.** Verified 2026-11-08: training (tiers a–d) runs on all four
+partitions; the camera tier renders on dgx2 (V100, driver 580) and segfaults in Kit's
+`librtx.scenedb` plugin on dgxh, tiamat and eecs2 (drivers 610/615) with either image and with
+a single Vulkan ICD forced. NVIDIA validates Isaac Sim 5.1 for the 580 branch only and names
+newer branches as the cause of exactly this crash. Nothing in the image changes a host driver,
+so recording on those nodes waits for a driver rollback or an Isaac Sim bump; `eval.py` forces
+cameras on, so evals are affected the same way.
 
 ### The job
 
-`hpc/hpc_job.bash` ships as package data and is submitted **by path**. sbatch spools it, so
-it has no siblings at runtime and can source nothing: every input arrives as an exported
-`RNK_*` variable or as argv. It validates its inputs, picks a wandb mode (no key, or a key
-under 40 characters, means offline — logging must never kill an unattended job), builds the
-binds, and `exec`s apptainer so `--signal=TERM@300` reaches python rather than bash.
+`robonuke_rl_core/hpc/hpc_job.bash` ships as package data and is submitted **by path**. sbatch
+spools it, so it has no siblings at runtime and can source nothing: every input arrives as an
+exported `RNK_*` variable or as argv. It validates its inputs, picks a wandb mode (no key, or a
+key under 40 characters, means offline — logging must never kill an unattended job; the
+environment's `WANDB_MODE` wins over `wandb.mode` in `logging.py` so that this holds), logs
+the GPU and refuses a MIG slice, picks the image by compute capability, builds the binds (the
+package, the project, `extra_repos`; the login shell's `PYTHONPATH` is **not** appended), and
+`exec`s apptainer so `--signal=TERM@300` reaches python rather than bash.
 
 **No job argument may contain whitespace.** sbatch word-splits the arguments it passes to a
 job script, so a multi-word argument arrives as several and a quoted python snippet arrives as

@@ -656,6 +656,14 @@ anything, with an error naming each one.
 key shorter than 40 characters, i.e. a bad paste) the job logs offline rather than dying —
 an unattended run must not be killed by its logging.
 
+**The image is the `general` conda env, reproduced.** `hpc/export_env.sh` (run locally) writes
+the lock files the build reads; `hpc/install_hpc.sh` (run once on a login node) sets the
+cluster up end to end: the `~/hpc-share/robonuke/` layout, the research clones, both images
+(`general-cu128.sif`, and `general-cu126.sif` for the V100s of dgx2, built on a compute node
+by `hpc/build_image.sh`), and `hpc/verify_partitions.sh`, one smoke job per partition. It
+prints the `hpc:` block below with your paths. `examples/hpc.yaml` is that block for the OSU
+CoE cluster.
+
 | field | type | default | what it does |
 | --- | --- | --- | --- |
 | `account` | str | `""` | `-A`, the allocation to charge. **Required at submit** |
@@ -665,13 +673,16 @@ an unattended run must not be killed by its logging.
 | `mem` | str | `"32G"` | `--mem` |
 | `cpus` | int | `12` | `-c`, CPUs per task |
 | `signal` | str | `"TERM@300"` | `--signal`; SLURM warns the job this far ahead of the walltime kill. The job `exec`s python, so the signal reaches the training process and not bash |
+| `constraint` | str | `""` | `--constraint`, a Slurm node-feature expression in Slurm's own syntax (`vram80g`, `vram80g\|vram140g\|v100`; no whitespace), emitted only when set. The way to keep a job off a MIG-sliced node: a MIG device has no graphics, so Isaac Sim's Kit cannot start on it, and the job script exits 2 there naming this field |
 | `exp_log_dir` | str | `"exp_logs"` | where `.out` / `.err` land, relative to the project root; logs go to `{exp_log_dir}/{project}/{name}_%j.out` |
 | `train_script` | str | `"scripts/train.py"` | the entry script `launch_train` / `launch_sweep` run, relative to the project root (checked to exist before anything is queued); a project-registered learner names its own, e.g. `scripts/train_bc.py`, since `train.main` runs sac / ppo / ddpg only |
-| `sif_image` | str | `""` | path to the `.sif` on the cluster (`~` is expanded). Nothing is installed into it — the job binds both repos and puts them on `PYTHONPATH` — so the existing `ghvic.sif` is used as-is; see `examples/hpc.yaml`. **Required at submit** |
+| `sif_image` | str | `""` | path to the `.sif` on the cluster (`~` is expanded): `general-cu128.sif`, the `general` env as an image, built by `hpc/install_hpc.sh`. Nothing of the research code is installed into it — the job binds the package, the project and `extra_repos` and puts them on `PYTHONPATH`; see `examples/hpc.yaml`. **Required at submit** |
+| `sif_image_sm70` | str | `""` | the `.sif` the job uses instead of `sif_image` when the GPU it lands on is compute capability 7.0 (a V100, the dgx2 partition): the cu128 torch wheels ship no sm_70 kernels, so that node needs a cu126 image (`~` is expanded). The job reads `nvidia-smi` and switches, saying so in its log; with the field empty it warns and continues on `sif_image`. Checked to be a file at submit when set |
 | `apptainer_bin` | str | `"apptainer"` | or `"singularity"` |
 | `container_python` | str | `"python"` | the python inside the image |
 | `cache_home` | str | `""` | bound as the container `HOME` (`~` is expanded). Kit and shader caches land here and run to GBs, so it must be scratch, **never an NFS home with a quota**. **Required at submit** |
 | `binds` | list[str] | `[]` | extra `host:container` mounts |
+| `extra_repos` | list[str] | `[]` | further repositories the job binds at their own paths and appends to the in-container `PYTHONPATH`, after the package and the project (`~` is expanded; no whitespace). For a project that imports from a third clone the image does not carry, e.g. `furniture_lab`. The container `PYTHONPATH` is exactly `package:project[:extra...]`; the login shell's is never appended |
 
 ## derived and meta
 

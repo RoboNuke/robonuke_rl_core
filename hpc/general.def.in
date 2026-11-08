@@ -1,0 +1,177 @@
+# Apptainer definition for the `general` environment -- the stack the package jobs run in.
+#
+# This is a TEMPLATE: `hpc/build_image.sh` fills the `@...@` tokens and builds it. The values come
+# from `hpc/env.lock.env` and `hpc/requirements-<flavor>.lock`, both written by
+# `hpc/export_env.sh` from the reference conda env, so the image is that env reproduced:
+# the same python, the same 275 pinned wheels, Isaac Lab at the same commit.
+#
+# Two flavors of one definition:
+#   cu128   torch 2.7.0+cu128 -- H100/H200 (dgxh), L40S (tiamat), RTX 6000 (eecs2)
+#   cu126   torch 2.7.0+cu126 -- V100 (dgx2): the cu128 wheels carry no sm_70 kernels
+#
+# THE RULE: the image bakes the STACK, never the research code. The job binds the package
+# and project clones at their own paths and puts them on PYTHONPATH (hpc_job.bash).
+#
+# Decisions worth knowing before editing:
+#   * `pip install --no-deps -r <lock>`: the env's pins do not satisfy Isaac Sim's declared
+#     requirements (isaacsim-kernel wants numpy==1.26.0; the env runs 1.26.4), so pip's
+#     resolver would refuse the set. --no-deps installs the lock exactly; a check afterwards
+#     proves every pin is in place.
+#   * Vulkan / EGL vendor files are baked in. `apptainer --nv` binds the driver libraries but
+#     not these JSONs, and without them Kit finds no Vulkan device -- no renderer, no cameras,
+#     no video. Isaac Sim's own docker image carries the same two files.
+#   * Kit writes GBs into <isaacsim>/kit/{cache,data,logs} inside site-packages. The image
+#     is read-only and --writable-tmpfs is tens of MB, so those three are symlinks into the
+#     bound HOME (hpc.cache_home); %environment creates the targets at every start.
+#   * Base is plain ubuntu:22.04 (glibc 2.35, what the isaacsim wheels require). torch, warp
+#     and Isaac Sim ship their own CUDA user-space libraries; the driver comes from --nv.
+
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    org.robonuke.flavor @FLAVOR@
+    org.robonuke.lock @LOCKFILE@
+    org.robonuke.lock_sha256_16 @LOCK_SHA@
+    org.robonuke.python @PYTHON_VERSION@
+    org.robonuke.isaaclab_commit @ISAACLAB_COMMIT@
+    org.robonuke.isaacsim @ISAACSIM_VERSION@
+    org.robonuke.built @BUILT_ON@
+
+%files
+    @LOCK_PATH@ /opt/hpc/@LOCKFILE@
+    @ENV_LOCK_PATH@ /opt/hpc/env.lock.env
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export LANG=C.UTF-8
+
+    # ---- system libraries ------------------------------------------------------------
+    # The GL/X/Vulkan set is what the Isaac Sim binaries link (ldd on the reference env),
+    # plus ffmpeg (the recorder), git (the package stamps every run with its commit), and
+    # vulkan-tools for `vulkaninfo`, the first thing to run when rendering misbehaves.
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl bzip2 git ffmpeg \
+        libgl1 libglu1-mesa libglx0 libopengl0 libegl1 libvulkan1 vulkan-tools \
+        libx11-6 libx11-xcb1 libxt6 libxext6 libsm6 libice6 libxi6 libxrandr2 \
+        libxinerama1 libxcursor1 libxrender1 libxcb-randr0 \
+        libicu70 libxml2 libbsd0 libgomp1 libssl3 libglib2.0-0
+    rm -rf /var/lib/apt/lists/*
+
+    # ---- NVIDIA Vulkan ICD and EGL vendor files -----------------------------------
+    # The libraries they name arrive at run time through `apptainer --nv`.
+    mkdir -p /etc/vulkan/icd.d /usr/share/glvnd/egl_vendor.d
+    cat > /etc/vulkan/icd.d/nvidia_icd.json <<'JSON'
+{
+    "file_format_version" : "1.0.0",
+    "ICD": {
+        "library_path": "libGLX_nvidia.so.0",
+        "api_version" : "1.3.242"
+    }
+}
+JSON
+    cat > /usr/share/glvnd/egl_vendor.d/10_nvidia.json <<'JSON'
+{
+    "file_format_version" : "1.0.0",
+    "ICD" : {
+        "library_path" : "libEGL_nvidia.so.0"
+    }
+}
+JSON
+
+    # ---- conda: the `general` env -----------------------------------------------------
+    curl -fsSL -o /tmp/miniforge.sh \
+        https://github.com/conda-forge/miniforge/releases/download/@MINIFORGE_VERSION@/Miniforge3-@MINIFORGE_VERSION@-Linux-x86_64.sh
+    bash /tmp/miniforge.sh -b -p /opt/conda
+    rm /tmp/miniforge.sh
+    /opt/conda/bin/conda create -y -q -n general python=@PYTHON_VERSION@
+    /opt/conda/bin/conda clean -afy
+    PY=/opt/conda/envs/general/bin/python
+
+    # ---- the lock, exactly --------------------------------------------------------------
+    # The build tools first, at the env's own versions: the lock's source-only packages
+    # (flatdict) build against them, without isolation, exactly as they did locally. The
+    # isolated build pip would use the newest setuptools, which has no pkg_resources.
+    grep -E '^(pip|setuptools|wheel)==' /opt/hpc/@LOCKFILE@ > /tmp/buildtools.txt
+    ${PY} -m pip install --no-cache-dir --no-deps -r /tmp/buildtools.txt
+    ${PY} -m pip install --no-cache-dir --no-deps --no-build-isolation \
+        --extra-index-url https://pypi.nvidia.com \
+        --extra-index-url https://download.pytorch.org/whl/@FLAVOR@ \
+        -r /opt/hpc/@LOCKFILE@
+
+    # ---- Isaac Lab at the recorded commit, editable, no deps (they are in the lock) -------
+    git clone @ISAACLAB_REPO@ /opt/IsaacLab
+    git -C /opt/IsaacLab checkout --detach @ISAACLAB_COMMIT@
+    for ext in isaaclab isaaclab_assets isaaclab_tasks isaaclab_rl isaaclab_mimic; do
+        ${PY} -m pip install --no-cache-dir --no-deps -e /opt/IsaacLab/source/${ext}
+    done
+
+    # ---- prove the lock is in place -----------------------------------------------------
+    ${PY} - <<'PYEOF'
+import re, sys
+from importlib import metadata
+missing = []
+for line in open("/opt/hpc/@LOCKFILE@"):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    name, want = line.split("==", 1)
+    try:
+        have = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        missing.append(f"{name}: not installed (want {want})")
+        continue
+    if have != want:
+        missing.append(f"{name}: have {have}, want {want}")
+if missing:
+    print("[general.def] lock not satisfied:\n  " + "\n  ".join(missing), file=sys.stderr)
+    sys.exit(1)
+print("[general.def] every pin in the lock is installed")
+PYEOF
+    # informational only: the reference env fails `pip check` the same way
+    ${PY} -m pip check || true
+
+    # ---- Kit's writable directories out of the read-only image --------------------------
+    # find_spec, not import: importing isaacsim here would pop the interactive EULA prompt
+    export OMNI_KIT_ACCEPT_EULA=YES
+    KIT=$(${PY} -c "import importlib.util as u, os; print(os.path.join(os.path.dirname(u.find_spec('isaacsim').origin), 'kit'))")
+    test -d "${KIT}"
+    for d in cache data logs; do
+        rm -rf "${KIT}/${d}"
+        ln -s "/root/.cache/isaacsim-kit/${d}" "${KIT}/${d}"
+    done
+
+    # mount points apptainer may need to exist
+    mkdir -p /root/.cache /root/.local/share/ov /root/.nvidia-omniverse /workspace
+
+%environment
+    export LANG=C.UTF-8
+    export PATH=/opt/conda/envs/general/bin:/opt/conda/bin:${PATH}
+    export PYTHONNOUSERSITE=1
+    export OMNI_KIT_ACCEPT_EULA=YES
+    export TORCHDYNAMO_DISABLE=1
+    export PYTHONUNBUFFERED=1
+    export ISAACLAB_PATH=/opt/IsaacLab
+    export RNK_IMAGE_FLAVOR=@FLAVOR@
+    # the targets of the kit/{cache,data,logs} symlinks, inside the bound HOME
+    mkdir -p "${HOME}/.cache/isaacsim-kit/cache" "${HOME}/.cache/isaacsim-kit/data" \
+        "${HOME}/.cache/isaacsim-kit/logs" 2>/dev/null || true
+
+%runscript
+    exec "$@"
+
+%test
+    set -e
+    python -c "import sys; print('python', sys.version.split()[0])"
+    python -c "import torch; print('torch', torch.__version__, 'archs', torch.cuda.get_arch_list())"
+    python -c "import isaaclab; print('isaaclab', isaaclab.__version__)"
+    python -c "import omegaconf, wandb, skrl, diffusers, pyarrow, imageio_ffmpeg; print('deps ok')"
+    git --version
+    ffmpeg -version | head -n 1
+
+%help
+    The `general` environment (flavor @FLAVOR@) for robonuke_rl_core jobs.
+    Run things with:  apptainer exec --nv --home <cache_home>:/root <this.sif> python ...
+    The research repos are not inside: bind them and put them on PYTHONPATH (hpc_job.bash).

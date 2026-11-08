@@ -81,6 +81,74 @@ def test_the_env_exports_carry_all_plus_the_rnk_variables(tmp_path, capsys):
         assert f"{name}=" in export
 
 
+def test_the_second_image_and_the_extra_repos_are_exported_to_the_job(tmp_path, capsys):
+    """The job script decides on the node (which GPU it got), so both ride along as RNK_*
+    variables -- with ~ expanded here, where a shell would, not inside the container."""
+    paths = tree(
+        tmp_path,
+        names=("alpha",),
+        extra="hpc:\n  sif_image_sm70: ~/images/general-cu126.sif\n  extra_repos:\n    - ~/furniture_lab\n    - /nfs/share/other_repo\n",
+    )
+    _, lines, _ = train(paths, capsys=capsys)
+    export = next(part for part in lines[0].split() if part.startswith("--export="))
+    home = str(S.Path("~").expanduser())
+    assert f"RNK_SIF_SM70={home}/images/general-cu126.sif" in export
+    assert f"RNK_EXTRA_REPOS={home}/furniture_lab,/nfs/share/other_repo" in export
+
+
+def test_the_second_image_and_the_extra_repos_are_exported_empty_when_unset(tmp_path, capsys):
+    """Exported always, so the job script reads one spelling and never a missing variable."""
+    paths = tree(tmp_path, names=("alpha",))
+    _, lines, _ = train(paths, capsys=capsys)
+    export = next(part for part in lines[0].split() if part.startswith("--export="))
+    assert "RNK_SIF_SM70=," in export
+    assert "RNK_EXTRA_REPOS=," in export
+
+
+def test_a_constraint_becomes_the_sbatch_flag_and_an_empty_one_emits_nothing(tmp_path, capsys):
+    """`--constraint` only when set: an empty `--constraint=` is an sbatch error, not "none"."""
+    paths = tree(tmp_path, names=("alpha",))
+    _, lines, _ = train(paths, capsys=capsys)
+    assert "--constraint" not in lines[0]
+    paths = tree(tmp_path, names=("alpha",), extra="hpc:\n  constraint: vram80g|vram140g|v100\n")
+    _, lines, _ = train(paths, capsys=capsys)
+    # shlex-quoted on the dry-run line because of the |, so compare the parsed argv
+    import shlex
+
+    assert "--constraint=vram80g|vram140g|v100" in shlex.split(lines[0])
+
+
+def test_a_constraint_with_whitespace_aborts_before_anything_is_queued(tmp_path, capsys):
+    paths = tree(tmp_path, names=("alpha",), extra="hpc:\n  constraint: vram80g | v100\n")
+    code, lines, out = train(paths, capsys=capsys)
+    assert code == 2 and lines == []
+    assert "hpc.constraint" in out
+
+
+def test_an_extra_repo_with_whitespace_aborts_before_anything_is_queued(tmp_path, capsys):
+    paths = tree(tmp_path, names=("alpha",), extra="hpc:\n  extra_repos:\n    - /home/me/furniture lab\n")
+    code, lines, out = train(paths, capsys=capsys)
+    assert code == 2 and lines == []
+    assert "hpc.extra_repos[0]" in out
+
+
+def test_a_real_submit_checks_the_second_image_is_a_file(tmp_path, monkeypatch):
+    """Same gate as `sif_image`: a missing image must fail here, not hours later on a V100."""
+    paths = tree(tmp_path, names=("alpha",))
+    submit = S.read_submit_config(paths["configs"]["alpha"])
+    monkeypatch.setattr(S.shutil, "which", lambda name: "/usr/bin/sbatch")  # pretend: a login node
+    S.preflight([submit], dry_run=False)  # sif_image exists, sm70 unset: fine
+    submit.hpc.sif_image_sm70 = str(tmp_path / "missing-cu126.sif")
+    with pytest.raises(S.SubmitError) as err:
+        S.preflight([submit], dry_run=False)
+    assert "hpc.sif_image_sm70" in str(err.value) and "missing-cu126.sif" in str(err.value)
+    (tmp_path / "missing-cu126.sif").write_text("")
+    S.preflight([submit], dry_run=False)
+    # a dry run prints commands and checks no file, like sif_image
+    submit.hpc.sif_image_sm70 = str(tmp_path / "never-built.sif")
+    S.preflight([submit], dry_run=True)
+
+
 def test_the_job_runs_the_train_script_in_the_container_python(tmp_path, capsys):
     paths = tree(tmp_path, names=("alpha",))
     _, lines, _ = train(paths, capsys=capsys)
@@ -434,3 +502,14 @@ def test_a_bad_train_script_is_rejected(bad):
 
     with pytest.raises(ValueError, match="train_script"):
         HpcCfg(train_script=bad).validate(None)
+
+
+def test_a_bind_expands_tilde_on_both_sides(monkeypatch):
+    """`~/x:~/x` must become two absolute paths: a literal `~` on the container side would be
+    created as a directory named `~`, and the project's runs/ symlink into it would dangle."""
+    from robonuke_rl_core.hpc.submit import expand_bind
+
+    monkeypatch.setenv("HOME", "/home/someone")
+    assert expand_bind("~/share/robonuke:~/share/robonuke") == "/home/someone/share/robonuke:/home/someone/share/robonuke"
+    assert expand_bind("~/share/x:/opt/x:ro") == "/home/someone/share/x:/opt/x:ro"
+    assert expand_bind("/abs/a:/abs/b") == "/abs/a:/abs/b"

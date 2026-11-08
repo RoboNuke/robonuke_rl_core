@@ -4,22 +4,42 @@
 #
 #   python launchers/launch_train.py <configs> --project P --group_prefix G
 #
-# WANDB_API_KEY is an environment variable, never a field here. The launcher passes
-# `sbatch --export=ALL`, which carries it from your login shell into the job.
+# The values are the OSU CoE cluster's, as `hpc/install_hpc.sh` sets it up (it prints this
+# block with your paths filled in). WANDB_API_KEY is an environment variable, never a field
+# here: the launcher passes `sbatch --export=ALL`, which carries it from your login shell.
 hpc:
   account: virl-grp
-  # the V-verified list: no `gpu` (AllowAccounts excludes virl-grp) and no `dgx2` (sm_70, no
-  # cu128 kernels)
-  partitions: dgxh,tiamat,eecs2
+  # every GPU partition the account reaches. `gpu` (RTX 8000) admits eecs/coeit only.
+  #   dgxh    H100 / H200   sm_90   cu128 image
+  #   dgx2    V100          sm_70   cu126 image (sif_image_sm70)
+  #   tiamat  L40S          sm_89   cu128 image
+  #   eecs2   RTX 6000      sm_75   cu128 image
+  # Training runs on all four (verified 2026-11-08). Video (Kit's RTX renderer) is a driver
+  # matter, not a GPU one: Isaac Sim 5.1 is validated for the 580 driver branch, and its
+  # renderer segfaults on the 610/615 drivers that dgxh, tiamat and eecs2 run; dgx2 (580)
+  # renders, RT cores or not. `hpc/verify_partitions.sh` tier e tells you the current state.
+  partitions: dgxh,dgx2,tiamat,eecs2
+  # whole-GPU node features of those partitions. dgxh-1 is MIG-sliced (feature vram40g, gres
+  # h100-40g); a MIG device has no graphics and Kit cannot start on it, so it is left out.
+  constraint: vram80g|vram140g|v100|l40s|rtx6000
 
-  # The existing Isaac image, reused as-is. Nothing is installed into it: the job binds both
-  # repos at their own paths and puts them on PYTHONPATH.
-  # Matches generalized_hybrid_vic_action_space's own default --
-  # launchers/hpc/hpc_env.bash:25, SIF_IMAGE:=$HOME/hpc-share/isaac/ghvic.sif
-  sif_image: ~/hpc-share/isaac/ghvic.sif
+  # The `general` env as an image (hpc/general.def.in + the lock files). Nothing of the
+  # research code is in it: the job binds the package, the project and extra_repos at their
+  # own paths and puts them on PYTHONPATH.
+  sif_image: ~/hpc-share/robonuke/images/general-cu128.sif
+  # the same env with torch cu126, picked by the job when it lands on a V100 (dgx2)
+  sif_image_sm70: ~/hpc-share/robonuke/images/general-cu126.sif
 
-  # Bound as the container HOME: Kit and shader caches land here and run to GBs, so it must be
-  # scratch, never a quota'd NFS home. This is the SAME directory the existing launchers use
-  # (hpc_env.bash:33, ISAAC_CACHE_HOME), so the caches it has already warmed are reused
-  # instead of starting cold.
-  cache_home: ~/hpc-share/isaac_cache_home
+  # Bound as the container HOME: Kit's caches and shader caches land here and run to GBs, so
+  # it must be scratch, never the quota'd NFS home.
+  cache_home: ~/hpc-share/robonuke/cache_home
+
+  # The clones' runs/ wandb/ exp_logs/ are symlinks into ~/hpc-share/robonuke/runs/<repo>/
+  # (the installer makes them: outputs off the quota'd home). The container sees only what
+  # is bound, so the symlinks' target must be bound too, or the first mkdir('runs') fails.
+  binds:
+    - ~/hpc-share/robonuke:~/hpc-share/robonuke
+
+  # a project that imports from a further clone names it here (hybrid_demos: furniture_lab)
+  # extra_repos:
+  #   - ~/hpc-share/Robonuke_Furniture_Bench

@@ -52,6 +52,10 @@ class HpcCfg:
     cpus: int = 12
     #: ``--signal``; SLURM sends this ahead of the walltime kill, so the job can bail out
     signal: str = "TERM@300"
+    #: ``--constraint``; a node-feature expression, Slurm's own syntax (``vram80g``,
+    #: ``vram80g|vram140g|v100``). The way to keep a job off a MIG-sliced node: a MIG device
+    #: has no graphics, so Isaac Sim's Kit cannot start on it. Empty means no constraint
+    constraint: str = ""
     #: where the ``.out`` / ``.err`` land, relative to the project root
     exp_log_dir: str = "exp_logs"
     #: the entry script ``launch_train`` / ``launch_sweep`` run, relative to the project root.
@@ -62,6 +66,10 @@ class HpcCfg:
     # ---- container ----
     #: absolute path to the ``.sif`` on the cluster. Required at submit.
     sif_image: str = ""
+    #: an alternative ``.sif`` the job uses when the GPU it lands on is compute capability
+    #: 7.0 (a V100): the cu128 torch wheels ship no sm_70 kernels, so a cu126 image is needed
+    #: there. Empty means ``sif_image`` is used on every GPU. Checked to exist at submit when set
+    sif_image_sm70: str = ""
     #: ``apptainer`` or ``singularity``
     apptainer_bin: str = "apptainer"
     #: the python inside the image
@@ -71,6 +79,10 @@ class HpcCfg:
     cache_home: str = ""
     #: extra ``host:container`` mounts
     binds: List[str] = field(default_factory=list)
+    #: further repositories the job binds at their own paths and appends to the in-container
+    #: ``PYTHONPATH``, after the package and the project (``~`` is expanded). For a project
+    #: that imports from a third clone the image does not carry
+    extra_repos: List[str] = field(default_factory=list)
 
     def validate(self, cfg: Any) -> None:
         """Formats only, and only on values that are set.
@@ -102,9 +114,25 @@ class HpcCfg:
                 f"hpc.train_script must be a whitespace-free .py path relative to the project "
                 f"root, got {script!r} (e.g. 'scripts/train.py')"
             )
+        if self.constraint and any(character.isspace() for character in self.constraint):
+            raise ValueError(
+                f"hpc.constraint must be a whitespace-free Slurm feature expression, got "
+                f"{self.constraint!r} (e.g. 'vram80g' or 'vram80g|vram140g|v100')"
+            )
+        if self.sif_image_sm70 and any(character.isspace() for character in self.sif_image_sm70):
+            raise ValueError(
+                f"hpc.sif_image_sm70 must be a whitespace-free path to a .sif, got "
+                f"{self.sif_image_sm70!r}"
+            )
         for index, bind in enumerate(self.binds):
             if not bind or any(character.isspace() for character in bind):
                 raise ValueError(
                     f"hpc.binds[{index}] must be a whitespace-free 'host:container' mount, "
                     f"got {bind!r}"
+                )
+        for index, repo in enumerate(self.extra_repos):
+            if not repo or any(character.isspace() for character in repo):
+                raise ValueError(
+                    f"hpc.extra_repos[{index}] must be a whitespace-free host directory, "
+                    f"got {repo!r}"
                 )
