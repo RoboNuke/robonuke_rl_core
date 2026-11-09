@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from robonuke_rl_core.hpc import launch_eval, launch_sweep, launch_train
+from robonuke_rl_core.hpc import launch_eval, launch_sweep, launch_train, launch_watch
 from robonuke_rl_core.hpc import submit as S
 
 from hpc_helpers import flag, sbatch_lines, tree
@@ -513,3 +513,102 @@ def test_a_bind_expands_tilde_on_both_sides(monkeypatch):
     assert expand_bind("~/share/robonuke:~/share/robonuke") == "/home/someone/share/robonuke:/home/someone/share/robonuke"
     assert expand_bind("~/share/x:/opt/x:ro") == "/home/someone/share/x:/opt/x:ro"
     assert expand_bind("/abs/a:/abs/b") == "/abs/a:/abs/b"
+
+
+# ------------------------------------------------------------------ launch_watch
+def _watch_tree(tmp_path, *, groups=("G_alpha", "G_beta"), extra="hpc:\n  watch_script: scripts/watch.py\n"):
+    """A training tree plus an eval config (``quick``) carrying the watch script, the script itself under the
+    project root (``tmp_path``) and the run directories the trainings would have written."""
+    paths = tree(tmp_path, names=("alpha", "beta", "quick"), extra=extra)
+    (tmp_path / "scripts").mkdir(exist_ok=True)
+    (tmp_path / "scripts" / "watch.py").write_text("")
+    for group in groups:
+        (paths["runs"] / "P" / group).mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def watch(paths, tmp_path, *args, capsys=None):
+    argv = [
+        str(paths["configs"]["alpha"]), str(paths["configs"]["beta"]),
+        "--project", "P", "--group_prefix", "G",
+        "--eval_config", str(paths["configs"]["quick"]),
+        "--project_root", str(tmp_path), "--dry_run", *args,
+    ]
+    code = launch_watch.main(argv)
+    out = capsys.readouterr().out if capsys else ""
+    return code, sbatch_lines(out), out
+
+
+def test_watch_is_one_job_per_training_config_over_its_run_dir(tmp_path, capsys):
+    paths = _watch_tree(tmp_path)
+    code, lines, _ = watch(paths, tmp_path, capsys=capsys)
+    assert code == 0 and len(lines) == 2
+    assert [flag(line, "-J") for line in lines] == ["watch_G_alpha", "watch_G_beta"]
+    # the same group rule as launch_train, so the run dir is the training's
+    assert f"scripts/watch.py --run {paths['runs']}/P/G_alpha --eval_config {paths['configs']['quick']}" in lines[0]
+    assert "--headless" in lines[0] and "--once" in lines[0]
+    assert flag(lines[1], "-o").endswith("/P/watch_G_beta_%j.out")
+
+
+def test_watch_follow_drops_once(tmp_path, capsys):
+    paths = _watch_tree(tmp_path)
+    _, lines, _ = watch(paths, tmp_path, "--follow", capsys=capsys)
+    assert "--once" not in lines[0] and "--headless" in lines[0]
+
+
+def test_watch_resources_and_script_come_from_the_eval_config_s_chain(tmp_path, capsys):
+    paths = _watch_tree(tmp_path)
+    # the eval config asks for its own resources; the training files keep the defaults
+    paths["configs"]["quick"].write_text(
+        paths["configs"]["quick"].read_text() + "  time: 0-16:00:00\n  mem: 64G\n  partitions: dgx2\n"
+    )
+    _, lines, _ = watch(paths, tmp_path, capsys=capsys)
+    assert flag(lines[0], "--time") == "0-16:00:00" and flag(lines[0], "--mem") == "64G"
+    assert flag(lines[0], "-p") == "dgx2"
+
+
+def test_watch_forwards_overrides_after_its_own_flags(tmp_path, capsys):
+    paths = _watch_tree(tmp_path)
+    _, lines, _ = watch(paths, tmp_path, "eval.num_rollouts=50", capsys=capsys)
+    assert lines[0].rstrip().endswith("--once eval.num_rollouts=50")
+
+
+def test_watch_without_a_watch_script_aborts_naming_the_field(tmp_path, capsys):
+    paths = _watch_tree(tmp_path, extra="")
+    code, lines, out = watch(paths, tmp_path, capsys=capsys)
+    assert code == 2 and lines == [] and "hpc.watch_script" in out
+
+
+def test_watch_with_a_missing_watch_script_file_aborts(tmp_path, capsys):
+    paths = _watch_tree(tmp_path)
+    (tmp_path / "scripts" / "watch.py").unlink()
+    code, lines, out = watch(paths, tmp_path, capsys=capsys)
+    assert code == 2 and lines == [] and "scripts/watch.py" in out and "not a file" in out
+
+
+def test_watch_dry_run_names_a_missing_run_dir_but_still_prints(tmp_path, capsys):
+    paths = _watch_tree(tmp_path, groups=("G_alpha",))
+    code, lines, out = watch(paths, tmp_path, capsys=capsys)
+    assert code == 0 and len(lines) == 2
+    assert "missing" in out and "G_beta" in out
+
+
+def test_a_real_watch_submit_aborts_on_a_missing_run_dir_before_queueing(tmp_path, capsys, monkeypatch):
+    paths = _watch_tree(tmp_path, groups=("G_alpha",))
+    calls = []
+    monkeypatch.setattr(S, "run_sbatch", lambda command, *, dry_run: calls.append(command) or (True, "0"))
+    monkeypatch.setattr(S.shutil, "which", lambda name: "/usr/bin/sbatch")
+    argv = [
+        str(paths["configs"]["alpha"]), str(paths["configs"]["beta"]),
+        "--project", "P", "--group_prefix", "G",
+        "--eval_config", str(paths["configs"]["quick"]), "--project_root", str(tmp_path),
+    ]
+    code = launch_watch.main(argv)
+    out = capsys.readouterr().out
+    assert code == 2 and calls == [] and "G_beta" in out and "Nothing was submitted" in out
+
+
+def test_watch_rejects_a_launcher_owned_override(tmp_path, capsys):
+    paths = _watch_tree(tmp_path)
+    code, lines, out = watch(paths, tmp_path, "wandb.group=x", capsys=capsys)
+    assert code == 2 and lines == [] and "wandb.group" in out

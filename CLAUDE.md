@@ -743,7 +743,10 @@ or an exact file name; `best` is `ckpt_best.ckpt` for the package's learners and
 learner, the file it registered (`register_eval_policy(name, fn, best_checkpoint=...)`), looked
 up from the run's `trainer.learner` before the checkpoint is downloaded. The policy is a 1-agent shell whatever the run trained, loaded with
 `load_agent(..., with_optimizer=False)`, normalizers frozen, `mean_actions` unless
-`eval.deterministic: false`.
+`eval.deterministic: false`. `build_eval_policy(..., num_agents=N)` builds an N-slot shell
+instead (slot `i` acts on envs `[i*E, (i+1)*E)` as in training; the caller loads slots 1..N-1
+itself with `load_agent(path, slot=i, with_optimizer=False)`): what a project's watcher uses to
+evaluate a run's agents side by side. Eval and debug never pass it.
 
 ### What an eval writes
 
@@ -840,7 +843,7 @@ env, which is why `pytest -m gpu` takes about three minutes rather than ninety s
 
 ## HPC launch
 
-`robonuke_rl_core/hpc/` submits package runs to SLURM + Apptainer. Three verbs, thin callers
+`robonuke_rl_core/hpc/` submits package runs to SLURM + Apptainer. Four verbs, thin callers
 in the project's `launchers/`:
 
 ```bash
@@ -848,7 +851,15 @@ python launchers/launch_train.py <folder | config.yaml ...> --project P --group_
 python launchers/launch_sweep.py <configs> --project P --group_prefix G \
     --sweep_param sac.actor_lr --label lr --value 1.0e-4 --value 3.0e-4
 python launchers/launch_eval.py --eval_config F --project P [--group G ...]
+python launchers/launch_watch.py <folder | config.yaml ...> --project P --group_prefix G --eval_config F [--follow]
 ```
+
+`launch_watch` is the training command with the verb swapped: one job per training config,
+running the project's `hpc.watch_script` (the package has no watcher) over the run directory
+`{trainer.output_dir}/{project}/{group}` with `--eval_config F --headless --once` (every
+checkpoint on disk, then exit; `--follow` keeps polling beside a live training). Resources and
+the script come from the eval config's chain, like `launch_eval`; a missing run directory
+aborts a real submit before anything is queued (a dry run names it and prints anyway).
 
 ### Naming
 

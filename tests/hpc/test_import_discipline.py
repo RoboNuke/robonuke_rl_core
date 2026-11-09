@@ -26,6 +26,7 @@ MODULES = [
     "robonuke_rl_core.hpc.launch_train",
     "robonuke_rl_core.hpc.launch_sweep",
     "robonuke_rl_core.hpc.launch_eval",
+    "robonuke_rl_core.hpc.launch_watch",
     "robonuke_rl_core.configfile",
 ]
 
@@ -56,7 +57,7 @@ def test_the_module_imports_light(module):
 
 def test_the_launchers_run_their_help_without_the_isaac_environment():
     """A whole `--help` exercises argparse and every module-level import on the path."""
-    for module in ("launch_train", "launch_sweep", "launch_eval"):
+    for module in ("launch_train", "launch_sweep", "launch_eval", "launch_watch"):
         code = (
             "import sys\n"
             f"from robonuke_rl_core.hpc.{module} import build_parser\n"

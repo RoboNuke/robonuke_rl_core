@@ -62,6 +62,10 @@ class HpcCfg:
     #: The package's ``train.main`` runs sac / ppo only, so a project-registered learner names
     #: its own entry script here (e.g. ``scripts/train_bc.py``) in its experiment config
     train_script: str = "scripts/train.py"
+    #: the entry script ``launch_watch`` runs beside (or after) a training, relative to the
+    #: project root: a project's checkpoint watcher, given the run's group directory as
+    #: ``--run`` and an eval config. Empty means the project has none; required by that verb only
+    watch_script: str = ""
 
     # ---- container ----
     #: absolute path to the ``.sif`` on the cluster. Required at submit.
@@ -113,6 +117,16 @@ class HpcCfg:
             raise ValueError(
                 f"hpc.train_script must be a whitespace-free .py path relative to the project "
                 f"root, got {script!r} (e.g. 'scripts/train.py')"
+            )
+        watch = self.watch_script
+        if watch and (
+            any(character.isspace() for character in watch)
+            or watch.startswith(("/", "~"))
+            or not watch.endswith(".py")
+        ):
+            raise ValueError(
+                f"hpc.watch_script must be a whitespace-free .py path relative to the project "
+                f"root, got {watch!r} (e.g. 'scripts/watch_residual_eval.py')"
             )
         if self.constraint and any(character.isspace() for character in self.constraint):
             raise ValueError(

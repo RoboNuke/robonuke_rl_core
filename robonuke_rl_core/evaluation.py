@@ -1013,33 +1013,44 @@ def register_eval_policy(learner: str, fn: Any, *, best_checkpoint: Optional[str
 
 
 def build_eval_policy(
-    cfg: Any, env: Any, checkpoint: Any, *, deterministic: bool = True
+    cfg: Any, env: Any, checkpoint: Any, *, deterministic: bool = True, num_agents: int = 1
 ) -> tuple:
-    """A frozen single-agent policy from a checkpoint: ``(policy, learner, metadata)``.
+    """A frozen policy from a checkpoint: ``(policy, learner, metadata)``.
 
-    Eval always runs **one** agent, whatever the training run's ``experiment.num_agents`` was:
-    the checkpoint holds one agent's slot and every env belongs to it. Normalizers come from
-    the checkpoint and never train again — the policy call passes no ``train=True`` anywhere —
-    and no optimizer state is loaded.
+    Eval runs **one** agent by default, whatever the training run's ``experiment.num_agents``
+    was: the checkpoint holds one agent's slot and every env belongs to it. A caller that
+    evaluates several agents of a run side by side (the project's checkpoint watcher) asks for
+    an N-slot shell with ``num_agents``: slot ``i`` then acts on envs ``[i*E, (i+1)*E)`` exactly
+    as in training, ``checkpoint`` loads into slot 0, and the caller loads the other slots with
+    ``learner.load_agent(path, slot=i, with_optimizer=False)``. Normalizers come from the
+    checkpoint and never train again — the policy call passes no ``train=True`` anywhere — and
+    no optimizer state is loaded.
     """
-    from .learners.cfg import LEARNERS, sac_critic_outputs
-    from .learners.ddpg import DDPG
-    from .learners.ppo import PPO
-    from .learners.sac import SAC
-    from .models.factory import build_models
-
-    classes = {"sac": SAC, "ppo": PPO, "ddpg": DDPG}
     learner_name = cfg.trainer.learner
     if learner_name in EVAL_POLICY_BUILDERS:
+        if int(num_agents) != 1:
+            raise ValueError(
+                f"learner {learner_name!r} has a project-registered eval policy, which builds one agent; "
+                f"num_agents={num_agents} is only for the package's learners"
+            )
         return EVAL_POLICY_BUILDERS[learner_name](cfg, env, checkpoint, deterministic)
     routes = list(getattr(cfg[learner_name], "route_labels", None) or []) if learner_name in ("sac", "ddpg") else []
     if routes:
-        return _build_routed_eval_policy(cfg, env, checkpoint, deterministic, routes)
-    return _build_single_eval_policy(cfg, env, checkpoint, deterministic)
+        return _build_routed_eval_policy(cfg, env, checkpoint, deterministic, routes, num_agents=num_agents)
+    return _build_single_eval_policy(cfg, env, checkpoint, deterministic, num_agents=num_agents)
 
 
-def _build_single_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic: bool, learner_cfg: Any = None) -> tuple:
-    """:func:`build_eval_policy` for one learner (``learner_cfg``: its section, by default the run's)."""
+def _build_single_eval_policy(
+    cfg: Any, env: Any, checkpoint: Any, deterministic: bool, learner_cfg: Any = None, num_agents: int = 1
+) -> tuple:
+    """:func:`build_eval_policy` for one learner (``learner_cfg``: its section, by default the run's;
+    ``num_agents``: the shell's slots, ``checkpoint`` loaded into slot 0)."""
+    num_agents = int(num_agents)
+    if num_agents < 1 or int(env.num_envs) % num_agents != 0:
+        raise ValueError(
+            f"num_agents={num_agents} must be >= 1 and divide the env count {env.num_envs}: each agent owns a "
+            "contiguous block of envs"
+        )
     from .learners.cfg import LEARNERS, sac_critic_outputs
     from .learners.ddpg import DDPG
     from .learners.ppo import PPO
@@ -1071,7 +1082,7 @@ def _build_single_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic
         env.observation_space,
         state_space,
         env.action_space,
-        1,  # one agent
+        num_agents,  # one slot per agent evaluated side by side; 1 for eval.py / debug.py
         env.device,
         controller_cfg,
         num_critics=int(learner_cfg.num_critics) if learner_name in ("sac", "ddpg") else 2,
@@ -1092,7 +1103,7 @@ def _build_single_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic
         device=env.device,
         cfg=learner_cfg,
         trainer_cfg=cfg.trainer,
-        num_agents=1,
+        num_agents=num_agents,
         num_envs=env.num_envs,
         **extra,
     )
@@ -1162,9 +1173,12 @@ class _RoutedEvalPolicy:
                 learner.enable_models_training_mode(False)
 
 
-def _build_routed_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic: bool, routes) -> tuple:
+def _build_routed_eval_policy(
+    cfg: Any, env: Any, checkpoint: Any, deterministic: bool, routes, num_agents: int = 1
+) -> tuple:
     """:func:`build_eval_policy` for a routed SAC or DDPG: ``checkpoint`` is one phase's file,
-    ``<run>/<phase>/checkpoints/<name>``; every phase's file of that name is loaded."""
+    ``<run>/<phase>/checkpoints/<name>``; every phase's file of that name is loaded (into slot 0 of
+    each phase's ``num_agents``-slot shell)."""
     import copy
     from pathlib import Path
 
@@ -1179,7 +1193,8 @@ def _build_routed_eval_policy(cfg: Any, env: Any, checkpoint: Any, deterministic
         route_cfg.route_labels = []
         route_cfg.demo_transitions = None  # eval stores and samples nothing
         policy, learner, metadata = _build_single_eval_policy(
-            cfg, env, base / route / "checkpoints" / path.name, deterministic, learner_cfg=route_cfg
+            cfg, env, base / route / "checkpoints" / path.name, deterministic, learner_cfg=route_cfg,
+            num_agents=num_agents,
         )
         parts[route] = (policy, learner)
     routed = _RoutedEvalPolicy(parts, section.std_label_names, deterministic)

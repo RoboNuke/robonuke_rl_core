@@ -29,6 +29,8 @@ def test_the_resource_defaults_are_the_documented_ones():
     assert cfg.binds == []
     # the node-feature, second-image and extra-repo knobs are all off by default
     assert (cfg.constraint, cfg.sif_image_sm70, cfg.extra_repos) == ("", "", [])
+    # the package ships no checkpoint watcher: a project names its own for launch_watch
+    assert cfg.watch_script == ""
 
 
 @pytest.mark.parametrize(
@@ -49,6 +51,9 @@ def test_the_resource_defaults_are_the_documented_ones():
         ("extra_repos", ["/home/me/furniture lab"], "hpc.extra_repos[0]"),
         ("extra_repos", [""], "hpc.extra_repos[0]"),
         ("extra_repos", ["/ok", "/bad one"], "hpc.extra_repos[1]"),
+        ("watch_script", "/abs/watch.py", "hpc.watch_script"),
+        ("watch_script", "scripts/watch.sh", "hpc.watch_script"),
+        ("watch_script", "scripts/my watch.py", "hpc.watch_script"),
     ],
 )
 def test_each_format_rule_fails_on_a_bad_value(field, value, needle):

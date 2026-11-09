@@ -640,7 +640,7 @@ reset → fragile → contact); see `CLAUDE.md` for why.
 ## hpc
 
 SLURM resources and container details for the launchers (`launch_train`, `launch_sweep`,
-`launch_eval`). **Resources are config, not a shell file**: cluster-wide values live in a base
+`launch_eval`, `launch_watch`). **Resources are config, not a shell file**: cluster-wide values live in a base
 YAML in the project, an experiment overrides what differs, and a one-off goes on the CLI
 (`hpc.time=2-00:00:00`). The section rides the normal chain, so `resolved_config.yaml` records
 the resources each run actually had.
@@ -676,6 +676,7 @@ CoE cluster.
 | `constraint` | str | `""` | `--constraint`, a Slurm node-feature expression in Slurm's own syntax (`vram80g`, `vram80g\|vram140g\|v100`; no whitespace), emitted only when set. The way to keep a job off a MIG-sliced node: a MIG device has no graphics, so Isaac Sim's Kit cannot start on it, and the job script exits 2 there naming this field |
 | `exp_log_dir` | str | `"exp_logs"` | where `.out` / `.err` land, relative to the project root; logs go to `{exp_log_dir}/{project}/{name}_%j.out` |
 | `train_script` | str | `"scripts/train.py"` | the entry script `launch_train` / `launch_sweep` run, relative to the project root (checked to exist before anything is queued); a project-registered learner names its own, e.g. `scripts/train_bc.py`, since `train.main` runs sac / ppo / ddpg only |
+| `watch_script` | str | `""` | the project's checkpoint watcher `launch_watch` runs, relative to the project root (checked to exist before anything is queued; `.py`, no whitespace). The job calls it with `--run <the training's run dir> --eval_config F --headless` and `--once` (dropped under `--follow`); the package ships no watcher, so the field is empty by default and required by that verb only, read from the eval config's chain (normally the project's base `hpc.yaml`) |
 | `sif_image` | str | `""` | path to the `.sif` on the cluster (`~` is expanded): `general-cu128.sif`, the `general` env as an image, built by `hpc/install_hpc.sh`. Nothing of the research code is installed into it — the job binds the package, the project and `extra_repos` and puts them on `PYTHONPATH`; see `examples/hpc.yaml`. **Required at submit** |
 | `sif_image_sm70` | str | `""` | the `.sif` the job uses instead of `sif_image` when the GPU it lands on is compute capability 7.0 (a V100, the dgx2 partition): the cu128 torch wheels ship no sm_70 kernels, so that node needs a cu126 image (`~` is expanded). The job reads `nvidia-smi` and switches, saying so in its log; with the field empty it warns and continues on `sif_image`. Checked to be a file at submit when set |
 | `apptainer_bin` | str | `"apptainer"` | or `"singularity"` |
