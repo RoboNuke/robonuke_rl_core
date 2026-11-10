@@ -762,6 +762,12 @@ class DDPGCfg(SACCfg):
     #: ResFiT's critic warm-up: once this learner may first update, this many critic-only gradient steps run at once,
     #: before the next env step; the actor learns from the update after. 0: none
     critic_warmup_updates: int = 0
+    #: with experiment.num_agents > 1: until the agents start learning (``learning_starts_rows``), every env's stored
+    #: row goes to every agent's memory -- the warm-up acts on the actors' untrained starting point -- so all agents
+    #: reach ``learning_starts_rows`` at once (N envs' rows per step instead of each agent's own), and their critic
+    #: warm-up (``critic_warmup_updates``) runs once, for every agent together. After that every agent stores only its
+    #: own envs' rows. False: each agent fills and starts on its own
+    shared_warmup: bool = False
 
     ACTOR_Q_REDUCTIONS = ("min", "mean", "min_random_pair", "q1")
     MIN_CRITICS = 1
@@ -787,6 +793,12 @@ class DDPGCfg(SACCfg):
             raise ValueError(f"{name}: {used} are SAC options DDPG does not implement; leave them at their defaults")
         if self.actor_action_scale <= 0:
             raise ValueError(f"{name}.actor_action_scale must be > 0, got {self.actor_action_scale}")
+        if self.shared_warmup:
+            if int(self.learning_starts_rows) <= 0:
+                raise ValueError(f"{name}.shared_warmup pools the rows until learning_starts_rows: set it > 0")
+            if self.hold_still_key:
+                raise ValueError(f"{name}.shared_warmup writes every env's row to every agent; held rows (hold_still_key) "
+                                 "are written per agent: use one or the other")
         if self.exploration_std < 0 or (self.exploration_std_end is not None and self.exploration_std_end < 0):
             raise ValueError(f"{name}.exploration_std (and _end) must be >= 0")
         if self.exploration_std_steps < 0:

@@ -239,9 +239,17 @@ class DDPG(SAC):
             return False
         return SAC._actor_may_learn(self, timestep)
 
+    def _pool_warmup_rows(self, timestep: int) -> bool:
+        """``shared_warmup``: until the agents start learning, every env's row goes to every agent's memory (the
+        warm-up acts on the actors' untrained starting point, the same for every agent), so they reach
+        ``learning_starts_rows`` together."""
+        return bool(self.cfg.shared_warmup) and not all(self._agent_started(timestep))
+
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
         started = self._agent_started(timestep)
-        newly = [s and not w and (self._agent_route_now[a] or not self.cfg.route_clock)
+        # shared_warmup: one critic warm-up for every agent at once, on the step they start together; otherwise each
+        # agent's own (with route_clock, on a step it is in its phase)
+        newly = [s and not w and (self.cfg.shared_warmup or self._agent_route_now[a] or not self.cfg.route_clock)
                  for a, (s, w) in enumerate(zip(started, self._agent_warmed))]
         if any(newly):
             # ResFiT's critic warm-up, per agent: critic_warmup_updates critic-only gradient steps now, before the next

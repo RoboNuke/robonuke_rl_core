@@ -237,6 +237,40 @@ def test_routed_phases_keep_their_own_warm_up_and_learning_starts():
     assert not screw._critic_warmed and screw._updates == 0 and screw._random_phase(12)  # screw has not started
 
 
+def test_shared_warmup_pools_every_envs_rows_until_the_agents_start_together_then_each_keeps_its_own():
+    from robonuke_rl_core.learners.routed import RoutedSAC
+
+    names = ["corner", "grasp", "insert", "screw", "success"]
+    kw = dict(num_agents=2, envs_per_agent=1, rollout=64, architecture="mlp", std_by_label="eval_state/phase/id",
+              std_label_names=names, route_clock=True, learning_starts_rows=6, critic_warmup_updates=2,
+              random_action_scale=0.2, exploration_std=0.0, shared_warmup=True)
+    routed = RoutedSAC({r: build_learner("ddpg", route_label=r, **kw) for r in ("insert", "screw")}, names)
+    routed.enable_training_mode(True)
+    insert = routed.learners["insert"]
+
+    def step(t, phases):
+        obs = torch.full((2, OBS_DIM), float(t))
+        actions, _ = routed.act(obs, None, timestep=t, timesteps=100)
+        routed.record_transition(observations=obs, states=None, actions=actions, rewards=torch.zeros(2, 1),
+                                 next_observations=obs, next_states=None, terminated=torch.zeros(2, 1, dtype=torch.bool),
+                                 truncated=torch.zeros(2, 1, dtype=torch.bool),
+                                 infos={"eval_state": {"phase/id": torch.tensor(phases, dtype=torch.float32)}},
+                                 timestep=t, timesteps=100)
+        routed.post_interaction(timestep=t, timesteps=100)
+
+    step(0, [2.0, 1.0])  # labels known from here: agent 0's env in insert, agent 1's in grasp
+    for t in range(1, 7):
+        step(t, [2.0, 1.0])  # only agent 0's env is in insert; its rows go to both agents' insert memories
+    assert insert.memory._agent_size == [6, 6]
+    first = insert.memory.get_tensor_by_name("observations")[:, :6, 0]
+    torch.testing.assert_close(first[0], first[1])  # the same pooled rows
+    assert insert._agent_warmed == [True, True]  # one burst, both agents, though agent 1 never was in insert
+    assert insert._agent_updates[0] == insert._agent_updates[1] > 0
+    for t in range(7, 10):
+        step(t, [2.0, 1.0])  # learning: each agent keeps only its own envs' rows
+    assert insert.memory._agent_size == [9, 6]
+
+
 def test_checkpoints_carry_the_target_actor(tmp_path):
     source = ddpg(run_dirs_list=[tmp_path / "a0", tmp_path / "a1"])
     fill_memory(source)
@@ -254,6 +288,9 @@ def test_checkpoints_carry_the_target_actor(tmp_path):
 def test_the_config_refuses_sac_only_options_and_bad_values():
     DDPGCfg().validate(None)
     DDPGCfg(noise_repeat=True).validate(None)  # held exploration noise, as SAC's
+    DDPGCfg(shared_warmup=True, learning_starts_rows=10).validate(None)
+    with pytest.raises(ValueError, match="learning_starts_rows"):
+        DDPGCfg(shared_warmup=True).validate(None)
     for bad in ({"learn_entropy": True}, {"critic_distribution": "categorical"}, {"noise_repeat": True, "noise_repeat_max": 0},
                 {"cross_batch_value": True}, {"action_l2_weight": 1.0}, {"critic_loss": "huber"},
                 {"q_target_min": 0.0}, {"actor_action_scale": 0.0}, {"actor_q_reduction": "min_random_pair"},

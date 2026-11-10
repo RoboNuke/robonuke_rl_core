@@ -327,6 +327,7 @@ DDPG's own fields:
 | `random_action_scale` | float | `0.0` | uniform actions in ±this until this learner starts learning (`learning_starts` / `learning_starts_rows`, per route with `route_clock`) or for the first `random_timesteps` env steps. For a residual, the base plus that noise (ResFiT: 0.2). 0: the actor with its noise from the start |
 | `random_action_mode` | str | `"uniform"` | what a warm-up action is: `uniform` (ResFiT's, `U(-random_action_scale, random_action_scale)` about 0) or `actor_gaussian` (the actor's own deterministic action plus `N(0, random_action_scale)`, clamped to `action_clip`: about the actor's starting point, for a residual whose neutral action is not 0, `model.actor.output_bias`) |
 | `critic_warmup_updates` | int | `0` | ResFiT's critic warm-up: when this learner may first update, this many critic-only gradient steps run at once, before the next env step. The actor learns from the next update on. Per route with `route_clock` |
+| `shared_warmup` | bool | `false` | with `experiment.num_agents` > 1: until the agents start learning (`learning_starts_rows`, > 0), every env's stored row goes to every agent's memory (the warm-up acts on the actors' untrained starting point), so all agents reach `learning_starts_rows` together and their `critic_warmup_updates` burst runs once, for every agent at once (per route). After that each agent stores only its own envs' rows. Not with `hold_still_key` |
 
 Metrics, on top of SAC's (no `entropy/*`): `policy/exploration_std` (the current noise std; also `policy/std`),
 `policy/mean_action` (mean |deterministic action|) and `q/ensemble_std` (the critics' spread over the batch).
@@ -334,7 +335,7 @@ Metrics, on top of SAC's (no `entropy/*`): `policy/exploration_std` (the current
 **Several agents (`experiment.num_agents` > 1) keep separate schedules.** Each agent has its own `route_clock` (its
 envs' steps in the phase), its own `learning_starts_rows` (its own online rows), and its own update and `policy_delay`
 counts and LR schedule. DDPG adds its own uniform warm-up (`random_action_scale`) and critic warm-up burst
-(`critic_warmup_updates`) per agent. An update steps only the agents that are due. Every optimizer step and every
+(`critic_warmup_updates`) per agent (with `shared_warmup`, one pooled warm-up and one burst for all agents). An update steps only the agents that are due. Every optimizer step and every
 target update (critics and the target actor) is masked to those agents, so an agent that is not due keeps its weights,
 targets, optimizer moments and step counts exactly. A block batch's online share is sized by the due agents' data
 alone. With such a schedule, `periodic_reset_enabled`, `retrain_every` and a `state_preprocessor` whose statistics update during training (`running`, or `update_normalizer_during_training`) act on

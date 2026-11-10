@@ -1063,7 +1063,12 @@ class SAC(LearnerBase):
             self._write_holding(row)
         elif "_keep" in row:  # store_labels: only the transitions starting in a listed phase
             keep = row.pop("_keep").reshape(-1) > 0.5
-            self.memory.add_rows(keep, **row)
+            if self._pool_warmup_rows(timestep):
+                self._add_pooled(keep, row)
+            else:
+                self.memory.add_rows(keep, **row)
+        elif self._pool_warmup_rows(timestep):
+            self._add_pooled(torch.ones(observations.shape[0], dtype=torch.bool, device=self.device), row)
         else:
             self.memory.add_samples(**row)
         self._read_host(route_now_t)
@@ -1108,6 +1113,18 @@ class SAC(LearnerBase):
             cached = torch.tensor(allowed, dtype=torch.long, device=device)
             self._label_index_cache[allowed] = cached
         return cached
+
+    def _pool_warmup_rows(self, timestep: int) -> bool:
+        """Whether this step's rows go to every agent's memory (DDPG's ``shared_warmup``); SAC never pools."""
+        return False
+
+    def _add_pooled(self, keep: torch.Tensor, row: Dict[str, torch.Tensor]) -> None:
+        """Every env's kept row into every agent's memory: one device-side :meth:`add_rows` per agent offset, the env
+        blocks rotated so that agent ``a`` receives agent ``a - k``'s envs' rows (no host read)."""
+        block = int(self.memory.envs_per_agent)
+        for k in range(self.num_agents):
+            shift = k * block
+            self.memory.add_rows(torch.roll(keep, shift, dims=0), **{name: torch.roll(value, shift, dims=0) for name, value in row.items()})
 
     def forced_env_reset(self) -> None:
         super().forced_env_reset()
