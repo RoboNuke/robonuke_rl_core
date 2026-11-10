@@ -861,7 +861,10 @@ def test_the_acting_std_is_logged_per_label_from_the_previous_steps_infos():
     seen.clear()
     _, outputs = learner.act(obs, None, timestep=1, timesteps=10)
     std = outputs["log_std"].exp().mean(-1)
-    got = {(agent, k): v for agent, m in seen for k, v in m.items() if k.startswith("policy/std_")}
+    # every agent emits every group's values with NaN outside the group (no host sync); the accumulator keeps the
+    # finite entries, which is what is checked here
+    got = {(agent, k): v[torch.isfinite(v)] for agent, m in seen for k, v in m.items() if k.startswith("policy/std_")}
+    got = {key: v for key, v in got.items() if v.numel()}
     torch.testing.assert_close(got[(0, "policy/std_corner")], std[0:2])
     torch.testing.assert_close(got[(0, "policy/std_grasp")], std[2:3])
     torch.testing.assert_close(got[(1, "policy/std_grasp")], std[3:4])
@@ -886,7 +889,7 @@ def test_env_metrics_are_logged_per_label_over_the_envs_that_ran_the_policy():
     learner._std_labels = torch.tensor([0, 0, 1, 1])  # the observations' phases
     learner._explore_keep = torch.tensor([True, False, True, True])  # env 1 ran on zeros
     learner._emit_metrics_by_label({"metrics_to_log": {"residual/position_mm": torch.tensor([1.0, 2.0, 3.0, 4.0])}}, 0)
-    got = {k: v for m in seen for k, v in m.items()}
+    got = {k: v[torch.isfinite(v)] for m in seen for k, v in m.items()}  # NaN outside the group: skipped downstream
     torch.testing.assert_close(got["residual/position_mm_corner"], torch.tensor([1.0]))
     torch.testing.assert_close(got["residual/position_mm_grasp"], torch.tensor([3.0, 4.0]))
 

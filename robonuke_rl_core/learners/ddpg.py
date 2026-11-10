@@ -138,6 +138,16 @@ class DDPG(SAC):
         """Every agent is in its uniform warm-up (:meth:`_agent_random_phase`)."""
         return all(self._agent_random_phase(timestep))
 
+    def _random_agent_mask(self, random_agents) -> torch.Tensor:
+        """``random_agents`` (a host list) as a ``(num_agents,)`` bool device tensor, rebuilt only when the list
+        changes: ``torch.tensor(list, device=cuda)`` every step is a host-to-device copy, i.e. a host sync."""
+        key = tuple(bool(v) for v in random_agents)
+        cached = getattr(self, "_random_mask_cache", None)
+        if cached is None or cached[0] != key:
+            cached = (key, torch.tensor(key, dtype=torch.bool, device=self.device))
+            self._random_mask_cache = cached
+        return cached[1]
+
     def _clamp(self, actions: torch.Tensor) -> torch.Tensor:
         clip = self.cfg.action_clip
         return actions if clip is None else actions.clamp(-float(clip), float(clip))
@@ -178,7 +188,7 @@ class DDPG(SAC):
             if any(random_agents):
                 # the agents still in their warm-up act at random; the others with their actors (agent i owns
                 # envs [i * envs_per_agent, (i + 1) * envs_per_agent))
-                per_env = torch.tensor(random_agents, device=self.device).repeat_interleave(rows // self.num_agents)
+                per_env = self._random_agent_mask(random_agents).repeat_interleave(rows // self.num_agents)
                 if around_actor:  # random_action_mode: actor_gaussian, about the actor's own action
                     warm = self._clamp(mean + torch.randn_like(mean) * float(self.cfg.random_action_scale))
                 else:

@@ -112,13 +112,33 @@ class RoutedSAC:
         next observation is in another phase is terminal (``phase_end``). Rewards and the env's flags pass as they are."""
         labels = self._labels_from(infos)
         phase_end = self.phase_end(self._labels, labels, kwargs["terminated"])
+        pending = []
         for learner in self.learners.values():
+            # every learner leaves its host values (route clock, memory fill, episodes) for the one read below
+            learner._host_read_deferred = True
+            learner._pending_host_read = None
             learner.record_transition(infos=infos, phase_end=phase_end, **kwargs)
+            if learner._pending_host_read is not None:
+                pending.append((learner, learner._pending_host_read))
+        crossed = None
         if self.phase_logger is not None:
             # the phase each env's step started in, and the one it ended in
-            self.phase_logger.observe(self._labels, labels, kwargs["rewards"], kwargs["terminated"], kwargs["truncated"],
-                                      infos, int(kwargs["timestep"]))
+            crossed = self.phase_logger.observe(self._labels, labels, kwargs["rewards"], kwargs["terminated"],
+                                                kwargs["truncated"], infos, int(kwargs["timestep"]), defer=True)
         self._labels = labels
+        # the step's single host synchronization: every learner's values and the phase logger's publish flags
+        pieces = [values for _, values in pending]
+        if crossed is not None:
+            pieces.append(crossed.reshape(-1).to(torch.float32))
+        if not pieces:
+            return
+        values = torch.cat(pieces).tolist()
+        at = 0
+        for learner, tensor in pending:
+            learner._apply_host_read(values[at : at + tensor.numel()])
+            at += tensor.numel()
+        if crossed is not None:
+            self.phase_logger.publish_crossed(values[at:], int(kwargs["timestep"]))
 
     def post_interaction(self, *, timestep: int, timesteps: int) -> None:
         for learner in self.learners.values():

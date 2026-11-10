@@ -94,9 +94,10 @@ def build_learner(
     aux_loss=None,
     architecture: str = "simba",
     critic_action_transform=None,
+    device: str = "cpu",
     **cfg_overrides,
 ):
-    """A learner with tiny networks and an empty memory of depth ``rollout``.
+    """A learner with tiny networks and an empty memory of depth ``rollout`` (on ``device``).
 
     ``architecture`` picks the model section (``simba`` or ``mlp``);
     ``model_overrides`` sets fields on its actor cfg (e.g. ``bernoulli_action_dims``);
@@ -138,7 +139,7 @@ def build_learner(
         state_space,
         action_space,
         num_agents,
-        "cpu",
+        device,
         controller_cfg,
         num_critics=cfg.num_critics if learner in ("sac", "ddpg") else 2,
         critic_outputs=sac_critic_outputs(cfg) if learner in ("sac", "ddpg") else 1,
@@ -147,7 +148,7 @@ def build_learner(
         ),
     )
     memory = MultiRandomMemory(
-        capacity=rollout * envs_per_agent, num_envs=num_envs, num_agents=num_agents, device="cpu"
+        capacity=rollout * envs_per_agent, num_envs=num_envs, num_agents=num_agents, device=device
     )
     extra = (
         {"model_cfg": model_cfg, "controller_cfg": controller_cfg} if learner in ("sac", "ddpg") else {}
@@ -158,7 +159,7 @@ def build_learner(
         observation_space=observation_space,
         state_space=state_space,
         action_space=action_space,
-        device="cpu",
+        device=device,
         cfg=cfg,
         trainer_cfg=trainer_cfg,
         num_agents=num_agents,

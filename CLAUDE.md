@@ -30,6 +30,18 @@ create a new conda env for this project.
 * `config.py` must import without Isaac Lab installed. Isaac Lab is imported only inside
   `load_task_cfg`, `task_cfg_to_dict` and `apply_task_cfg`.
 * Do not commit or push without approval. Report tests as passed / failed / total.
+* **No host synchronization on the per-step path.** Every env step the trainer runs the policy,
+  the env, `record_transition` and `post_interaction`; nothing in that path may read a device
+  value to the host except the learner's one combined read (`SAC._read_host`, done by
+  `RoutedSAC` for all its learners and the phase logger at once) and the logging flush at the
+  write interval. Boolean-mask indexing, `nonzero`, `.item()`, `.tolist()`, `int(t.sum())`,
+  `if t.any()`, `torch.tensor(..., device=cuda)` or indexing with a Python list inside that
+  path are each a CPU-GPU round trip that also stops the CPU from queueing kernels ahead of
+  the GPU (on a cluster node they were most of the step). Write with `torch.where`, NaN-masked
+  emits (the accumulator counts finite entries), `index_put_`, device counters and
+  `learners/windows.py`; constants and index tensors are built once; host flags reach the
+  device through `windows.stage_to_device` (pinned, asynchronous). `torch.cuda.set_sync_debug_mode(1)`
+  with a warning counter finds offenders.
 * **Every config field is documented.** Adding, renaming or removing a field in any section
   means updating its row in the README's configuration reference in the same change. No test
   checks this. The README never documents `task.cfg` fields — it says once that any env cfg
@@ -430,6 +442,14 @@ and nothing it samples can come from another agent's rows.
   order and advances one shared pointer by `envs_per_agent` rows (every agent writes the same
   number of rows per step, so one pointer is enough). When full it wraps, overwriting the
   oldest rows uniformly per agent, mid-step if the capacity is not divisible.
+* **Out of lockstep** (`add_rows(keep, **tensors)`: `store_labels`, `hold_still_key`): each
+  agent appends the envs it keeps at its own pointer. The pointer, fill and rows-written per
+  agent are device tensors (`_agent_pointer_t`, `_agent_size_t`, `_agent_written_t`, updated
+  in place), and the write is one gather and one scatter per tensor: every env gets a distinct
+  slot in `[pointer, pointer + envs_per_agent)`, the kept ones first, the others writing their
+  slot's content back. No host read. `fills()` / `_agent_size` / `_agent_pointer` /
+  `_agent_written` / `size` read the device (one sync each) for the update decision, the
+  periodic reset and the checkpoints; the step uses `fills_on_device()`.
 * **Row order**: row `step * envs_per_agent + env` within an agent's slab. `time_view(name)`
   is the `(num_agents, steps, envs_per_agent, dim)` view this implies and is how PPO gets the
   time axis GAE needs; it raises unless the capacity divides by the envs per agent.
@@ -449,11 +469,13 @@ renaming. A wrong shape or a non-dict raises, naming the key; a missing key forw
 
 * **Every step:** `infos["metrics_to_log"]`. The learner slices it to each agent's envs and
   emits the `(envs_per_agent,)` slice.
-* **End of episode:** `infos["episode_metrics_to_log"]`. The learner masks the slice with that
-  step's `terminated | truncated` and emits the compacted `(k,)` tensor of the envs that
-  finished; an agent with none emits nothing, so an interval with no episodes publishes no
-  point (a gap, not a zero). Slots of envs that did not finish are never read, so an env may
-  leave anything there — there is no NaN convention.
+* **End of episode:** `infos["episode_metrics_to_log"]`. The learner emits each agent's
+  `(envs_per_agent,)` slice with NaN where the env did not finish (`terminated | truncated`);
+  the accumulator counts finite entries only, so an interval with no episodes publishes no
+  point (a gap, not a zero). Slots of envs that did not finish are never read (they become
+  NaN before anything sees them), so an env may leave anything there. The rolling windows
+  (`success_window`, `windowed_metrics`) take the finished envs on the device
+  (`learners/windows.py`).
 * **Learner side:** build a `(num_agents,)` tensor and call `emit_per_agent({name: value},
   step)`. The name is free. `episode/return` and `episode/length` ride the episode channel as
   the episodes end; `episode/count` comes once per write interval.
@@ -467,8 +489,9 @@ probability is the smoother of the two and is what the supervised selection loss
 is the one to watch when asking whether a policy is learning *when* to push. The axis names
 come from the model, which the factory names from the controller's force-eligible axes.
 
-The episode channel is the only host sync in the rollout path (compacting needs the count on
-the host), it happens once per step, and only while an `on_log` hook is attached.
+Nothing in the rollout path reads the device: a per-env value that does not apply this step is
+NaN, and the accumulator skips it. The per-label channels (`std_by_label`, `metrics_by_label`)
+are emitted the same way, every label for every agent with NaN outside the group.
 
 ### What gets logged
 

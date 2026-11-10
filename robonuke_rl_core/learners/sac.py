@@ -52,6 +52,7 @@ from ..optim import BlockAdamW, clip_grad_norm_per_agent, lr_at
 from ..models.factory import build_models
 from ..models.normalizer import BlockReturnScaler, BlockRunningNorm
 from ..losses.losses import LossContext
+from .windows import stage_to_device
 from .base import LearnerBase
 from .cfg import sac_critic_outputs
 from .cuda_graph import StepGraphs
@@ -458,9 +459,10 @@ class SAC(LearnerBase):
         if self.cfg.demo_storage == "memory_critic" and int(self.memory.size) != 0:
             raise RuntimeError("sac.demo_storage: memory_critic writes the demos first, into an empty memory")
         self.memory.add_block(**{name: rows[name] for name in self._tensors_names})
+        self._fills_now, self._written_now = self.memory.fills(), self.memory.written()  # one read, outside any capture
         if self.cfg.demo_storage == "memory_critic":
             # the online rows of each agent are [n_demo, fill) until the memory wraps: the actor's sampler bound
-            self._demo_rows = list(self.memory._agent_size)
+            self._demo_rows = list(self._fills_now)
             self._online_low = torch.tensor(self._demo_rows, dtype=torch.float32, device=self.device)
         print(f"[sac] {next(iter(demo.values())).shape[0]} demo transitions written into the replay memory", flush=True)
 
@@ -494,8 +496,11 @@ class SAC(LearnerBase):
         return self.memory.sample_range_graph_safe(names=names, batch_size=batch_size, low=low)
 
     def _memory_wrapped(self) -> bool:
-        """Whether some agent's memory has written past its capacity (old rows, demos first, overwritten)."""
-        return max(self.memory.written()) > self.memory.capacity
+        """Whether some agent's memory has written past its capacity (old rows, demos first, overwritten). From the
+        step's host read (this runs inside the captured gradient step, where nothing may read the device); before
+        the first training step, read from the memory."""
+        written = self._written_now if self._written_now is not None else self.memory.written()
+        return max(written) > self.memory.capacity
 
     def _online_rows_available(self) -> bool:
         """``demo_storage: memory_critic``: every agent this update steps holds at least one online row (host side,
@@ -504,15 +509,22 @@ class SAC(LearnerBase):
         if self._memory_wrapped():
             counts = self.memory.count_where("is_demo", 0.0)
             return min(counts[a] for a in due) > 0
-        fills = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
+        fills = self.memory.fills()  # live (one read per update, outside any capture): rows may have been written directly
         return min(fills[a] - self._demo_rows[a] for a in due) > 0
 
     def _due_fill(self) -> int:
         """The smallest memory fill among the agents this update steps: what a block batch's online share is sized by,
         so an agent with little (or no) data of its own never shrinks another agent's batch."""
-        fills = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
+        fills = self._fills()
         due = [int(fills[a]) for a, d in enumerate(self._agent_due) if d]
-        return min(due) if due else int(self.memory.size)
+        return min(due) if due else min(fills)
+
+    def _fills(self) -> List[int]:
+        """Each agent's memory fill as the step's host read saw it (no synchronization), or, before the first
+        training step, read from the memory (one synchronization)."""
+        if self._fills_now is not None:
+            return list(self._fills_now)
+        return self.memory.fills()
 
     def _online_rows_ready(self) -> bool:
         """``learning_starts_rows``: every agent's memory holds that many online rows."""
@@ -525,12 +537,12 @@ class SAC(LearnerBase):
             return [True] * self.num_agents
         if all(self._agent_rows_ready):
             return list(self._agent_rows_ready)
-        if self.memory is None or self.memory.size == 0 and self.memory._agent_size is None:
+        if self.memory is None:
             return list(self._agent_rows_ready)
         if "is_demo" in self._tensors_names:
             counts = self.memory.count_where("is_demo", 0.0)
         else:
-            counts = list(self.memory._agent_size or [int(self.memory.size)] * self.num_agents)
+            counts = self._fills()
         self._agent_rows_ready = [r or int(c) >= need for r, c in zip(self._agent_rows_ready, counts)]
         return list(self._agent_rows_ready)
 
@@ -608,6 +620,17 @@ class SAC(LearnerBase):
             self._agent_route_steps = [0] * n
             self._agent_route_now = [False] * n
             self._agent_rows_ready = [False] * n
+            #: the step's host read (_read_host): each agent's memory fill and the env episodes finished so far, as
+            #: the update decision last saw them; None before the first training step
+            self._fills_now: Optional[List[int]] = None
+            self._written_now: Optional[List[int]] = None
+            self._finished_episodes = 0
+            self._finished_count_t = torch.zeros((), dtype=torch.long, device=self.device)
+            self._label_index_cache: Dict[tuple, torch.Tensor] = {}
+            #: a parent (RoutedSAC) that reads every learner's host values in one go sets this; the learner then
+            #: leaves its pending device values for the parent (_pending_host_read) instead of reading itself
+            self._host_read_deferred = False
+            self._pending_host_read: Optional[torch.Tensor] = None
         self._agent_due = [True] * n
         self._keep_critic = torch.ones(n, dtype=torch.bool, device=self.device)
         self._keep_actor = torch.ones(n, dtype=torch.bool, device=self.device)
@@ -647,7 +670,7 @@ class SAC(LearnerBase):
     def _set_due(self, due) -> None:
         """The agents this update steps (host list; mirrored to the device mask a captured graph reads)."""
         self._agent_due = [bool(d) for d in due]
-        self._keep_critic.copy_(torch.tensor(self._agent_due, dtype=torch.bool))
+        stage_to_device(self._keep_critic, self._agent_due)
 
     def _agent_actor_may_learn(self, agent: int, timestep: int) -> bool:
         """Whether agent ``agent``'s actor may take steps in this update (by default the learner-wide rule)."""
@@ -860,13 +883,14 @@ class SAC(LearnerBase):
         if labels.shape[0] != std.shape[0]:
             return
         per_agent = std.shape[0] // self.num_agents
+        nan = torch.full_like(std, float("nan"))
         for index, name in enumerate(self.cfg.std_label_names):
-            hit = labels == index
+            # NaN where the env is in another label: the accumulator counts finite entries only, so this is the
+            # group's values with no boolean-mask indexing (a host synchronization per metric, label and agent)
+            masked = torch.where(labels == index, std, nan)
             for agent in range(self.num_agents):
                 rows = slice(agent * per_agent, (agent + 1) * per_agent)
-                values = std[rows][hit[rows]]
-                if values.numel():
-                    self.emit(agent, {f"policy/std_{name}": values}, timestep)
+                self.emit(agent, {f"policy/std_{name}": masked[rows]}, timestep)
 
     def _emit_metrics_by_label(self, infos: Any, timestep: int) -> None:
         """``metrics_by_label``: this step's per-env ``metrics_to_log`` values, per ``std_by_label`` group (the label
@@ -887,13 +911,13 @@ class SAC(LearnerBase):
             value = torch.as_tensor(value, device=self.device).reshape(-1)
             if value.shape != labels.shape:
                 continue
+            nan = torch.full_like(value, float("nan"))
             for index, group in enumerate(self.cfg.std_label_names):
-                hit = (labels == index) & active
+                # NaN outside the group (see _emit_std_by_label): no host synchronization
+                masked = torch.where((labels == index) & active, value, nan)
                 for agent in range(self.num_agents):
                     rows = slice(agent * per_agent, (agent + 1) * per_agent)
-                    values = value[rows][hit[rows]]
-                    if values.numel():
-                        self.emit(agent, {f"{name}_{group}": values}, timestep)
+                    self.emit(agent, {f"{name}_{group}": masked[rows]}, timestep)
 
     def _explore_share(self, timestep: int) -> float:
         """``min(max(timestep - start, 0) / H, 1)``: the chance an env runs the policy this step, 0 until
@@ -925,7 +949,7 @@ class SAC(LearnerBase):
         included) and its gradient updates."""
         if not self.cfg.route_label:
             return
-        sizes = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
+        sizes = self._fills()
         self.emit_per_agent({
             "route/steps": torch.tensor([float(v) for v in self._agent_route_steps], device=self.device),
             "route/memory_rows": torch.tensor([float(v) for v in sizes], device=self.device),
@@ -959,8 +983,9 @@ class SAC(LearnerBase):
             step=timestep,
         )
         if self.training:
-            # the env's own episode ends (warmup_episodes counts them)
-            self._finished_episodes = getattr(self, "_finished_episodes", 0) + int((terminated | truncated).sum())
+            # the env's own episode ends (warmup_episodes counts them): a device counter, read with the step's
+            # single host read (_read_host)
+            self._finished_count_t.add_((terminated | truncated).sum())
         shaping = self._potential_shaping(infos, terminated | truncated) if self._potential_terms else None
         #: the label of the observation this transition starts from (store_labels)
         start_labels = getattr(self, "_std_labels", None)
@@ -987,18 +1012,15 @@ class SAC(LearnerBase):
             extra["next_states"] = next_states
         extra.update(self.aux_memory_values(infos))
         extra.update(self._side_input_values(infos, observations.shape[0]))
+        route_now_t = None
         if self.cfg.route_label:
-            # route_clock: this step is one of this residual's own when an env starts it in the route's label
+            # route_clock: this step is one of this residual's own when an env starts it in the route's label; per
+            # agent, one of its envs. Read to the host with the step's single read (_read_host), below
             index = self.cfg.std_label_names.index(self.cfg.route_label)
             if start_labels is None:
-                now = [False] * self.num_agents
-            else:  # per agent: one of its envs starts this step in the route's label
-                now = (start_labels.reshape(self.num_agents, -1) == index).any(dim=1).tolist()
-            self._agent_route_now = [bool(v) for v in now]
-            self._agent_route_steps = [c + int(v) for c, v in zip(self._agent_route_steps, self._agent_route_now)]
-            # learner-wide views (periodic reset / retrain, the legacy metrics): any agent's step, the furthest clock
-            self._route_step_now = any(self._agent_route_now)
-            self._route_steps = max(self._agent_route_steps)
+                route_now_t = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
+            else:
+                route_now_t = (start_labels.reshape(self.num_agents, -1) == index).any(dim=1)
         if self.cfg.demo_storage == "memory_critic":
             extra["is_demo"] = torch.zeros(observations.shape[0], 1, device=self.device)
         if self.cfg.hold_still_key:
@@ -1014,11 +1036,11 @@ class SAC(LearnerBase):
         stored_labels = [self.cfg.route_label] if self.cfg.route_label else list(self.cfg.store_labels)
         if stored_labels:
             # stored only where the starting observation's label is listed (none before the first label is known)
-            allowed = [self.cfg.std_label_names.index(label) for label in stored_labels]
+            allowed = tuple(self.cfg.std_label_names.index(label) for label in stored_labels)
             if start_labels is None:
                 keep = torch.zeros(observations.shape[0], dtype=torch.bool, device=self.device)
             else:
-                keep = torch.isin(start_labels, torch.tensor(allowed, device=start_labels.device))
+                keep = torch.isin(start_labels, self._label_index(allowed, start_labels.device))
             extra["_keep"] = keep.to(torch.float32).unsqueeze(-1)
         stored_rewards = self.shape_rewards(rewards, timestep, timesteps)
         if self.return_scaler is not None:
@@ -1039,12 +1061,53 @@ class SAC(LearnerBase):
                 return
         if self.cfg.hold_still_key:
             self._write_holding(row)
-            return
-        if "_keep" in row:  # store_labels: only the transitions starting in a listed phase
+        elif "_keep" in row:  # store_labels: only the transitions starting in a listed phase
             keep = row.pop("_keep").reshape(-1) > 0.5
             self.memory.add_rows(keep, **row)
+        else:
+            self.memory.add_samples(**row)
+        self._read_host(route_now_t)
+
+    # ------------------------------------------------------------------ the step's single host read
+    def _host_read_values(self, route_now_t: Optional[torch.Tensor]) -> torch.Tensor:
+        """What the update decision needs from the device this step, as one float tensor: per agent whether it
+        stepped in its route's label (``route_clock``), per agent its memory fill (``learning_starts_rows``), and the
+        env episodes finished so far (``warmup_episodes``)."""
+        n = self.num_agents
+        route = route_now_t.to(torch.float32) if route_now_t is not None else torch.zeros(n, device=self.device)
+        return torch.cat((route, self.memory.fills_on_device().to(torch.float32), self.memory.written_on_device().to(torch.float32),
+                          self._finished_count_t.to(torch.float32).view(1)))
+
+    def _apply_host_read(self, values: List[float]) -> None:
+        """The host side of :meth:`_host_read_values`."""
+        n = self.num_agents
+        self._fills_now = [int(v) for v in values[n : 2 * n]]
+        self._written_now = [int(v) for v in values[2 * n : 3 * n]]
+        self._finished_episodes = int(values[3 * n])
+        if self.cfg.route_label:
+            self._agent_route_now = [v > 0.5 for v in values[:n]]
+            self._agent_route_steps = [c + int(v) for c, v in zip(self._agent_route_steps, self._agent_route_now)]
+            # learner-wide views (periodic reset / retrain, the legacy metrics): any agent's step, the furthest clock
+            self._route_step_now = any(self._agent_route_now)
+            self._route_steps = max(self._agent_route_steps)
+
+    def _read_host(self, route_now_t: Optional[torch.Tensor]) -> None:
+        """The training step's one host synchronization: every scalar the update decision needs, in one copy.
+        Deferred to the parent when it reads for all its learners at once (``_host_read_deferred``)."""
+        pending = self._host_read_values(route_now_t)
+        if self._host_read_deferred:
+            self._pending_host_read = pending
             return
-        self.memory.add_samples(**row)
+        self._apply_host_read(pending.tolist())
+
+    def _label_index(self, allowed: tuple, device) -> torch.Tensor:
+        """``allowed`` label indices as a device tensor, built once per tuple (``torch.tensor(..., device=cuda)`` each
+        step is a host-to-device copy, a synchronization)."""
+        cached = self._label_index_cache.get(allowed)
+        if cached is None or cached.device != torch.device(device):
+            cached = torch.tensor(allowed, dtype=torch.long, device=device)
+            self._label_index_cache[allowed] = cached
+        return cached
 
     def forced_env_reset(self) -> None:
         super().forced_env_reset()
@@ -1520,7 +1583,7 @@ class SAC(LearnerBase):
         if self.cfg.store_labels or self.cfg.route_label:
             # an agent with no transition of its stored phase yet has nothing to learn from: it is not stepped (the
             # others are, on their own data)
-            fills = self.memory._agent_size or [int(self.memory.size)] * self.num_agents
+            fills = self._fills()
             due = [d and int(f) > 0 for d, f in zip(self._agent_due, fills)]
             if not any(due):
                 return
@@ -1556,7 +1619,7 @@ class SAC(LearnerBase):
                            for agent, on in enumerate(agent_policy_on)]
             actor_step = any(agent_actor)
             if self._masked:
-                self._keep_actor.copy_(torch.tensor(agent_actor, dtype=torch.bool))
+                stage_to_device(self._keep_actor, agent_actor)
             mode = (demo_on, policy_on, actor_step)
             if graph:
                 out = self._graphs.run(mode, lambda: self._gradient_step(mode, rows, timestep, graph=True))

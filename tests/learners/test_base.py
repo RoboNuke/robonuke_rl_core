@@ -22,12 +22,23 @@ def collector(skip=("reward/step",)):
     """An on_log hook plus the list it fills.
 
     The learner emits ``reward/step`` every step for every agent, which would drown out the
-    channel each test is actually about, so it is filtered out by default.
+    channel each test is actually about, so it is filtered out by default. The episode channels
+    come as every env's value with NaN where the env did not finish (no host sync in the
+    learner); like the accumulator, the collector keeps the finite entries and drops a channel
+    with none.
     """
     seen: list[tuple[int, dict, int]] = []
 
     def hook(agent, metrics, step):
-        kept = {name: value for name, value in metrics.items() if name not in skip}
+        kept = {}
+        for name, value in metrics.items():
+            if name in skip:
+                continue
+            if torch.is_tensor(value) and torch.is_floating_point(value) and value.dim():
+                value = value[torch.isfinite(value)]
+                if value.numel() == 0:
+                    continue
+            kept[name] = value
         if kept:
             seen.append((agent, kept, step))
 
@@ -677,7 +688,7 @@ def test_more_episodes_than_the_window_at_once_keep_the_last_n():
     learner.on_log.append(lambda agent, metrics, step: None)
     _finish(learner, [1.0, 1.0, 0.0, 1.0], step=0)
     assert sorted(learner._success_window[0].tolist()) == [0.0, 1.0]
-    assert learner._success_window_next == [0]
+    assert learner._success_window_next.tolist() == [0]
 
 
 def test_an_empty_window_publishes_nothing_and_off_keeps_the_per_episode_rate():

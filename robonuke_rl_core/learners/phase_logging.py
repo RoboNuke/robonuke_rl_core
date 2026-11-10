@@ -23,16 +23,20 @@ The env's ``phase/*`` episode metrics leave the ``phase`` family: ``phase/reache
 ``phase/<name>`` becomes ``episode/<name>``. Every metric name has one ``/``: the rest of it is joined with ``_``
 (``episode/length/max`` -> ``episode/length_max``).
 
-The labels come to the host once per step (one ``(num_envs,)`` copy), so this is for the few-env runs routing is used
-with.
+Nothing is read to the host per step: the attempt counters, the per-(agent, phase) step counts and attempt sums,
+the success windows and the publish-cadence flags all live on the labels' device, and a phase's point is read once
+when it is published (every ``write_interval`` of its steps) or at the global flush. Whether a phase crossed its
+publish cadence this step is a device tensor; :meth:`PhaseLogger.observe` reads it itself, or leaves it for a
+caller that reads every learner's host values in one copy (``defer=True`` and :meth:`PhaseLogger.publish_crossed`).
 """
 
 from __future__ import annotations
 
-from collections import deque
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
+
+from .windows import push_window
 
 __all__ = ["PhaseLogger", "flat_name"]
 
@@ -47,30 +51,68 @@ def flat_name(name: str) -> str:
 
 
 class _Attempts:
-    """One (agent, phase)'s finished attempts since its last publish, its success window and best rate."""
+    """Per (agent, phase), the finished attempts since the phase's last publish, its success window and best rate: every
+    sum a ``(num_agents, num_phases)`` float64 device tensor, the window ``(num_agents, num_phases, window)``."""
 
-    def __init__(self, window: Optional[int]) -> None:
-        self.success: List[float] = []
-        self.length: List[float] = []
-        self.ret: List[float] = []
-        self.oob: List[float] = []
-        self.window = deque(maxlen=int(window)) if window else None
-        self.best = float("nan")
+    def __init__(self, num_agents: int, num_phases: int, window: Optional[int], device) -> None:
+        shape = (num_agents, num_phases)
+        z = lambda: torch.zeros(shape, dtype=torch.float64, device=device)  # noqa: E731
+        self.count, self.success, self.length, self.ret, self.oob, self.oob_count = z(), z(), z(), z(), z(), z()
+        self.length_min, self.length_max = torch.full(shape, float("inf"), dtype=torch.float64, device=device), torch.full(shape, float("-inf"), dtype=torch.float64, device=device)
+        self.return_min, self.return_max = torch.full(shape, float("inf"), dtype=torch.float64, device=device), torch.full(shape, float("-inf"), dtype=torch.float64, device=device)
+        self.window = torch.full((num_agents * num_phases, int(window)), float("nan"), dtype=torch.float64, device=device) if window else None
+        self.window_next = torch.zeros((num_agents * num_phases,), dtype=torch.long, device=device) if window else None
+        self.best = [[float("nan")] * num_phases for _ in range(num_agents)]
+        self.num_phases = num_phases
 
-    def add(self, success: float, length: float, ret: float, oob: float) -> None:
-        self.success.append(success)
-        self.length.append(length)
-        self.ret.append(ret)
-        self.oob.append(oob)
+    def add(self, agent: torch.Tensor, phase: torch.Tensor, finished: torch.Tensor, passed: torch.Tensor,
+            length: torch.Tensor, ret: torch.Tensor, oob: torch.Tensor) -> None:
+        """Fold this step's finished attempts (per env: ``finished`` bool, the others float64) into the sums, on the
+        device. Envs that finished nothing add zero; the min / max see +-inf for them."""
+        index = (agent, phase)
+        w = finished.to(torch.float64)
+        self.count.index_put_(index, w, accumulate=True)
+        self.success.index_put_(index, w * passed, accumulate=True)
+        self.length.index_put_(index, w * length, accumulate=True)
+        self.ret.index_put_(index, w * ret, accumulate=True)
+        finite = finished & torch.isfinite(oob)
+        self.oob.index_put_(index, finite.to(torch.float64) * torch.nan_to_num(oob), accumulate=True)
+        self.oob_count.index_put_(index, finite.to(torch.float64), accumulate=True)
+        flat = agent * self.num_phases + phase
+        inf = torch.full_like(length, float("inf"))
+        for target, values, reduce in ((self.length_min, length, "amin"), (self.length_max, length, "amax"),
+                                       (self.return_min, ret, "amin"), (self.return_max, ret, "amax")):
+            masked = torch.where(finished, values, inf if reduce == "amin" else -inf)
+            target.view(-1).index_reduce_(0, flat, masked, reduce, include_self=True)
         if self.window is not None:
-            self.window.append(success)
+            push_window(self.window, self.window_next, flat, finished, passed)
 
-    def rate(self) -> Optional[float]:
-        values = list(self.window) if self.window is not None else self.success
+    def read(self, agent: int, phase: int) -> Dict[str, float]:
+        """One (agent, phase)'s values as floats: a single device read."""
+        cells = [self.count, self.success, self.length, self.ret, self.oob, self.oob_count,
+                 self.length_min, self.length_max, self.return_min, self.return_max]
+        values = torch.stack([c[agent, phase] for c in cells])
+        if self.window is not None:
+            values = torch.cat((values, self.window[agent * self.num_phases + phase]))
+        values = values.tolist()
+        keys = ["count", "success", "length", "ret", "oob", "oob_count", "length_min", "length_max", "return_min", "return_max"]
+        out = dict(zip(keys, values))
+        out["window"] = values[len(keys):]
+        return out
+
+    def rate(self, agent: int, phase: int, read: Dict[str, float]) -> Optional[float]:
+        values = [v for v in read["window"] if v == v] if self.window is not None else None
+        if values is None:
+            return read["success"] / read["count"] if read["count"] > 0 else None
         return sum(values) / len(values) if values else None
 
-    def clear(self) -> None:
-        self.success, self.length, self.ret, self.oob = [], [], [], []
+    def clear(self, agent: int, phase: int) -> None:
+        for cell in (self.count, self.success, self.length, self.ret, self.oob, self.oob_count):
+            cell[agent, phase] = 0.0
+        self.length_min[agent, phase] = float("inf")
+        self.return_min[agent, phase] = float("inf")
+        self.length_max[agent, phase] = float("-inf")
+        self.return_max[agent, phase] = float("-inf")
 
 
 class PhaseLogger:
@@ -108,9 +150,14 @@ class PhaseLogger:
         self.envs_per_agent = int(envs_per_agent)
         self.write_interval = int(write_interval)
         self.index = {p: self.names.index(p) for p in self.phases}
-        #: per (agent, phase) env steps, and the finished attempts since the phase's last publish
-        self.steps = {(a, p): 0 for a in range(self.num_agents) for p in self.phases}
-        self.attempts = {(a, p): _Attempts(success_window) for a in range(self.num_agents) for p in self.phases}
+        self.success_window = int(success_window) if success_window else None
+        #: per (agent, phase) env steps, and the finished attempts since the phase's last publish: on the labels'
+        #: device, created at the first step (:meth:`_state`)
+        self.steps: Optional[torch.Tensor] = None
+        self.attempts: Optional[_Attempts] = None
+        #: label index -> position in ``phases`` (-1: not tracked), and env -> agent, on the device
+        self._phase_of_label: Optional[torch.Tensor] = None
+        self._env_agent: Optional[torch.Tensor] = None
         #: a routed phase's learner and per-phase residual metrics, held until its own publish
         self.held = {
             p: MetricAccumulator(self.num_agents, device=getattr(getattr(logger, "accumulator", None), "device", None),
@@ -120,6 +167,23 @@ class PhaseLogger:
         #: per env: its current attempt's steps and return (reset when the attempt ends)
         self._attempt_steps: Optional[torch.Tensor] = None
         self._attempt_return: Optional[torch.Tensor] = None
+
+    def _state(self, labels: torch.Tensor) -> None:
+        """The device state, created at the first step on the labels' device."""
+        if self.steps is not None:
+            return
+        n, device = labels.numel(), labels.device
+        if n != self.num_agents * self.envs_per_agent:
+            raise ValueError(f"phase logging: {n} labels for {self.num_agents} x {self.envs_per_agent} envs")
+        self.steps = torch.zeros((self.num_agents, len(self.phases)), dtype=torch.float64, device=device)
+        self.attempts = _Attempts(self.num_agents, len(self.phases), self.success_window, device)
+        lookup = torch.full((len(self.names),), -1, dtype=torch.long, device=device)
+        for position, phase in enumerate(self.phases):
+            lookup[self.index[phase]] = position
+        self._phase_of_label = lookup
+        self._env_agent = torch.arange(n, device=device) // self.envs_per_agent
+        self._attempt_steps = torch.zeros(n, dtype=torch.float64, device=device)
+        self._attempt_return = torch.zeros(n, dtype=torch.float64, device=device)
 
     # ------------------------------------------------------------------ names
     @staticmethod
@@ -198,92 +262,107 @@ class PhaseLogger:
         truncated: torch.Tensor,
         infos: Any,
         step: int,
-    ) -> None:
+        defer: bool = False,
+    ) -> Optional[torch.Tensor]:
         """One env step: ``labels`` the phase each env's step started in (the routed learner's), ``next_labels`` the
-        one it ended in (this step's ``infos``)."""
+        one it ended in (this step's ``infos``). Device work only, except the publish check: which (agent, phase)
+        crossed its publish cadence this step, a ``(num_agents, num_phases)`` bool tensor, read here (one host
+        synchronization) and acted on, or, with ``defer``, returned for the caller to read with its other host
+        values and hand to :meth:`publish_crossed`."""
         if labels is None or next_labels is None:
-            return
-        n = labels.numel()
-        if self._attempt_steps is None:
-            self._attempt_steps = torch.zeros(n, dtype=torch.float64)
-            self._attempt_return = torch.zeros(n, dtype=torch.float64)
-        now = labels.reshape(-1).to("cpu", torch.long)
-        nxt = next_labels.reshape(-1).to("cpu", torch.long)
-        done = (terminated.reshape(-1) | truncated.reshape(-1)).to("cpu", torch.bool)
+            return None
+        self._state(labels)
+        now = labels.reshape(-1).to(torch.long)
+        nxt = next_labels.reshape(-1).to(now.device, torch.long)
+        done = (terminated.reshape(-1) | truncated.reshape(-1)).to(now.device)
         self._attempt_steps += 1
-        self._attempt_return += rewards.reshape(-1).to("cpu", torch.float64)
+        self._attempt_return += rewards.reshape(-1).to(now.device, torch.float64)
         episode = (infos or {}).get("episode_metrics_to_log") or {} if isinstance(infos, dict) else {}
         success = episode.get("episode/success")
         oob = episode.get("episode/out_of_bounds")
+        known = (now >= 0) & (now < len(self.names))
+        phase = self._phase_of_label[now.clamp(0, len(self.names) - 1)]
+        tracked = known & (phase >= 0)
+        phase = phase.clamp(min=0)  # an untracked env's weight is 0 below, its position irrelevant
         ended = done | (nxt != now)
-        crossed = []
-        for env in range(n):
-            label = int(now[env])
-            phase = self.names[label] if 0 <= label < len(self.names) else None
-            if phase not in self.index:
-                if bool(ended[env]):
-                    self._attempt_steps[env] = 0.0
-                    self._attempt_return[env] = 0.0
-                continue
-            agent = env // self.envs_per_agent
-            before = self.steps[(agent, phase)]
-            self.steps[(agent, phase)] = before + 1
-            if (before + 1) % self.write_interval == 0:
-                crossed.append((agent, phase))
-            if bool(ended[env]):
-                if bool(done[env]):
-                    passed = float(success.reshape(-1)[env]) if success is not None else 0.0
-                    out = float(oob.reshape(-1)[env]) if oob is not None else float("nan")
-                else:
-                    passed, out = float(int(nxt[env]) > label), 0.0
-                self.attempts[(agent, phase)].add(passed, float(self._attempt_steps[env]), float(self._attempt_return[env]), out)
-                self._attempt_steps[env] = 0.0
-                self._attempt_return[env] = 0.0
-        for agent, phase in crossed:
-            if phase in self.held:
-                self._publish_phase(agent, phase, step)
+        agent = self._env_agent
+        before = self.steps.clone()
+        self.steps.index_put_((agent, phase), tracked.to(torch.float64), accumulate=True)
+        crossed = (self.steps // self.write_interval) > (before // self.write_interval)
+        finished = tracked & ended
+        zero = torch.zeros_like(self._attempt_return)
+        passed_done = success.reshape(-1).to(now.device, torch.float64) if success is not None else zero
+        out_done = oob.reshape(-1).to(now.device, torch.float64) if oob is not None else torch.full_like(zero, float("nan"))
+        passed = torch.where(done, passed_done, (nxt > now).to(torch.float64))
+        out = torch.where(done, out_done, zero)
+        self.attempts.add(agent, phase, finished, passed, self._attempt_steps, self._attempt_return, out)
+        self._attempt_steps = torch.where(ended, zero, self._attempt_steps)
+        self._attempt_return = torch.where(ended, zero, self._attempt_return)
+        if defer:
+            return crossed
+        self.publish_crossed(crossed.reshape(-1).tolist(), step)
+        return None
+
+    def publish_crossed(self, crossed: Sequence[float], step: int) -> None:
+        """Publish every routed (agent, phase) whose flag in ``crossed`` (``num_agents * num_phases`` host values, row
+        major, as :meth:`observe` returned them) is set."""
+        width = len(self.phases)
+        for flat, flag in enumerate(crossed):
+            if flag:
+                agent, position = divmod(flat, width)
+                phase = self.phases[position]
+                if phase in self.held:
+                    self._publish_phase(agent, phase, step)
 
     def _publish_phase(self, agent: int, phase: str, step: int) -> None:
         """A routed phase's point: its attempts, its held metrics and its step count, at the global ``step``."""
         values = dict(self.held[phase].flush(agents=[agent])[agent])
         values.update(self._attempt_values(agent, phase, f"{phase}_episode/"))
-        values[f"{phase}_step"] = float(self.steps[(agent, phase)])
+        values[f"{phase}_step"] = float(self.steps[agent, self.phases.index(phase)].item())
         self.logger.log_now(agent, values, step)
 
     def _attempt_values(self, agent: int, phase: str, prefix: str) -> Dict[str, float]:
-        a = self.attempts[(agent, phase)]
+        position = self.phases.index(phase)
+        a = self.attempts
+        read = a.read(agent, position)
         out: Dict[str, float] = {}
-        rate = a.rate()
+        rate = a.rate(agent, position, read)
         if rate is not None:
             out[f"{prefix}success"] = rate
-            a.best = rate if not a.best == a.best else max(a.best, rate)  # NaN before the first
-            out[f"{prefix}best_success_rate"] = a.best
-        if a.length:
-            out[f"{prefix}count"] = float(len(a.length))
-            for key, values in (("length", a.length), ("return", a.ret)):
-                out[f"{prefix}{key}"] = sum(values) / len(values)
-                out[f"{prefix}{key}_min"] = min(values)
-                out[f"{prefix}{key}_max"] = max(values)
-            oob = [v for v in a.oob if v == v]
-            if oob:
-                out[f"{prefix}out_of_bounds"] = sum(oob) / len(oob)
-        a.clear()
+            best = a.best[agent][position]
+            a.best[agent][position] = rate if not best == best else max(best, rate)  # NaN before the first
+            out[f"{prefix}best_success_rate"] = a.best[agent][position]
+        count = read["count"]
+        if count > 0:
+            out[f"{prefix}count"] = float(count)
+            out[f"{prefix}length"] = read["length"] / count
+            out[f"{prefix}length_min"] = read["length_min"]
+            out[f"{prefix}length_max"] = read["length_max"]
+            out[f"{prefix}return"] = read["ret"] / count
+            out[f"{prefix}return_min"] = read["return_min"]
+            out[f"{prefix}return_max"] = read["return_max"]
+            if read["oob_count"] > 0:
+                out[f"{prefix}out_of_bounds"] = read["oob"] / read["oob_count"]
+        a.clear(agent, position)
         return out
 
     # ------------------------------------------------------------------ the episodes' interval
     def on_global_flush(self, step: int) -> None:
         """Every ``trainer.write_interval`` env steps, before the logger's flush: each phase without a residual's
         attempts and step count into the ``episode`` family."""
+        if self.steps is None:
+            return
+        steps = self.steps.tolist()  # one read for every agent and phase
         for agent in range(self.num_agents):
             values: Dict[str, torch.Tensor] = {}
-            for phase in self.phases:
+            for position, phase in enumerate(self.phases):
                 if phase in self.held:
                     continue
-                a = self.attempts[(agent, phase)]
-                if a.success:
-                    values[f"episode/{phase}_success"] = torch.tensor(sum(a.success) / len(a.success))
-                    values[f"episode/{phase}_length"] = torch.tensor(sum(a.length) / len(a.length))
-                values[f"episode/{phase}_steps"] = torch.tensor(float(self.steps[(agent, phase)]))
-                a.clear()
+                read = self.attempts.read(agent, position)
+                if read["count"] > 0:
+                    values[f"episode/{phase}_success"] = torch.tensor(read["success"] / read["count"])
+                    values[f"episode/{phase}_length"] = torch.tensor(read["length"] / read["count"])
+                values[f"episode/{phase}_steps"] = torch.tensor(float(steps[agent][position]))
+                self.attempts.clear(agent, position)
             if values:
                 self.logger(agent, values, step)

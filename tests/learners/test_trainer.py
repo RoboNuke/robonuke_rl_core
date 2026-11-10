@@ -105,11 +105,17 @@ def test_without_the_flag_the_loop_is_skrls():
 
 
 def episodes_emitted(learner) -> list:
-    """Counts the ``episode/return`` values that reach the log hook: one per finished episode."""
+    """Counts the ``episode/return`` values that reach the log hook: one per finished episode (the channel carries
+    every env's value with NaN where the env did not finish; a step with none finished is not counted)."""
     counts: list = []
-    learner.on_log.append(
-        lambda agent, metrics, step: counts.append(metrics["episode/return"].numel()) if "episode/return" in metrics else None
-    )
+
+    def hook(agent, metrics, step):
+        if "episode/return" in metrics:
+            finite = int(torch.isfinite(metrics["episode/return"]).sum())
+            if finite:
+                counts.append(finite)
+
+    learner.on_log.append(hook)
     return counts
 
 

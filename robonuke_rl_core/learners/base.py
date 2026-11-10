@@ -30,6 +30,7 @@ from ..losses.losses import LossContext
 from ..memory.multi_random import MultiRandomMemory
 from ..models.normalizer import BlockRewardScaler, BlockRunningNorm
 from .cfg import TrainerCfg
+from .windows import push_window
 
 __all__ = [
     "LearnerBase",
@@ -183,11 +184,13 @@ class LearnerBase(Agent):
         self._success_window = (
             torch.full((num_agents, window), float("nan"), device=self.device) if window > 0 else None
         )
-        self._success_window_next = [0] * num_agents
+        self._success_window_next = torch.zeros(num_agents, dtype=torch.long, device=self.device)
         #: ``trainer.windowed_metrics``: the patterns, and per matching channel the same rolling window and next slot
         self._windowed_patterns = list(getattr(trainer_cfg, "windowed_metrics", None) or []) if window > 0 else []
         self._metric_windows: Dict[str, torch.Tensor] = {}
-        self._metric_window_next: Dict[str, List[int]] = {}
+        self._metric_window_next: Dict[str, torch.Tensor] = {}
+        #: env -> agent, for the device-side episode bookkeeping
+        self._env_agent = torch.arange(self.num_envs, device=self.device) // self.envs_per_agent
         #: the success rate of the interval that produced the current best checkpoint, and
         #: which agents produced a new best in the interval just flushed
         self._best_success: List[float] = [float("nan")] * num_agents
@@ -411,12 +414,11 @@ class LearnerBase(Agent):
         self._episode_return += rewards.reshape(-1)
         self._episode_length += 1.0
 
-        # The compaction below is the step's only host sync, and only when someone is
-        # listening: with no ``on_log`` hook the episode channels are skipped entirely.
-        slots = self._episode_slots(done) if self.on_log else None
-        if slots is not None:
-            self._emit_finished_episodes(slots, step)
-        self._forward_episode_metrics(infos, slots, step)
+        # Nothing here reads the device: an env that did not finish contributes NaN, which the accumulator and
+        # the windows skip (a ``nonzero`` of the finished envs would stall the CPU on the GPU every step)
+        if self.on_log:
+            self._emit_finished_episodes(done, step)
+        self._forward_episode_metrics(infos, done, step)
         self._fold_finished_episodes(done)
 
     def _forward_env_metrics(self, infos: Any, step: int) -> None:
@@ -429,77 +431,57 @@ class LearnerBase(Agent):
             hi = lo + self.envs_per_agent
             self.emit(agent, {name: value[lo:hi] for name, value in metrics.items()}, step)
 
-    def _forward_episode_metrics(
-        self, infos: Any, slots: Optional[List[torch.Tensor]], step: int
-    ) -> None:
-        """Forward ``infos["episode_metrics_to_log"]`` for the envs that finished this step.
+    def _forward_episode_metrics(self, infos: Any, done: torch.Tensor, step: int) -> None:
+        """Forward ``infos["episode_metrics_to_log"]`` for the envs that finished this step (``done``, ``(num_envs,)``
+        bool).
 
-        Each agent gets the compacted ``(k,)`` values of its own finished envs; an agent with
-        none gets nothing, so an interval without episodes publishes no point. Slots of envs
-        that did not finish are never read — an env may leave anything there.
+        Each agent gets its envs' values with NaN where the env did not finish: the accumulator counts finite
+        entries only, so an interval without episodes publishes no point, and a slot of an env that did not finish
+        is never read -- an env may leave anything there. All on the device.
         """
         metrics = self._env_metrics(infos, "episode_metrics_to_log")
-        if metrics is None or slots is None:
+        if metrics is None:
             return
         success = metrics.get(SUCCESS_METRIC)
         windowed = self._success_window is not None
-        for agent, index in enumerate(slots):
-            if index.numel() == 0:
-                continue
-            lo = agent * self.envs_per_agent
-            hi = lo + self.envs_per_agent
-            if success is not None:
-                # kept on device: the interval's single sync is in _flush_episode_stats
-                mine = success[lo:hi].index_select(0, index)
-                self._success_total[agent] += mine.sum()
-                self._success_count[agent] += mine.numel()
-                if windowed:
-                    self._push_success_window(agent, mine)
-            for name, value in metrics.items():
-                if self._is_windowed_metric(name):
-                    mine = value[lo:hi].index_select(0, index)
-                    mine = mine[torch.isfinite(mine)]  # NaN: no value for this episode, not counted
-                    if mine.numel():
-                        self._push_metric_window(name, agent, mine)
-            self.emit(
-                agent,
-                {
-                    name: value[lo:hi].index_select(0, index)
-                    for name, value in metrics.items()
-                    # windowed, the rate is published at the flush instead (_flush_episode_stats)
-                    if not (windowed and name == SUCCESS_METRIC) and not self._is_windowed_metric(name)
-                },
-                step,
-            )
+        blocks = (self.num_agents, self.envs_per_agent)
+        done_f = done.to(torch.float32)
+        if success is not None:
+            # kept on device: the interval's single sync is in _flush_episode_stats
+            self._success_total += (success.to(torch.float32) * done_f).view(blocks).sum(dim=1)
+            self._success_count += done_f.view(blocks).sum(dim=1)
+            if windowed:
+                self._push_success_window(done, success)
+        masked = {}
+        for name, value in metrics.items():
+            if self._is_windowed_metric(name):
+                # NaN: no value for this episode, not counted
+                self._push_metric_window(name, done & torch.isfinite(value), value)
+            elif not (windowed and name == SUCCESS_METRIC):
+                # windowed, the rate is published at the flush instead (_flush_episode_stats)
+                masked[name] = torch.where(done, value, torch.full_like(value, float("nan")))
+        if masked:
+            for agent in range(self.num_agents):
+                lo = agent * self.envs_per_agent
+                hi = lo + self.envs_per_agent
+                self.emit(agent, {name: value[lo:hi] for name, value in masked.items()}, step)
 
     def _is_windowed_metric(self, name: str) -> bool:
         """``trainer.windowed_metrics``: whether episode channel ``name`` is averaged over the rolling window."""
         return name != SUCCESS_METRIC and any(fnmatch.fnmatchcase(name, pattern) for pattern in self._windowed_patterns)
 
-    def _push_metric_window(self, name: str, agent: int, values: torch.Tensor) -> None:
-        """A ``windowed_metrics`` channel's newly finished episodes into the agent's rolling window for it."""
+    def _push_metric_window(self, name: str, finished: torch.Tensor, values: torch.Tensor) -> None:
+        """A ``windowed_metrics`` channel's newly finished episodes (``finished`` ``(num_envs,)`` bool) into each
+        agent's rolling window for it, on the device."""
         if name not in self._metric_windows:
             self._metric_windows[name] = torch.full_like(self._success_window, float("nan"))
-            self._metric_window_next[name] = [0] * self.num_agents
-        window = self._metric_windows[name]
-        size = window.shape[1]
-        start, count = self._metric_window_next[name][agent], values.numel()
-        kept = values[-size:].to(window.dtype)
-        first = start + count - kept.numel()
-        window[agent, (first + torch.arange(kept.numel(), device=self.device)) % size] = kept
-        self._metric_window_next[name][agent] = (start + count) % size
+            self._metric_window_next[name] = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
+        push_window(self._metric_windows[name], self._metric_window_next[name], self._env_agent, finished, values)
 
-    def _push_success_window(self, agent: int, values: torch.Tensor) -> None:
-        """Write an agent's newly finished episodes' successes into its rolling window,
-        overwriting the oldest. ``values.numel()`` is known on the host (the slots are), so
-        this adds no sync."""
-        size = self._success_window.shape[1]
-        start, count = self._success_window_next[agent], values.numel()
-        kept = values[-size:].to(self._success_window.dtype)  # more than N at once: the last N
-        first = start + count - kept.numel()
-        index = (first + torch.arange(kept.numel(), device=self.device)) % size
-        self._success_window[agent, index] = kept
-        self._success_window_next[agent] = (start + count) % size
+    def _push_success_window(self, finished: torch.Tensor, success: torch.Tensor) -> None:
+        """The finished envs' successes into their agents' rolling windows, overwriting the oldest (more than N
+        at once: the last N), on the device."""
+        push_window(self._success_window, self._success_window_next, self._env_agent, finished, success)
 
     def _env_metrics(self, infos: Any, key: str) -> Optional[Dict[str, torch.Tensor]]:
         """The validated ``infos[key]`` dict, or None when the env does not provide it."""
@@ -520,33 +502,16 @@ class LearnerBase(Agent):
         return metrics
 
     # ------------------------------------------------------------------ episode statistics
-    def _episode_slots(self, done: torch.Tensor) -> Optional[List[torch.Tensor]]:
-        """Local env indices of the envs that finished this step, per agent, or None if none."""
-        finished = torch.nonzero(done, as_tuple=False).flatten().tolist()
-        if not finished:
-            return None
-        per_agent: List[List[int]] = [[] for _ in range(self.num_agents)]
-        for env in finished:
-            per_agent[env // self.envs_per_agent].append(env % self.envs_per_agent)
-        return [
-            torch.tensor(local, dtype=torch.long, device=self.device) for local in per_agent
-        ]
-
-    def _emit_finished_episodes(self, slots: List[torch.Tensor], step: int) -> None:
-        """Emit the return and length of every episode that ended this step, per agent."""
-        for agent, index in enumerate(slots):
-            if index.numel() == 0:
-                continue
+    def _emit_finished_episodes(self, done: torch.Tensor, step: int) -> None:
+        """Emit the return and length of every episode that ended this step, per agent: its envs' values with NaN
+        where the env did not finish (the accumulator skips those), no host read."""
+        nan = torch.full_like(self._episode_return, float("nan"))
+        returns = torch.where(done, self._episode_return, nan)
+        lengths = torch.where(done, self._episode_length, nan)
+        for agent in range(self.num_agents):
             lo = agent * self.envs_per_agent
             hi = lo + self.envs_per_agent
-            self.emit(
-                agent,
-                {
-                    "episode/return": self._episode_return[lo:hi].index_select(0, index),
-                    "episode/length": self._episode_length[lo:hi].index_select(0, index),
-                },
-                step,
-            )
+            self.emit(agent, {"episode/return": returns[lo:hi], "episode/length": lengths[lo:hi]}, step)
 
     def _fold_finished_episodes(self, done: torch.Tensor) -> None:
         """Fold finished envs into their agent's interval sums, then reset those envs.
