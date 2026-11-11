@@ -144,8 +144,8 @@ def test_nothing_is_converted_to_python_before_flush(monkeypatch):
     for _ in range(4):
         accumulator.add(0, {"env/force": torch.ones(2), "episode/return": torch.tensor([3.0])})
         accumulator.add(1, {"env/force": torch.zeros(2)})
-    # the state is still device-side tensors
-    assert torch.is_tensor(accumulator._sums[0]["env/force"])
+    # the state is still device-side tensors (the tables, and the stacks queued for the next fold)
+    assert torch.is_tensor(accumulator._sum) and all(torch.is_tensor(stacked) for _, _, stacked in accumulator._pending)
     monkeypatch.undo()
 
     flushed = accumulator.flush()

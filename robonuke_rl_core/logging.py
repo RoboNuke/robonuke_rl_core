@@ -57,10 +57,22 @@ class MetricAccumulator:
 
     **A NaN means "not applicable", not "zero".** An episode that did not break has no break
     step; one that never succeeded has no time-to-success. Those entries are NaN and are
-    skipped — by the sum, the count and the min/max alike — so a metric that only some
+    skipped -- by the sum, the count and the min/max alike -- so a metric that only some
     episodes have still reports the right average over the episodes that have it. The count
     therefore lives on the device too, and is converted with everything else at flush.
+
+    **Batched, because the step is launch-bound.** The sums and counts are one ``(num_agents,
+    names)`` table each on the device. :meth:`add` only stacks the call's values per shape (one
+    copy per shape) and queues them; every ``COMMIT_EVERY`` queued stacks, and at :meth:`flush`,
+    the queue is folded into the tables in one pass per value width (one ``isfinite``, one masked
+    sum, one count, two ``index_add_``). Folding each metric of each agent as it arrived cost
+    ~8 kernel launches per metric and ~1500 per training step -- more than the replay memory
+    write it sits next to. No host synchronization at any point before :meth:`flush`: the row
+    indices of a fold reach the device through pinned memory.
     """
+
+    #: queued stacks that trigger a fold (bounds the queue when nothing flushes for a long time)
+    COMMIT_EVERY = 64
 
     def __init__(
         self,
@@ -73,21 +85,28 @@ class MetricAccumulator:
             raise ValueError(f"num_agents must be >= 1, got {num_agents}")
         self.num_agents = int(num_agents)
         self.device = torch.device(device) if device is not None else None
-        #: names that also publish ``<name>/min`` and ``<name>/max`` — for a metric whose
+        #: names that also publish ``<name>/min`` and ``<name>/max`` -- for a metric whose
         #: spread across envs says as much as its average (a return, an episode length, a Q)
         self.distributions = set(distributions)
         #: what joins a distribution's name and ``min`` / ``max`` (``"_"``: one ``/`` per name, phase logging's)
         self.sep = str(sep)
-        self._sums: List[Dict[str, torch.Tensor]] = [{} for _ in range(self.num_agents)]
-        #: finite entries seen, as a device tensor: counting them needs the NaN mask
-        self._counts: List[Dict[str, torch.Tensor]] = [{} for _ in range(self.num_agents)]
-        self._extremes: List[Dict[str, tuple]] = [{} for _ in range(self.num_agents)]
+        #: name -> column of the tables
+        self._columns: Dict[str, int] = {}
+        #: ``(num_agents, columns)`` float64 on the device: sums, finite counts, and for the distributions the
+        #: running min and max (+-inf where nothing was seen); None until the first value fixes the device
+        self._sum: Optional[torch.Tensor] = None
+        self._count: Optional[torch.Tensor] = None
+        self._low: Optional[torch.Tensor] = None
+        self._high: Optional[torch.Tensor] = None
+        #: queued (agent, names, stacked ``(len(names), width)`` float64 values), folded by :meth:`_commit`
+        self._pending: List[tuple] = []
 
+    # ------------------------------------------------------------------ in
     def add(self, agent: int, metrics: Dict[str, torch.Tensor]) -> None:
         """Fold one agent's metrics into the interval. No host sync."""
         if not 0 <= agent < self.num_agents:
             raise ValueError(f"agent {agent} is out of range for {self.num_agents} agents")
-        sums, counts = self._sums[agent], self._counts[agent]
+        by_width: Dict[int, tuple] = {}
         for name, value in metrics.items():
             if not torch.is_tensor(value):
                 raise TypeError(
@@ -96,68 +115,126 @@ class MetricAccumulator:
                 )
             if value.numel() == 0:
                 continue  # an interval with nothing in it publishes nothing
-
-            detached = value.detach().to(torch.float64)
-            if self.device is not None:
+            if name not in self._columns:
+                self._add_column(name)
+            names, values = by_width.setdefault(value.numel(), ([], []))
+            names.append(name)
+            values.append(value.detach().reshape(-1))
+        for width, (names, values) in by_width.items():
+            stacked = torch.stack(values).to(torch.float64)
+            if self.device is None:
+                self.device = stacked.device
+            if self._sum is None:
+                self._tables_to(self.device)
+            if stacked.device != self.device:
                 # a value from elsewhere (phase logging's host-side counts): every sum lives on one device
-                detached = detached.to(self.device)
-            finite = torch.isfinite(detached)
-            zero = torch.zeros((), dtype=detached.dtype, device=detached.device)
-            total = torch.where(finite, detached, zero).sum()
-            count = finite.sum().to(torch.float64)
-            if name in sums:
-                sums[name] = sums[name] + total
-                counts[name] = counts[name] + count
-            else:
-                sums[name] = total
-                counts[name] = count
-            if name in self.distributions:
-                infinity = torch.full((), float("inf"), dtype=detached.dtype, device=detached.device)
-                low = torch.where(finite, detached, infinity).min()
-                high = torch.where(finite, detached, -infinity).max()
-                seen = self._extremes[agent].get(name)
-                self._extremes[agent][name] = (
-                    (low, high)
-                    if seen is None
-                    else (torch.minimum(seen[0], low), torch.maximum(seen[1], high))
-                )
+                stacked = stacked.to(self.device)
+            self._pending.append((agent, names, stacked))
+        if len(self._pending) >= self.COMMIT_EVERY:
+            self._commit()
 
+    def _add_column(self, name: str) -> None:
+        self._commit()  # the queued stacks index the tables as they are
+        self._columns[name] = len(self._columns)
+        if self._sum is not None:
+            self._grow(1)
+
+    def _grow(self, by: int) -> None:
+        n, device = self.num_agents, self._sum.device
+        self._sum = torch.cat((self._sum, torch.zeros(n, by, dtype=torch.float64, device=device)), dim=1)
+        self._count = torch.cat((self._count, torch.zeros(n, by, dtype=torch.float64, device=device)), dim=1)
+        self._low = torch.cat((self._low, torch.full((n, by), float("inf"), dtype=torch.float64, device=device)), dim=1)
+        self._high = torch.cat((self._high, torch.full((n, by), -float("inf"), dtype=torch.float64, device=device)), dim=1)
+
+    def _tables_to(self, device) -> None:
+        n, k = self.num_agents, len(self._columns)
+        self._sum = torch.zeros(n, k, dtype=torch.float64, device=device)
+        self._count = torch.zeros(n, k, dtype=torch.float64, device=device)
+        self._low = torch.full((n, k), float("inf"), dtype=torch.float64, device=device)
+        self._high = torch.full((n, k), -float("inf"), dtype=torch.float64, device=device)
+
+    def _commit(self) -> None:
+        """Fold the queued stacks into the tables: one pass per value width, no host sync."""
+        if not self._pending:
+            return
+        from robonuke_rl_core.learners.windows import stage_to_device
+
+        pending, self._pending = self._pending, []
+        k = len(self._columns)
+        by_width: Dict[int, list] = {}
+        for agent, names, stacked in pending:
+            by_width.setdefault(stacked.shape[1], []).append((agent, names, stacked))
+        for width, group in by_width.items():
+            values = torch.cat([stacked for _, _, stacked in group])
+            flat = [agent * k + self._columns[name] for agent, names, _ in group for name in names]
+            index = torch.empty(len(flat), dtype=torch.long, device=values.device)
+            stage_to_device(index, flat)
+            finite = torch.isfinite(values)
+            total = torch.where(finite, values, torch.zeros((), dtype=values.dtype, device=values.device)).sum(dim=1)
+            self._sum.view(-1).index_add_(0, index, total)
+            self._count.view(-1).index_add_(0, index, finite.sum(dim=1).to(torch.float64))
+            spread = self._spread_rows(group)
+            if spread:
+                pick = torch.empty(len(spread), dtype=torch.long, device=values.device)
+                stage_to_device(pick, spread)
+                where = index[pick]
+                infinity = torch.full((), float("inf"), dtype=values.dtype, device=values.device)
+                low = torch.where(finite, values, infinity).amin(dim=1)[pick]
+                high = torch.where(finite, values, -infinity).amax(dim=1)[pick]
+                self._low.view(-1).scatter_reduce_(0, where, low, reduce="amin")
+                self._high.view(-1).scatter_reduce_(0, where, high, reduce="amax")
+
+    def _spread_rows(self, group) -> List[int]:
+        """Rows of a width group's stacked values whose name is a distribution."""
+        rows, at = [], 0
+        for _, names, _ in group:
+            for name in names:
+                if name in self.distributions:
+                    rows.append(at)
+                at += 1
+        return rows
+
+    # ------------------------------------------------------------------ out
     def flush(self, agents: Optional[Iterable[int]] = None) -> List[Dict[str, float]]:
         """Mean per (agent, name) for the interval, then clear. One sync for everything. ``agents``: only these agents'
         (the others keep accumulating; their entries in the result are empty)."""
         chosen = list(range(self.num_agents)) if agents is None else [int(a) for a in agents]
-        keys = [(agent, name) for agent in chosen for name in self._sums[agent]]
-        if not keys:
-            self._clear(chosen)
-            return [{} for _ in range(self.num_agents)]
-        # one sync for everything: the sums, then the counts, then each distribution's extremes
-        tensors = [self._sums[agent][name] for agent, name in keys]
-        tensors += [self._counts[agent][name] for agent, name in keys]
-        spread = [(agent, name) for agent, name in keys if name in self._extremes[agent]]
-        for agent, name in spread:
-            tensors.extend(self._extremes[agent][name])
-        values = torch.stack(tensors).tolist()
-
+        self._commit()
         out: List[Dict[str, float]] = [{} for _ in range(self.num_agents)]
-        counts = {}
-        for index, (agent, name) in enumerate(keys):
-            total, count = values[index], values[len(keys) + index]
-            counts[(agent, name)] = count
-            if count > 0:  # every entry was NaN: the interval has nothing to say about it
-                out[agent][name] = total / count
-        rest = values[2 * len(keys) :]
-        for index, (agent, name) in enumerate(spread):
-            if counts[(agent, name)] > 0:
-                out[agent][f"{name}{self.sep}min"] = rest[2 * index]
-                out[agent][f"{name}{self.sep}max"] = rest[2 * index + 1]
+        if self._sum is None or not self._columns or not chosen:
+            self._clear(chosen)
+            return out
+        rows = torch.as_tensor(chosen, dtype=torch.long)
+        if self._sum.device.type != "cpu":
+            rows = rows.to(self._sum.device, non_blocking=True)
+        # one sync for everything: the sums, the counts, the extremes of the chosen agents
+        values = torch.stack((self._sum[rows], self._count[rows], self._low[rows], self._high[rows])).tolist()
+        names = sorted(self._columns, key=self._columns.get)
+        for i, agent in enumerate(chosen):
+            sums, counts, lows, highs = values[0][i], values[1][i], values[2][i], values[3][i]
+            for name, column in self._columns.items():
+                if counts[column] > 0:  # every entry was NaN (or none came): the interval has nothing to say about it
+                    out[agent][name] = sums[column] / counts[column]
+            for name in names:
+                column = self._columns[name]
+                if name in self.distributions and counts[column] > 0:
+                    out[agent][f"{name}{self.sep}min"] = lows[column]
+                    out[agent][f"{name}{self.sep}max"] = highs[column]
         self._clear(chosen)
         return out
 
     def _clear(self, agents: Optional[Iterable[int]] = None) -> None:
-        for agent in (range(self.num_agents) if agents is None else agents):
-            self._sums[agent] = {}
-            self._counts[agent] = {}
-            self._extremes[agent] = {}
+        chosen = list(range(self.num_agents)) if agents is None else list(agents)
+        self._pending = [entry for entry in self._pending if entry[0] not in chosen]
+        if self._sum is None or not chosen:
+            return
+        rows = torch.as_tensor(chosen, dtype=torch.long)
+        if self._sum.device.type != "cpu":
+            rows = rows.to(self._sum.device, non_blocking=True)
+        self._sum[rows] = 0.0
+        self._count[rows] = 0.0
+        self._low[rows] = float("inf")
+        self._high[rows] = -float("inf")
 
 
 def _version_tuple(raw: Any) -> tuple:

@@ -205,7 +205,14 @@ target uses in place of `gamma`. With n_step 1 nothing of it runs. Tests:
 **The update is launch-bound at small batches**, so three things keep it on the GPU in few
 launches: the stacked critics, `torch._foreach_*` in `BlockAdamW`'s unmasked step and the
 Polyak update, and `sac.cuda_graph`, which captures `SAC._gradient_step` per mode
-(`learners/cuda_graph.py: StepGraphs`) and replays it. A graphed step must stay device-only:
+(`learners/cuda_graph.py: StepGraphs`) and replays it. **With large critics it is
+memory-bound instead**: on CUDA `BlockAdamW` runs the per-tensor masked update as one
+`torch.compile`d kernel (`optim.py: adamw_tensor_`, compiled at construction by a dry run with
+every agent frozen, which writes nothing new), so each parameter and its moments are streamed
+once per step rather than a dozen times. It needs Dynamo on (the optimizer refuses
+`TORCHDYNAMO_DISABLE`) and a C compiler for Triton (the HPC image carries `gcc`); the eager
+`adamw_tensor_` is the CPU path and the reference the CUDA tests compare against. A graphed
+step must stay device-only:
 no host sync, no Python value read from a tensor, and **state written in place** (the
 normalizer's stats, the entropy coefficient, the LRs) — a reassigned tensor leaves the graph
 reading the old one. The memory's size reaches it through `sync_size` / `sample_graph_safe`.
@@ -545,10 +552,13 @@ wrapper that taps the env's own hooks. Nothing re-derives another component's nu
 
 `logging.py` holds the whole logging layer; the learners only route.
 
-* `MetricAccumulator` keeps per `(agent, name)` sums on the device and counts on the host
-  between flushes, so no metric costs a GPU->CPU sync when it is emitted. `flush()` converts
-  the whole interval in one `tolist()` and returns the mean per agent, skipping any name whose
-  count is zero.
+* `MetricAccumulator` keeps the per `(agent, name)` sums and finite counts as two device tables
+  between flushes, so no metric costs a GPU->CPU sync when it is emitted, and folds them in
+  batches: `add()` only stacks a call's values per shape and queues them; the queue is folded
+  into the tables in one pass per value width (`_commit`, every 64 queued stacks and at the
+  flush). Folding each metric as it arrived was ~8 launches per metric, ~1500 per training step.
+  `flush()` converts the whole interval in one `tolist()` and returns the mean per agent,
+  skipping any name whose count is zero.
 * `WandbLogger` owns one wandb run per agent (`derived.run_names`, grouped by `wandb.group`,
   with the resolved config attached) and is itself the `on_log` hook; `flush` is the `on_flush`
   hook, `checkpoint` is the `on_checkpoint` hook and `close()` finishes the runs.

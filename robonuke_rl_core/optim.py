@@ -11,17 +11,86 @@ decay first, ``eps`` added to the bias-corrected second moment outside the sqrt)
 Freezing: ``step(keep)`` computes the full update and writes it only where ``keep`` is true.
 A frozen agent comes out bit-identical — weights, both moments, and its step count — so
 neither momentum nor weight decay can move it while another agent trains.
+
+On CUDA the per-tensor update runs as one fused kernel per parameter (:func:`adamw_tensor_`
+through ``torch.compile``): the eager version is a dozen elementwise kernels that each stream
+the parameter, its gradient or a moment through memory — with large critics the update is
+bound by that traffic, not by arithmetic — and the fused one reads the four tensors once and
+writes the three it changes once. Same expression, same ``keep`` masking, so a frozen agent
+stays bit-identical; a stepped agent differs from the eager result only by floating-point
+reordering. The kernels are compiled at construction (a dry run with every agent frozen, which
+changes nothing), so a later CUDA-graph capture of a gradient step finds them ready. The CPU
+path stays eager.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import torch
 import torch.nn as nn
 
-__all__ = ["BlockAdamW", "lr_at", "clip_grad_norm_per_agent"]
+__all__ = ["BlockAdamW", "adamw_tensor_", "lr_at", "clip_grad_norm_per_agent"]
+
+
+def adamw_tensor_(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    decay: torch.Tensor,
+    step_size: torch.Tensor,
+    bias_correction2_sqrt: torch.Tensor,
+    keep: torch.Tensor,
+    beta1: float,
+    beta2: float,
+    eps: float,
+) -> None:
+    """One AdamW step on one stacked parameter, in place, for the agents ``keep`` marks.
+
+    ``torch.optim.AdamW``'s single-tensor path op for op (decoupled weight decay first, ``eps``
+    added to the bias-corrected second moment outside the sqrt). ``decay``, ``step_size`` and
+    ``bias_correction2_sqrt`` are per-agent ``(N,)`` in the parameter's dtype; ``keep`` is
+    ``(N,)`` bool. Where ``keep`` is false the parameter and both moments are written back
+    unchanged. Eager on the CPU; :class:`BlockAdamW` runs it compiled on CUDA.
+    """
+    view = (-1,) + (1,) * (param.dim() - 1)  # broadcast the per-agent scalars
+    new_param = param * decay.view(view)
+    new_exp_avg = exp_avg.lerp(grad, 1.0 - beta1)
+    new_exp_avg_sq = torch.addcmul(exp_avg_sq * beta2, grad, grad, value=1.0 - beta2)
+    denom = new_exp_avg_sq.sqrt() / bias_correction2_sqrt.view(view) + eps
+    new_param = new_param - step_size.view(view) * new_exp_avg / denom
+    keep_view = keep.view(view)
+    param.copy_(torch.where(keep_view, new_param, param))
+    exp_avg.copy_(torch.where(keep_view, new_exp_avg, exp_avg))
+    exp_avg_sq.copy_(torch.where(keep_view, new_exp_avg_sq, exp_avg_sq))
+
+
+_fused_adamw_tensor_: Optional[Callable[..., None]] = None
+
+
+def _fused() -> Callable[..., None]:
+    """The compiled :func:`adamw_tensor_`, built once per process. ``dynamic=True``: one graph per
+    tensor rank, whatever the sizes, so the optimizers of a run never exhaust Dynamo's cache."""
+    global _fused_adamw_tensor_
+    if _fused_adamw_tensor_ is None:
+        import os
+
+        import torch._dynamo
+
+        if torch._dynamo.config.disable or os.environ.get("TORCHDYNAMO_DISABLE", "") not in ("", "0"):
+            # torch.compile would hand the eager function back and the update would silently run
+            # a dozen kernels per parameter; the environment has to allow Dynamo (hpc_job.bash does)
+            raise RuntimeError(
+                "BlockAdamW's fused CUDA step needs torch.compile, but Dynamo is disabled "
+                "(TORCHDYNAMO_DISABLE / torch._dynamo.config.disable). Enable it, or build the "
+                "optimizer on the CPU for the eager path."
+            )
+        # one entry per (rank, dtype) pair in use; the default of 8 is a silent fall-back to eager
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+        _fused_adamw_tensor_ = torch.compile(adamw_tensor_, dynamic=True, fullgraph=True)
+    return _fused_adamw_tensor_
 
 
 class BlockAdamW:
@@ -70,6 +139,25 @@ class BlockAdamW:
         self.t = torch.zeros(num_agents, device=device, dtype=torch.int64)
         self.exp_avg = [torch.zeros_like(p, memory_format=torch.preserve_format) for p in params]
         self.exp_avg_sq = [torch.zeros_like(p, memory_format=torch.preserve_format) for p in params]
+        #: CUDA: the per-tensor step is the fused kernel (module docstring); CPU: eager
+        self.fused = device.type == "cuda"
+        self._all = torch.ones(num_agents, device=device, dtype=torch.bool)
+        if self.fused:
+            self._compile()
+
+    @torch.no_grad()
+    def _compile(self) -> None:
+        """Compile the fused kernel for every parameter now: a step with every agent frozen and zero
+        gradients, which writes every tensor back unchanged. A CUDA-graph capture of a later step
+        must not be the first call of a shape (Triton compiles and benchmarks outside captures)."""
+        had_grad = [p.grad for p in self.params]
+        for param in self.params:
+            param.grad = torch.zeros_like(param)
+        try:
+            self._step_tensors(torch.zeros(self.num_agents, device=self.t.device, dtype=torch.bool))
+        finally:
+            for param, grad in zip(self.params, had_grad):
+                param.grad = grad
 
     # ------------------------------------------------------------------ the step
     def zero_grad(self) -> None:
@@ -108,38 +196,28 @@ class BlockAdamW:
                     "gradient. Every parameter must take part in the loss; call backward "
                     "before step."
                 )
-        if mask is None:
+        if mask is None and not self.fused:
             self._step_foreach(decay, step_size, bias_correction2_sqrt)
-            self.t += advance
-            return
-
-        for index, param in enumerate(self.params):
-            grad = param.grad
-            view = (-1,) + (1,) * (param.dim() - 1)  # broadcast the per-agent scalars
-            dtype = param.dtype
-            exp_avg = self.exp_avg[index]
-            exp_avg_sq = self.exp_avg_sq[index]
-
-            # torch.optim.AdamW, single-tensor path, op for op
-            new_param = param * decay.to(dtype).view(view)
-            new_exp_avg = exp_avg.lerp(grad, 1.0 - self.beta1)
-            new_exp_avg_sq = torch.addcmul(
-                exp_avg_sq * self.beta2, grad, grad, value=1.0 - self.beta2
-            )
-            denom = new_exp_avg_sq.sqrt() / bias_correction2_sqrt.to(dtype).view(view) + self.eps
-            new_param = new_param - step_size.to(dtype).view(view) * new_exp_avg / denom
-
-            if mask is None:
-                param.copy_(new_param)
-                exp_avg.copy_(new_exp_avg)
-                exp_avg_sq.copy_(new_exp_avg_sq)
-            else:
-                keep_view = mask.view(view)
-                param.copy_(torch.where(keep_view, new_param, param))
-                exp_avg.copy_(torch.where(keep_view, new_exp_avg, exp_avg))
-                exp_avg_sq.copy_(torch.where(keep_view, new_exp_avg_sq, exp_avg_sq))
-
+        else:
+            self._step_tensors(self._all if mask is None else mask, decay, step_size, bias_correction2_sqrt)
         self.t += advance
+
+    def _step_tensors(self, keep, decay=None, step_size=None, bias_correction2_sqrt=None) -> None:
+        """The per-tensor step (:func:`adamw_tensor_`) over every parameter, fused on CUDA; the
+        per-agent scalars default to those of a first step (the compile-time dry run)."""
+        if decay is None:
+            ones = torch.ones(self.num_agents, device=self.t.device, dtype=torch.float64)
+            decay, step_size, bias_correction2_sqrt = ones, ones * 0.0, ones
+        update = _fused() if self.fused else adamw_tensor_
+        scalars: Dict[torch.dtype, tuple] = {}
+        for index, param in enumerate(self.params):
+            if param.dtype not in scalars:
+                scalars[param.dtype] = tuple(v.to(param.dtype) for v in (decay, step_size, bias_correction2_sqrt))
+            # the parameter goes in detached: Dynamo specializes an nn.Parameter's shape
+            # (force_parameter_static_shapes), which would mean one compile per parameter; the
+            # alias shares the storage, so the in-place write is the parameter's
+            update(param.detach(), param.grad, self.exp_avg[index], self.exp_avg_sq[index], *scalars[param.dtype],
+                   keep, self.beta1, self.beta2, self.eps)
 
     def _step_foreach(self, decay, step_size, bias_correction2_sqrt) -> None:
         """The unmasked step over every parameter at once (``torch._foreach_*``: one launch

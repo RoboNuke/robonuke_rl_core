@@ -49,11 +49,13 @@ From: ubuntu:22.04
 
     # ---- system libraries ------------------------------------------------------------
     # The GL/X/Vulkan set is what the Isaac Sim binaries link (ldd on the reference env),
-    # plus ffmpeg (the recorder), git (the package stamps every run with its commit), and
-    # vulkan-tools for `vulkaninfo`, the first thing to run when rendering misbehaves.
+    # plus ffmpeg (the recorder), git (the package stamps every run with its commit),
+    # vulkan-tools for `vulkaninfo`, the first thing to run when rendering misbehaves, and
+    # gcc + libc6-dev: Triton builds its kernel launcher with the system C compiler, and the
+    # package's optimizer step is a torch.compile'd (Triton) kernel on CUDA (optim.py).
     apt-get update
     apt-get install -y --no-install-recommends \
-        ca-certificates curl bzip2 git ffmpeg \
+        ca-certificates curl bzip2 git ffmpeg gcc libc6-dev \
         libgl1 libglu1-mesa libglx0 libopengl0 libegl1 libvulkan1 vulkan-tools \
         libx11-6 libx11-xcb1 libxt6 libxext6 libsm6 libice6 libxi6 libxrandr2 \
         libxinerama1 libxcursor1 libxrender1 libxcb-randr0 \
@@ -151,7 +153,6 @@ PYEOF
     export PATH=/opt/conda/envs/general/bin:/opt/conda/bin:${PATH}
     export PYTHONNOUSERSITE=1
     export OMNI_KIT_ACCEPT_EULA=YES
-    export TORCHDYNAMO_DISABLE=1
     export PYTHONUNBUFFERED=1
     export ISAACLAB_PATH=/opt/IsaacLab
     export RNK_IMAGE_FLAVOR=@FLAVOR@
@@ -168,6 +169,8 @@ PYEOF
     python -c "import torch; print('torch', torch.__version__, 'archs', torch.cuda.get_arch_list())"
     python -c "import isaaclab; print('isaaclab', isaaclab.__version__)"
     python -c "import omegaconf, wandb, skrl, diffusers, pyarrow, imageio_ffmpeg; print('deps ok')"
+    python -c "import triton; print('triton', triton.__version__)"
+    gcc --version | head -n 1
     git --version
     ffmpeg -version | head -n 1
 

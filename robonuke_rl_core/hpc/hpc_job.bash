@@ -205,7 +205,6 @@ if [[ -n "${RNK_CHAIN_SCRIPT}" ]]; then
         "${bind_args[@]}" \
         --env PYTHONPATH="${container_pythonpath}" \
         --env OMNI_KIT_ACCEPT_EULA=YES \
-        --env TORCHDYNAMO_DISABLE=1 \
         --env PYTHONUNBUFFERED=1 \
         "${image}" bash /opt/hpc_job_chain.bash "$@"
 fi
@@ -215,6 +214,5 @@ exec "${RNK_APPTAINER_BIN}" exec --nv --writable-tmpfs \
     "${bind_args[@]}" \
     --env PYTHONPATH="${container_pythonpath}" \
     --env OMNI_KIT_ACCEPT_EULA=YES \
-    --env TORCHDYNAMO_DISABLE=1 \
     --env PYTHONUNBUFFERED=1 \
     "${image}" "$@"

@@ -8,7 +8,9 @@ Several agents train in parallel in one Isaac Sim instance on one GPU. Agent `i`
 contiguous block of envs; the models are ordinary single-agent `nn.Module`s stacked with
 `torch.vmap` so every agent runs in one pass, one `BlockAdamW` is N independent AdamW
 instances over the stacked parameters, and nothing computed from agent `j`'s data touches
-agent `i`'s update.
+agent `i`'s update. On CUDA its step is one `torch.compile`d kernel per parameter (the eager
+update is a dozen memory-bound passes per parameter; with large critics that was most of the
+update's GPU time), masked exactly as before: an agent that is not due stays bit-identical.
 
 Built area by area. Today: the config manager (`robonuke_rl_core/config.py`), the learners
 (`learners/`), the models (`models/`), the optimizer (`optim.py`), the memory (`memory/`) and
@@ -662,7 +664,9 @@ cluster up end to end: the `~/hpc-share/robonuke/` layout, the research clones, 
 (`general-cu128.sif`, and `general-cu126.sif` for the V100s of dgx2, built on a compute node
 by `hpc/build_image.sh`), and `hpc/verify_partitions.sh`, one smoke job per partition. It
 prints the `hpc:` block below with your paths. `examples/hpc.yaml` is that block for the OSU
-CoE cluster.
+CoE cluster. The image carries `gcc`: the optimizer's fused step is a Triton kernel, and Triton
+builds its launcher with the system C compiler; the job leaves Dynamo enabled for the same
+reason (`BlockAdamW` refuses to run with `TORCHDYNAMO_DISABLE` set).
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |
