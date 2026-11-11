@@ -77,3 +77,22 @@ def test_the_memory_writes_kept_rows_without_a_host_read():
     assert memory.fills() == [3, 2] and memory.size == 2
     x = memory.get_tensor_by_name("x")
     assert x[0, :3, 0].tolist() == [0.0, 10.0, 11.0] and x[1, :2, 0].tolist() == [2.0, 3.0]
+
+
+def test_a_shared_warmup_step_synchronizes_once():
+    """DDPG's shared_warmup writes every env's row to every agent's memory (one add_rows per agent offset): still
+    the one combined read."""
+    learner = build_learner(
+        "ddpg", num_agents=2, envs_per_agent=3, device="cuda", architecture="mlp", std_by_label="eval_state/phase/id",
+        std_label_names=["corner", "grasp"], route_label="grasp", route_clock=True, learning_starts_rows=50,
+        shared_warmup=True,
+    )
+    n = learner.num_envs
+    labels = torch.tensor([0, 1, 1, 0, 0, 1], dtype=torch.float32, device="cuda")
+    _step(learner, n, labels)
+    _step(learner, n, labels)
+    with _Count() as c:
+        _step(learner, n, labels)
+    assert len(c.syncs) == 1, c.syncs
+    fills = learner.memory.fills()
+    assert fills[0] == fills[1] == 6  # every env's grasp row (3 per step, 2 stored steps) in both agents' memories
