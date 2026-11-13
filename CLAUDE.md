@@ -263,7 +263,8 @@ trainer) is refused by `record_transition`. With no request the loop is skrl's.
 `tests/learners/test_trainer.py` drives it on CPU against a fake vectorized env.
 
 **Several agents (`experiment.num_agents` > 1) keep separate schedules.** Each agent has its own `route_clock` (its
-envs' steps in the phase), its own `learning_starts_rows` (its own online rows), and its own update and `policy_delay`
+envs' steps in the phase -- every agent's envs' while `shared_warmup` pools the rows: the steps its memory received
+rows for, counted on the labels at step time), its own `learning_starts_rows` (its own online rows), and its own update and `policy_delay`
 counts and LR schedule. DDPG adds its own uniform warm-up (`random_action_scale`) and critic warm-up burst
 (`critic_warmup_updates`) per agent. An update steps only the agents that are due. Every optimizer step and every
 target update (critics and the target actor) is masked to those agents, so an agent that is not due keeps its weights,

@@ -147,6 +147,11 @@ def masked_lerp_(targets, sources, weight: float, keep: torch.Tensor) -> None:
         target.lerp_(source, w)
 
 
+def _due_indices(since: int, every: int) -> int:
+    """How many update indices ``0, every, 2 * every, ...`` lie in ``[0, since]`` (none for a negative ``since``)."""
+    return since // every + 1 if since >= 0 else 0
+
+
 class SAC(LearnerBase):
     #: the learner has an entropy temperature (``entropy/coefficient``); DDPG has none
     HAS_TEMPERATURE = True
@@ -619,6 +624,10 @@ class SAC(LearnerBase):
         if not hasattr(self, "_agent_route_steps"):  # the clocks and the data outlive a rebuild of the optimizers
             self._agent_route_steps = [0] * n
             self._agent_route_now = [False] * n
+            #: this step's phase steps per agent (what the clock just advanced by) and whether this step's rows were
+            #: pooled into every agent's memory (DDPG shared_warmup), as record_transition decided
+            self._agent_route_count_now = [0] * n
+            self._pooled_now = False
             self._agent_rows_ready = [False] * n
             #: the step's host read (_read_host): each agent's memory fill and the env episodes finished so far, as
             #: the update decision last saw them; None before the first training step
@@ -944,9 +953,10 @@ class SAC(LearnerBase):
         return torch.where(keep, actions, torch.zeros_like(actions))
 
     def _emit_interval_metrics(self, timestep: int) -> None:
-        """A routed residual's progress, every ``write_interval`` from the first step (before it learns too): the agent
-        steps that started in its phase (an agent step is residual.steps_per_chunk env steps), its replay rows (demos
-        included) and its gradient updates."""
+        """A routed residual's progress, every ``write_interval`` from the first step (before it learns too): its phase
+        steps (the env steps that started in its phase, its own envs' -- every agent's while the rows are pooled --,
+        i.e. the steps its memory received rows for; an env step is residual.steps_per_chunk sim steps), its replay
+        rows (demos included) and its gradient updates."""
         if not self.cfg.route_label:
             return
         sizes = self._fills()
@@ -994,6 +1004,7 @@ class SAC(LearnerBase):
             # the label of the observation the next act() sees
             self._std_labels = self._std_labels_from(infos)
 
+        self._pooled_now = False
         if not self.training:
             return
         env_terminated, env_truncated = terminated, truncated
@@ -1012,15 +1023,22 @@ class SAC(LearnerBase):
             extra["next_states"] = next_states
         extra.update(self.aux_memory_values(infos))
         extra.update(self._side_input_values(infos, observations.shape[0]))
-        route_now_t = None
+        # shared_warmup (DDPG): this step's rows go to every agent's memory; decided once, for the write and the clock
+        pooled = self._pool_warmup_rows(timestep)
+        self._pooled_now = pooled
+        route_count_t = None
         if self.cfg.route_label:
-            # route_clock: this step is one of this residual's own when an env starts it in the route's label; per
-            # agent, one of its envs. Read to the host with the step's single read (_read_host), below
+            # route_clock: per agent, its phase steps this step -- how many of its envs start the step in the route's
+            # label, which is how many rows its memory receives; pooled, every agent receives every env's, so every
+            # agent counts them all. Counted on the labels at step time (never from the memory: n_step delays the
+            # rows, a full memory keeps no count). Read to the host with the step's single read (_read_host), below
             index = self.cfg.std_label_names.index(self.cfg.route_label)
             if start_labels is None:
-                route_now_t = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
+                route_count_t = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
             else:
-                route_now_t = (start_labels.reshape(self.num_agents, -1) == index).any(dim=1)
+                route_count_t = (start_labels.reshape(self.num_agents, -1) == index).sum(dim=1)
+                if pooled:
+                    route_count_t = route_count_t.sum().expand(self.num_agents)
         if self.cfg.demo_storage == "memory_critic":
             extra["is_demo"] = torch.zeros(observations.shape[0], 1, device=self.device)
         if self.cfg.hold_still_key:
@@ -1055,31 +1073,36 @@ class SAC(LearnerBase):
             **extra,
         )
         if self._n_step_window is not None:
-            # the n-step row of the step n - 1 back, once the window holds n steps
+            # the n-step row of the step n - 1 back, once the window holds n steps (none before then: the step still
+            # counts on the route clock and the host read still runs)
             row = self._n_step_window.push(row)
-            if row is None:
-                return
+        if row is not None:
+            self._store_row(row, pooled, observations.shape[0])
+        self._read_host(route_count_t)
+
+    def _store_row(self, row: Dict[str, torch.Tensor], pooled: bool, num_envs: int) -> None:
+        """One env-step's rows into the memory: held (``hold_still_key``), the listed phases' only (``store_labels`` /
+        the route), or all; ``pooled`` writes every kept row to every agent's memory (DDPG ``shared_warmup``)."""
         if self.cfg.hold_still_key:
             self._write_holding(row)
         elif "_keep" in row:  # store_labels: only the transitions starting in a listed phase
             keep = row.pop("_keep").reshape(-1) > 0.5
-            if self._pool_warmup_rows(timestep):
+            if pooled:
                 self._add_pooled(keep, row)
             else:
                 self.memory.add_rows(keep, **row)
-        elif self._pool_warmup_rows(timestep):
-            self._add_pooled(torch.ones(observations.shape[0], dtype=torch.bool, device=self.device), row)
+        elif pooled:
+            self._add_pooled(torch.ones(num_envs, dtype=torch.bool, device=self.device), row)
         else:
             self.memory.add_samples(**row)
-        self._read_host(route_now_t)
 
     # ------------------------------------------------------------------ the step's single host read
-    def _host_read_values(self, route_now_t: Optional[torch.Tensor]) -> torch.Tensor:
-        """What the update decision needs from the device this step, as one float tensor: per agent whether it
-        stepped in its route's label (``route_clock``), per agent its memory fill (``learning_starts_rows``), and the
-        env episodes finished so far (``warmup_episodes``)."""
+    def _host_read_values(self, route_count_t: Optional[torch.Tensor]) -> torch.Tensor:
+        """What the update decision needs from the device this step, as one float tensor: per agent its phase steps
+        this step (``route_clock``: its envs that started the step in the route's label, every env's when pooled), per
+        agent its memory fill (``learning_starts_rows``), and the env episodes finished so far (``warmup_episodes``)."""
         n = self.num_agents
-        route = route_now_t.to(torch.float32) if route_now_t is not None else torch.zeros(n, device=self.device)
+        route = route_count_t.to(torch.float32) if route_count_t is not None else torch.zeros(n, device=self.device)
         return torch.cat((route, self.memory.fills_on_device().to(torch.float32), self.memory.written_on_device().to(torch.float32),
                           self._finished_count_t.to(torch.float32).view(1)))
 
@@ -1090,16 +1113,18 @@ class SAC(LearnerBase):
         self._written_now = [int(v) for v in values[2 * n : 3 * n]]
         self._finished_episodes = int(values[3 * n])
         if self.cfg.route_label:
-            self._agent_route_now = [v > 0.5 for v in values[:n]]
-            self._agent_route_steps = [c + int(v) for c, v in zip(self._agent_route_steps, self._agent_route_now)]
+            counts = [int(round(v)) for v in values[:n]]
+            self._agent_route_count_now = counts
+            self._agent_route_now = [c > 0 for c in counts]
+            self._agent_route_steps = [s + c for s, c in zip(self._agent_route_steps, counts)]
             # learner-wide views (periodic reset / retrain, the legacy metrics): any agent's step, the furthest clock
             self._route_step_now = any(self._agent_route_now)
             self._route_steps = max(self._agent_route_steps)
 
-    def _read_host(self, route_now_t: Optional[torch.Tensor]) -> None:
+    def _read_host(self, route_count_t: Optional[torch.Tensor]) -> None:
         """The training step's one host synchronization: every scalar the update decision needs, in one copy.
         Deferred to the parent when it reads for all its learners at once (``_host_read_deferred``)."""
-        pending = self._host_read_values(route_now_t)
+        pending = self._host_read_values(route_count_t)
         if self._host_read_deferred:
             self._pending_host_read = pending
             return
@@ -1280,8 +1305,11 @@ class SAC(LearnerBase):
                 return
             due = []
             for agent in range(self.num_agents):
-                since = self._agent_route_steps[agent] - 1 - start
-                due.append(ready[agent] and self._agent_route_now[agent] and since >= 0 and since % every == 0)
+                # due when this step's phase steps crossed an update index (start, start + every, ...): a clock that
+                # advances by several per step (several envs in the phase, pooled rows) must not skip one
+                after = self._agent_route_steps[agent] - 1 - start
+                before = after - self._agent_route_count_now[agent]
+                due.append(ready[agent] and self._agent_route_now[agent] and _due_indices(after, every) > _due_indices(before, every))
             self._run_update(due, timestep, timesteps)
             self._maybe_periodic_reset(timestep)
             self._maybe_retrain(self._route_steps - 1, timesteps, logged_at=timestep)

@@ -155,3 +155,28 @@ def test_the_accumulator_takes_values_from_another_device():
     acc.add(0, {"a/x": torch.tensor([1.0], device="cuda")})
     acc.add(0, {"b/y": torch.tensor(2.0)})  # a host-side value, as phase logging's counts are
     assert acc.flush()[0] == {"a/x": 1.0, "b/y": 2.0}
+
+
+def test_a_pooled_phase_counts_every_envs_step_for_every_agent():
+    """While a residual pools its rows (shared_warmup), <phase>_step grows by every env's step in the phase for every
+    agent -- the steps the agent's memory received rows for; the other phases and the attempts stay the agent's own."""
+    sink = Sink()
+    log = PhaseLogger(sink, names=NAMES, phases=NAMES[:4], routes=["insert", "screw"], num_agents=2, envs_per_agent=1,
+                      write_interval=100, success_window=None)
+    insert, screw, corner = (NAMES.index(p) for p in ("insert", "screw", "corner"))
+
+    def observe(now, nxt, pooled=()):
+        infos = {"episode_metrics_to_log": {"episode/success": torch.zeros(2), "episode/out_of_bounds": torch.zeros(2)}}
+        log.observe(torch.tensor(now), torch.tensor(nxt), torch.zeros(2), torch.zeros(2, dtype=torch.bool),
+                    torch.zeros(2, dtype=torch.bool), infos, 0, pooled=pooled)
+
+    observe([insert, insert], [insert, insert], pooled=["insert"])  # both envs in insert, pooled: 2 for each agent
+    assert log.steps[:, log.phases.index("insert")].tolist() == [2.0, 2.0]
+    observe([insert, corner], [insert, corner], pooled=["insert"])  # one env in insert: still 1 for each agent
+    assert log.steps[:, log.phases.index("insert")].tolist() == [3.0, 3.0]
+    assert log.steps[:, log.phases.index("corner")].tolist() == [0.0, 1.0]  # corner is not pooled: agent 1's own
+    observe([insert, screw], [insert, screw])  # pooling over: each agent its own envs
+    assert log.steps[:, log.phases.index("insert")].tolist() == [4.0, 3.0]
+    assert log.steps[:, log.phases.index("screw")].tolist() == [0.0, 1.0]
+    with pytest.raises(ValueError, match="not a routed phase"):
+        observe([insert, insert], [insert, insert], pooled=["corner"])

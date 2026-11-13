@@ -65,6 +65,49 @@ def test_each_agent_counts_its_own_phase_steps_and_rows():
     assert list(learner.memory._agent_size) == [4, 3, 0]
 
 
+def test_the_phase_clock_counts_the_steps_the_memory_receives_rows_for():
+    """The route clock is the number of phase steps the agent's memory got rows for: several of its envs in the phase
+    at once count several; while shared_warmup pools the rows, every agent counts every env's step; and the count
+    is taken on the labels at step time, so an n-step window delaying the rows does not delay it."""
+    learner = routed_ddpg(envs_per_agent=2, learning_starts_rows=1000)
+    learner.enable_training_mode(True)
+    step(learner, 0, [INSERT, INSERT, INSERT, 0, 0, 0])  # 3 agents x 2 envs; a step starts in the label published before it
+    step(learner, 1, [INSERT, INSERT, INSERT, 0, 0, 0])  # agent 0 has two envs in insert, agent 1 one, agent 2 none
+    assert learner._agent_route_steps == [2, 1, 0]
+    assert list(learner.memory._agent_size) == [2, 1, 0]
+
+    pooled = routed_ddpg(shared_warmup=True, learning_starts_rows=1000)
+    pooled.enable_training_mode(True)
+    step(pooled, 0, [INSERT, INSERT, 0])
+    for t in range(1, 5):
+        step(pooled, t, [INSERT, INSERT, 0])  # two envs in insert each step: every agent's memory gets both rows
+    assert pooled._agent_route_steps == [8, 8, 8]
+    assert list(pooled.memory._agent_size) == [8, 8, 8]
+
+    delayed = routed_ddpg(learning_starts_rows=1000, n_step=3)
+    delayed.enable_training_mode(True)
+    step(delayed, 0, [INSERT, INSERT, INSERT])
+    step(delayed, 1, [INSERT, INSERT, INSERT])
+    assert delayed._agent_route_steps == [1, 1, 1]  # the window holds no full row yet; the step counts all the same
+    assert delayed.memory.fills() == [0, 0, 0]  # no row written yet
+
+
+def test_an_update_index_crossed_by_several_phase_steps_at_once_is_not_skipped():
+    """update_every under route_clock: an update on every step whose phase steps cross an update index, also when the
+    clock advances by more than one per step (three envs in the phase, pooled rows)."""
+    learner = build_learner("sac", num_agents=1, envs_per_agent=3, rollout=64, std_by_label="eval_state/phase/id",
+                            std_label_names=NAMES, route_label="insert", route_clock=True, learning_starts=0,
+                            update_every=4, batch_size=2)
+    learner.enable_training_mode(True)
+    updates = []
+    learner.update = lambda **kw: updates.append(kw["timestep"])
+    step(learner, 0, [INSERT] * 3)
+    for t in range(1, 6):
+        step(learner, t, [INSERT] * 3)  # the clock reads 3, 6, 9, 12, 15 after steps 1..5
+    # update indices 0, 4, 8, 12: crossed on steps 1 (0), 2 (4), 3 (8), 5 (12); step 4 (indices 9..11) crosses none
+    assert updates == [1, 2, 3, 5]
+
+
 def test_an_agent_starts_warms_up_and_learns_on_its_own_while_the_others_stay_untouched():
     learner = routed_ddpg()
     learner.enable_training_mode(True)

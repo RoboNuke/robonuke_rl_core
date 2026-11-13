@@ -242,7 +242,8 @@ class DDPG(SAC):
     def _pool_warmup_rows(self, timestep: int) -> bool:
         """``shared_warmup``: until the agents start learning, every env's row goes to every agent's memory (the
         warm-up acts on the actors' untrained starting point, the same for every agent), so they reach
-        ``learning_starts_rows`` together."""
+        ``learning_starts_rows`` together. Every agent's route clock and ``<phase>_step`` count the pooled steps too
+        (``SAC.record_transition``), so they also reach a step-based ``learning_starts`` together."""
         return bool(self.cfg.shared_warmup) and not all(self._agent_started(timestep))
 
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:

@@ -123,8 +123,12 @@ class RoutedSAC:
         crossed = None
         if self.phase_logger is not None:
             # the phase each env's step started in, and the one it ended in
+            # the phases whose residual pooled this step's rows into every agent's memory count every env's step for
+            # every agent (the same count the residual's route clock took)
+            pooled = [route for route, learner in self.learners.items() if learner._pooled_now]
             crossed = self.phase_logger.observe(self._labels, labels, kwargs["rewards"], kwargs["terminated"],
-                                                kwargs["truncated"], infos, int(kwargs["timestep"]), defer=True)
+                                                kwargs["truncated"], infos, int(kwargs["timestep"]), defer=True,
+                                                pooled=pooled)
         self._labels = labels
         # the step's single host synchronization: every learner's values and the phase logger's publish flags
         pieces = [values for _, values in pending]

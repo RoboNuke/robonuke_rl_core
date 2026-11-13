@@ -262,6 +262,7 @@ def test_shared_warmup_pools_every_envs_rows_until_the_agents_start_together_the
     for t in range(1, 7):
         step(t, [2.0, 1.0])  # only agent 0's env is in insert; its rows go to both agents' insert memories
     assert insert.memory._agent_size == [6, 6]
+    assert insert._agent_route_steps == [6, 6]  # the pooled steps count on every agent's clock
     first = insert.memory.get_tensor_by_name("observations")[:, :6, 0]
     torch.testing.assert_close(first[0], first[1])  # the same pooled rows
     assert insert._agent_warmed == [True, True]  # one burst, both agents, though agent 1 never was in insert
@@ -269,6 +270,7 @@ def test_shared_warmup_pools_every_envs_rows_until_the_agents_start_together_the
     for t in range(7, 10):
         step(t, [2.0, 1.0])  # learning: each agent keeps only its own envs' rows
     assert insert.memory._agent_size == [9, 6]
+    assert insert._agent_route_steps == [9, 6]  # and counts only its own steps again
 
 
 def test_checkpoints_carry_the_target_actor(tmp_path):

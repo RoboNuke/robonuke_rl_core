@@ -7,7 +7,12 @@ moved to a later phase, or if the episode ended in it with the task's success (`
 phase can be in progress when the task succeeds). Each attempt records its steps, its return (the rewards of its steps)
 and whether its episode ended out of bounds (``episode/out_of_bounds``, when the env publishes it).
 
-Every phase in ``sac.phase_logging_phases`` (default: every label) counts its env steps, ``<phase>_step``, per agent.
+Every phase in ``sac.phase_logging_phases`` (default: every label) counts its env steps, ``<phase>_step``, per agent:
+the steps the agent's envs started in the phase, which is what its residual's memory receives rows for. While a
+residual pools its rows into every agent's memory (DDPG ``shared_warmup``), every agent's counter takes every agent's
+envs' steps in that phase, so ``<phase>_step`` stays the count of phase steps behind the agent's memory (and equals the
+residual's ``route/steps``). Counted on the labels at step time: ``n_step`` delaying the rows and the memory's capacity
+play no part.
 
 * A phase with a residual (``sac.route_labels``) is published every ``trainer.write_interval`` of **its own** steps, as
   ``<phase>_episode/<metric>`` (``success`` -- over the last ``trainer.success_window`` attempts when set --,
@@ -263,12 +268,14 @@ class PhaseLogger:
         infos: Any,
         step: int,
         defer: bool = False,
+        pooled: Sequence[str] = (),
     ) -> Optional[torch.Tensor]:
         """One env step: ``labels`` the phase each env's step started in (the routed learner's), ``next_labels`` the
-        one it ended in (this step's ``infos``). Device work only, except the publish check: which (agent, phase)
-        crossed its publish cadence this step, a ``(num_agents, num_phases)`` bool tensor, read here (one host
-        synchronization) and acted on, or, with ``defer``, returned for the caller to read with its other host
-        values and hand to :meth:`publish_crossed`."""
+        one it ended in (this step's ``infos``). ``pooled``: the routed phases whose residual wrote this step's rows
+        into every agent's memory; their step counters grow by every env's step in the phase, for every agent. Device
+        work only, except the publish check: which (agent, phase) crossed its publish cadence this step, a
+        ``(num_agents, num_phases)`` bool tensor, read here (one host synchronization) and acted on, or, with
+        ``defer``, returned for the caller to read with its other host values and hand to :meth:`publish_crossed`."""
         if labels is None or next_labels is None:
             return None
         self._state(labels)
@@ -287,7 +294,15 @@ class PhaseLogger:
         ended = done | (nxt != now)
         agent = self._env_agent
         before = self.steps.clone()
-        self.steps.index_put_((agent, phase), tracked.to(torch.float64), accumulate=True)
+        own = tracked
+        for name in pooled:
+            if name not in self.held:
+                raise ValueError(f"phase logging: pooled phase {name!r} is not a routed phase {list(self.held)}")
+            position = self.phases.index(name)
+            in_phase = tracked & (phase == position)
+            own = own & in_phase.logical_not()
+            self.steps[:, position] += in_phase.sum().to(torch.float64)  # every env's step, to every agent
+        self.steps.index_put_((agent, phase), own.to(torch.float64), accumulate=True)
         crossed = (self.steps // self.write_interval) > (before // self.write_interval)
         finished = tracked & ended
         zero = torch.zeros_like(self._attempt_return)
