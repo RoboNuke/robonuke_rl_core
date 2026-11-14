@@ -82,3 +82,37 @@ def test_a_registered_project_learner_builds_its_own_eval_policy():
             evaluation.register_eval_policy("sac", lambda *a: None)
     finally:
         evaluation.EVAL_POLICY_BUILDERS.pop("bc_test", None)
+
+
+def test_an_eval_ddpg_learner_gets_the_runs_critic_action_transform(monkeypatch):
+    """The critics are evaluated on the action they trained on: the registered transform is set on the eval learner,
+    as train.py sets it on the training one (critic_values would hand them the raw action otherwise)."""
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    from robonuke_rl_core import evaluation
+    from robonuke_rl_core.learners import ddpg, sac
+    from robonuke_rl_core.models import factory
+
+    transform = object()
+
+    class FakeDDPG:
+        def __init__(self, **kwargs):
+            self.critic_action_transform = None
+            self.models = {}
+
+        def load_agent(self, path, slot=0, with_optimizer=False):
+            return {"step": 7}
+
+        def enable_training_mode(self, enabled=True):
+            pass
+
+    monkeypatch.setattr(ddpg, "DDPG", FakeDDPG)
+    monkeypatch.setattr(factory, "build_models", lambda *a, **k: {})
+    monkeypatch.setattr(sac, "critic_action_transform", lambda cfg, env: transform)
+    monkeypatch.setattr(sac, "critic_action_space", lambda t, space: None)
+    cfg = OmegaConf.create({"trainer": {"learner": "ddpg"}, "ddpg": {"num_critics": 2, "route_labels": []}, "model": {}})
+    env = SimpleNamespace(num_envs=2, observation_space=None, state_space=None, action_space=None, device="cpu")
+    _, learner, metadata = evaluation.build_eval_policy(cfg, env, "ckpt")
+    assert learner.critic_action_transform is transform and metadata == {"step": 7}

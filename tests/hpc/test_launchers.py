@@ -573,6 +573,14 @@ def test_watch_forwards_overrides_after_its_own_flags(tmp_path, capsys):
     assert lines[0].rstrip().endswith("--once eval.num_rollouts=50")
 
 
+def test_watch_passes_out_name_to_the_watcher_before_the_overrides(tmp_path, capsys):
+    paths = _watch_tree(tmp_path)
+    _, lines, _ = watch(paths, tmp_path, "--out_name", "eval_v2", "eval.num_rollouts=50", capsys=capsys)
+    assert lines[0].rstrip().endswith("--once --out_name eval_v2 eval.num_rollouts=50")
+    _, plain, _ = watch(paths, tmp_path, capsys=capsys)
+    assert "--out_name" not in plain[0]
+
+
 def test_watch_without_a_watch_script_aborts_naming_the_field(tmp_path, capsys):
     paths = _watch_tree(tmp_path, extra="")
     code, lines, out = watch(paths, tmp_path, capsys=capsys)

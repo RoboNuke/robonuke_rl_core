@@ -1107,6 +1107,10 @@ def _build_single_eval_policy(
         num_envs=env.num_envs,
         **extra,
     )
+    if transform is not None:
+        # the critics take the transformed action, as in training (train.py sets it before init()): the critics'
+        # health on eval and demo rows (critic_values) goes through it
+        learner.critic_action_transform = transform
     metadata = learner.load_agent(checkpoint, slot=0, with_optimizer=False)
     learner.enable_training_mode(False)  # eval mode: no dropout, no stat updates
     if any(getattr(m, "uses_batch_stats", False) for m in learner.models.values() if m is not None):

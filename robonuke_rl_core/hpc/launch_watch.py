@@ -2,13 +2,15 @@
 watcher over that config's run directory.
 
     python launchers/launch_watch.py <folder | config.yaml ...> --project P --group_prefix G \\
-        --eval_config F [--follow] [--dry_run] [a.b.c=value ...]
+        --eval_config F [--follow] [--out_name NAME] [--dry_run] [a.b.c=value ...]
 
 The job runs ``hpc.watch_script`` (a project script: the package has no watcher of its own)
 with ``--run <run dir> --eval_config F --headless`` and, by default, ``--once``: evaluate every
 checkpoint the run has on disk, then exit -- for runs that have finished. ``--follow`` drops
 ``--once`` so the watcher keeps polling for new checkpoints, for a watcher started beside a
-training. The run directory is ``{trainer.output_dir}/{project}/{group}`` with the group named by
+training. ``--out_name NAME`` is passed to the watcher as its own ``--out_name``: a separate
+evaluation of the same runs (the project's watcher keeps its results and its eval runs apart under
+that name). The run directory is ``{trainer.output_dir}/{project}/{group}`` with the group named by
 the **same rule** ``launch_train`` used (``{group_prefix}_{config stem}``), so the command that
 launched the trainings launches their watchers with the verb swapped.
 
@@ -63,13 +65,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep polling for new checkpoints (a watcher beside a training); default: --once, evaluate what "
         "is on disk and exit",
     )
+    parser.add_argument(
+        "--out_name",
+        default=None,
+        help="passed to the watcher as --out_name: a separate evaluation of the same runs (its own results "
+        "folder and eval runs, by the watcher's rule); default: the watcher's own",
+    )
     add_common_args(parser)
     return parser
 
 
-def watch_argv(script: str, run_dir: str, eval_config: str, *, follow: bool, forwarded: Sequence[str]) -> List[str]:
+def watch_argv(script: str, run_dir: str, eval_config: str, *, follow: bool, forwarded: Sequence[str],
+               out_name: Optional[str] = None) -> List[str]:
     """The watcher's command line inside the job: ``<script> --run <run dir> --eval_config F --headless
-    [--once] <overrides...>``."""
+    [--once] [--out_name NAME] <overrides...>``."""
     return [
         script,
         "--run",
@@ -78,6 +87,7 @@ def watch_argv(script: str, run_dir: str, eval_config: str, *, follow: bool, for
         str(eval_config),
         "--headless",
         *([] if follow else ["--once"]),
+        *(["--out_name", str(out_name)] if out_name else []),
         *forwarded,
     ]
 
@@ -144,7 +154,8 @@ def _run(args: argparse.Namespace, overrides: Sequence[str]) -> int:
     submissions: List[S.Submission] = []
     for config, group, run_dir in planned:
         name = f"watch_{group}"
-        argv = watch_argv(script, str(run_dir), str(eval_path), follow=args.follow, forwarded=forwarded)
+        argv = watch_argv(script, str(run_dir), str(eval_path), follow=args.follow, forwarded=forwarded,
+                          out_name=args.out_name)
         out_path, err_path = S.log_paths(eval_config.hpc, args.project, name, create=not args.dry_run)
         sbatch = S.sbatch_command(
             hpc=eval_config.hpc,

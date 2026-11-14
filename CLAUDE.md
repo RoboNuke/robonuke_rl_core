@@ -888,13 +888,14 @@ python launchers/launch_train.py <folder | config.yaml ...> --project P --group_
 python launchers/launch_sweep.py <configs> --project P --group_prefix G \
     --sweep_param sac.actor_lr --label lr --value 1.0e-4 --value 3.0e-4
 python launchers/launch_eval.py --eval_config F --project P [--group G ...]
-python launchers/launch_watch.py <folder | config.yaml ...> --project P --group_prefix G --eval_config F [--follow]
+python launchers/launch_watch.py <folder | config.yaml ...> --project P --group_prefix G --eval_config F [--follow] [--out_name NAME]
 ```
 
 `launch_watch` is the training command with the verb swapped: one job per training config,
 running the project's `hpc.watch_script` (the package has no watcher) over the run directory
 `{trainer.output_dir}/{project}/{group}` with `--eval_config F --headless --once` (every
-checkpoint on disk, then exit; `--follow` keeps polling beside a live training). Resources and
+checkpoint on disk, then exit; `--follow` keeps polling beside a live training; `--out_name NAME`
+goes to the watcher as its own `--out_name`, a separate evaluation of the same runs). Resources and
 the script come from the eval config's chain, like `launch_eval`; a missing run directory
 aborts a real submit before anything is queued (a dry run names it and prints anyway).
 
