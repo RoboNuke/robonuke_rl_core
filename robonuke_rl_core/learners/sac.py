@@ -267,6 +267,8 @@ class SAC(LearnerBase):
             if self.cfg.adaptive_reward_scaling
             else None
         )
+        #: True while an update's metrics are not to be published (DDPG's critic warm-up burst, all but its end)
+        self._suppress_update_metrics = False
         #: noise_repeat: the held standard-normal draw per env, and per agent the steps it has
         #: been held and the length drawn for it (count 0: draw at the next step)
         self._held_noise: Optional[torch.Tensor] = None
@@ -1696,7 +1698,7 @@ class SAC(LearnerBase):
             if actor_step:
                 last_actor = out["actor"]
 
-        if self.on_log:
+        if self.on_log and not self._suppress_update_metrics:
             # once per update, from its last gradient step (the actor's from its last step in
             # this update), not after every gradient step: emitting costs kernel launches and
             # a memory query, and consecutive gradient steps' values are alike
@@ -1782,8 +1784,40 @@ class SAC(LearnerBase):
             critic_loss=critic_ce,
             # the aux terms' raw values: returned like the rest, so a replayed graph's are fresh
             aux_metrics={k: v.detach() for k, v in ctx.aux_metrics.items()},
+            # the critics' prediction the health metrics read (DDPG: the ensemble's mean)
+            critic_mean_values=self._critic_prediction(critic_1_values, critic_2_values).detach(),
         )
         return {"critic": critic, "actor": actor}
+
+    def _critic_prediction(self, critic_1_values: torch.Tensor, critic_2_values: torch.Tensor) -> torch.Tensor:
+        """The critics' value prediction for the health metrics: SAC the mean of its two critics."""
+        return 0.5 * (critic_1_values + critic_2_values)
+
+    def critic_health_metrics(self, prediction: torch.Tensor, target_values: torch.Tensor, rows: int,
+                              demo_rows: int = 0) -> Dict[str, torch.Tensor]:
+        """Per agent, over its rows of the last critic batch -- all of them, and with demo rows in the batch also its
+        online rows (``_online``) and its demo rows (``_demo``; the batch holds each agent's online rows first):
+        ``q/explained_variance`` (1 - Var(y - Q) / Var(y), Q the critics' prediction, y the target),
+        ``q/td_abs_mean`` / ``q/td_abs_max`` (|y - Q|) and ``q/mean`` (Q)."""
+        q = prediction.reshape(self.num_agents, rows)
+        y = target_values.reshape(self.num_agents, rows)
+
+        def health(qs: torch.Tensor, ys: torch.Tensor, suffix: str) -> Dict[str, torch.Tensor]:
+            err = ys - qs
+            var_y = ys.var(dim=1, unbiased=False)
+            return {
+                f"q/explained_variance{suffix}": 1.0 - err.var(dim=1, unbiased=False) / var_y.clamp(min=1e-8),
+                f"q/td_abs_mean{suffix}": err.abs().mean(dim=1),
+                f"q/td_abs_max{suffix}": err.abs().amax(dim=1),
+                f"q/mean{suffix}": qs.mean(dim=1),
+            }
+
+        out = health(q, y, "")
+        online = rows - int(demo_rows)
+        if 0 < int(demo_rows) < rows:
+            out.update(health(q[:, :online], y[:, :online], "_online"))
+            out.update(health(q[:, online:], y[:, online:], "_demo"))
+        return out
 
     def _batch_inputs(self, sampled, train: bool = True):
         """The (normalized) actor and critic inputs of a sampled batch; ``train`` updates the
@@ -1900,9 +1934,11 @@ class SAC(LearnerBase):
         mean_actions=None,
         aux_metrics=None,
         actor_aux_metrics=None,
+        critic_mean_values=None,
     ) -> None:
         """One point per update: the critic's last gradient step, the actor's last step (with
-        graph-safe aux losses, their terms' raw values too, from the same steps)."""
+        graph-safe aux losses, their terms' raw values too, from the same steps), and the critic's health
+        (:meth:`critic_health_metrics`)."""
         with torch.no_grad():
             metrics = {
                 # categorical: the cross-entropy it trains on; scalar: the halved MSE sum
@@ -1962,6 +1998,8 @@ class SAC(LearnerBase):
             if self.aux_loss_graph_safe():  # otherwise the hook emitted them every gradient step
                 metrics.update(aux_metrics or {})
                 metrics.update(actor_aux_metrics or {})
+            if critic_mean_values is not None:
+                metrics.update(self.critic_health_metrics(critic_mean_values, target_values, rows, demo_rows))
             metrics.update(self.stats_metrics())
             self.emit_per_agent(metrics, timestep)
 

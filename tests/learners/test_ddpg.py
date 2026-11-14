@@ -393,3 +393,54 @@ def test_the_replay_memory_is_saved_beside_each_checkpoint_only_when_asked(tmp_p
     memory.tensors["rewards"][0, :, 0] = marks
     rows = torch.load(on.save_memory(0, 9), weights_only=False)["rows"]["rewards"][:, 0]
     torch.testing.assert_close(rows, torch.cat((marks[3:], marks[:3])))
+
+
+
+def test_the_critic_warm_up_publishes_only_its_last_updates():
+    learner = ddpg(critic_warmup_updates=40, gradient_steps=2)
+    learner.WARMUP_LOGGED_UPDATES = 8  # the last 8 gradient steps: 4 update points of 2
+    fill_memory(learner)
+    points = []
+    learner.on_log.append(lambda agent, metrics, step: points.append(dict(metrics)) if "loss/critic" in metrics else None)
+    learner._update_if_ready(timestep=0, timesteps=100)
+    assert learner._updates == 40
+    assert len(points) == 4 * learner.num_agents  # one point per agent for each of the burst's last 4 updates
+    points.clear()
+    learner._update_if_ready(timestep=1, timesteps=100)
+    assert len(points) == learner.num_agents  # an ordinary update publishes as before
+
+
+def test_the_critic_health_metrics():
+    learner = ddpg()
+    rows = 4
+    y = torch.tensor([0.0, 1.0, 2.0, 3.0] * learner.num_agents).reshape(-1, 1)
+    perfect = learner.critic_health_metrics(y.clone(), y, rows)
+    torch.testing.assert_close(perfect["q/explained_variance"], torch.ones(learner.num_agents))
+    torch.testing.assert_close(perfect["q/td_abs_max"], torch.zeros(learner.num_agents))
+    flat = learner.critic_health_metrics(torch.full_like(y, 1.5), y, rows)
+    torch.testing.assert_close(flat["q/explained_variance"], torch.zeros(learner.num_agents))  # no better than the mean
+    torch.testing.assert_close(flat["q/td_abs_mean"], torch.full((learner.num_agents,), 1.0))
+    # rows 0-1 online (fitted exactly), rows 2-3 demo (each off by 1): every metric on all rows and on each part
+    pred = y.clone().reshape(learner.num_agents, rows)
+    pred[:, 2:] += torch.tensor([1.0, -1.0])
+    split = learner.critic_health_metrics(pred.reshape(-1, 1), y, rows, demo_rows=2)
+    a = learner.num_agents
+    torch.testing.assert_close(split["q/explained_variance_online"], torch.ones(a))
+    torch.testing.assert_close(split["q/td_abs_max_online"], torch.zeros(a))
+    torch.testing.assert_close(split["q/td_abs_mean_demo"], torch.ones(a))
+    torch.testing.assert_close(split["q/explained_variance_demo"], torch.full((a,), -3.0))  # Var(err) 1 vs Var(y) 0.25
+    torch.testing.assert_close(split["q/td_abs_mean"], torch.full((a,), 0.5))
+    torch.testing.assert_close(split["q/mean_online"], torch.full((a,), 0.5))
+    torch.testing.assert_close(split["q/mean_demo"], torch.full((a,), 2.5))
+    assert "q/mean_online" not in learner.critic_health_metrics(y.clone(), y, rows)  # no demo rows: all rows only
+
+
+def test_an_update_publishes_the_critic_health_and_the_action_slope():
+    learner = ddpg(policy_delay=1)
+    fill_memory(learner)
+    seen = {}
+    learner.on_log.append(lambda agent, metrics, step: seen.update(metrics))
+    learner._update_if_ready(timestep=0, timesteps=100)
+    for key in ("q/explained_variance", "q/td_abs_mean", "q/td_abs_max", "q/action_grad_norm"):
+        assert key in seen, key
+        assert torch.isfinite(torch.as_tensor(seen[key])).all()

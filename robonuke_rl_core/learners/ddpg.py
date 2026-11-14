@@ -44,6 +44,8 @@ class DDPG(SAC):
     and ``target_critics`` (``num_critics`` stacked)."""
 
     HAS_TEMPERATURE = False
+    #: the critic warm-up burst publishes the metrics of its last this-many gradient steps only
+    WARMUP_LOGGED_UPDATES = 1000
 
     def __init__(self, **kwargs) -> None:
         models = kwargs.get("models") or {}
@@ -285,8 +287,13 @@ class DDPG(SAC):
             # env step, for the agents that just started (the others untouched)
             self._in_critic_warmup = True
             rounds = -(-int(self.cfg.critic_warmup_updates) // int(self.cfg.gradient_steps))
-            for _ in range(rounds):
+            # only the burst's end is published: its last WARMUP_LOGGED_UPDATES gradient steps, one point per update
+            # as usual, so the interval it lands in holds the critic as the actor will meet it
+            logged = -(-self.WARMUP_LOGGED_UPDATES // int(self.cfg.gradient_steps))
+            for round_index in range(rounds):
+                self._suppress_update_metrics = round_index < rounds - logged
                 self._run_update(newly, timestep, timesteps)
+            self._suppress_update_metrics = False
             self._in_critic_warmup = False
             self._agent_warmed = [w or n for w, n in zip(self._agent_warmed, newly)]
             return
@@ -355,7 +362,13 @@ class DDPG(SAC):
             spread = values.std(dim=0) if self._num_critics > 1 else torch.zeros_like(values[0])
             self._q_spread = spread.view(self.num_agents, rows).mean(dim=1)
         second = values[1] if self._num_critics > 1 else values[0]
+        #: the ensemble's mean prediction, for the health metrics (read back in the same gradient step)
+        self._ensemble_mean = values.detach().mean(dim=0)
         return critic_loss, values[0], second, target_values, None, per_agent
+
+    def _critic_prediction(self, critic_1_values, critic_2_values):
+        """The ensemble's mean Q (all ``num_critics``) of the last critic step."""
+        return self._ensemble_mean
 
     def _compute_actor_loss(self, *, sampled, inputs, critic_inputs, rows, next_inputs=None):
         with self._batch_mode(self.policy, True):
@@ -374,7 +387,9 @@ class DDPG(SAC):
             mean_abs = q.detach().abs().view(self.num_agents, rows).mean(dim=1).clamp(min=1e-6)
             q_term = q * self.expand_per_agent((float(self.cfg.actor_q_scale) / mean_abs).unsqueeze(-1), rows)
         per_row = -q_term
-        metrics = {}
+        # the critics' slope in the action at the actor's own action, |dQ/da| per row: the signal the actor follows
+        slope = torch.autograd.grad(q.sum(), actions, retain_graph=True)[0]
+        metrics = {"q/action_grad_norm": slope.detach().norm(dim=-1).view(self.num_agents, rows).mean(dim=1)}
         if self.cfg.action_l2_reg_weight > 0:
             l2 = actions.pow(2).sum(dim=-1, keepdim=True)
             per_row = per_row + float(self.cfg.action_l2_reg_weight) * l2

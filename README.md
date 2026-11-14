@@ -337,7 +337,10 @@ DDPG's own fields:
 | `shared_warmup` | bool | `false` | with `experiment.num_agents` > 1: until the agents start learning (`learning_starts_rows`, > 0), every env's stored row goes to every agent's memory (the warm-up acts on the actors' untrained starting point), so all agents reach `learning_starts_rows` together and their `critic_warmup_updates` burst runs once, for every agent at once (per route). Every agent's `route_clock` and `<phase>_step` count the pooled steps too (`num_agents` x faster than its own envs' steps), so the phase axis keeps counting the steps the memory holds. After that each agent stores only its own envs' rows. Not with `hold_still_key` |
 
 Metrics, on top of SAC's (no `entropy/*`): `policy/exploration_std` (the current noise std; also `policy/std`),
-`policy/mean_action` (mean |deterministic action|) and `q/ensemble_std` (the critics' spread over the batch).
+`policy/mean_action` (mean |deterministic action|), `q/ensemble_std` (the critics' spread over the batch) and
+`q/action_grad_norm` (|dQ/da| of the critics' mean at the actor's own action, per row: the slope the actor follows).
+The critic warm-up burst (`critic_warmup_updates`) publishes only its last 1000 gradient steps (one point per update, as
+usual), so the interval it lands in shows the critic as the actor first meets it, not the burst's own learning curve.
 
 **Several agents (`experiment.num_agents` > 1) keep separate schedules.** Each agent has its own `route_clock` (its
 envs' steps in the phase), its own `learning_starts_rows` (its own online rows), and its own update and `policy_delay`
