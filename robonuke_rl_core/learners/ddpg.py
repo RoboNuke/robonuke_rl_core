@@ -387,9 +387,11 @@ class DDPG(SAC):
             mean_abs = q.detach().abs().view(self.num_agents, rows).mean(dim=1).clamp(min=1e-6)
             q_term = q * self.expand_per_agent((float(self.cfg.actor_q_scale) / mean_abs).unsqueeze(-1), rows)
         per_row = -q_term
-        # the critics' slope in the action at the actor's own action, |dQ/da| per row: the signal the actor follows
-        slope = torch.autograd.grad(q.sum(), actions, retain_graph=True)[0]
-        metrics = {"q/action_grad_norm": slope.detach().norm(dim=-1).view(self.num_agents, rows).mean(dim=1)}
+        metrics = {}
+        if self.cfg.log_action_grad:
+            # the critics' slope in the action at the actor's own action, |dQ/da| per row: the signal the actor follows
+            slope = torch.autograd.grad(q.sum(), actions, retain_graph=True)[0]
+            metrics["q/action_grad_norm"] = slope.detach().norm(dim=-1).view(self.num_agents, rows).mean(dim=1)
         if self.cfg.action_l2_reg_weight > 0:
             l2 = actions.pow(2).sum(dim=-1, keepdim=True)
             per_row = per_row + float(self.cfg.action_l2_reg_weight) * l2

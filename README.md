@@ -335,10 +335,12 @@ DDPG's own fields:
 | `random_action_mode` | str | `"uniform"` | what a warm-up action is: `uniform` (ResFiT's, `mid + U(-random_action_scale, random_action_scale)`) or `actor_gaussian` (the actor's own deterministic action plus `N(0, random_action_scale)`, clamped to `action_range` with `clip_actions`: about the actor's starting point, wherever `model.actor.output_bias` put it) |
 | `critic_warmup_updates` | int | `0` | ResFiT's critic warm-up: when this learner may first update, this many critic-only gradient steps run at once, before the next env step. The actor learns from the next update on. Per route with `route_clock` |
 | `shared_warmup` | bool | `false` | with `experiment.num_agents` > 1: until the agents start learning (`learning_starts_rows`, > 0), every env's stored row goes to every agent's memory (the warm-up acts on the actors' untrained starting point), so all agents reach `learning_starts_rows` together and their `critic_warmup_updates` burst runs once, for every agent at once (per route). Every agent's `route_clock` and `<phase>_step` count the pooled steps too (`num_agents` x faster than its own envs' steps), so the phase axis keeps counting the steps the memory holds. After that each agent stores only its own envs' rows. Not with `hold_still_key` |
+| `log_action_grad` | bool | `false` | log `q/action_grad_norm` on every actor step; costs one extra backward pass through the critics per actor step |
 
 Metrics, on top of SAC's (no `entropy/*`): `policy/exploration_std` (the current noise std; also `policy/std`),
 `policy/mean_action` (mean |deterministic action|), `q/ensemble_std` (the critics' spread over the batch) and
-`q/action_grad_norm` (|dQ/da| of the critics' mean at the actor's own action, per row: the slope the actor follows).
+`q/action_grad_norm` (|dQ/da| of the critics' mean at the actor's own action, per row: the slope the actor follows;
+only with `log_action_grad`).
 The critic warm-up burst (`critic_warmup_updates`) publishes only its last 1000 gradient steps (one point per update, as
 usual), so the interval it lands in shows the critic as the actor first meets it, not the burst's own learning curve.
 

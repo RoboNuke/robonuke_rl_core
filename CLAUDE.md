@@ -528,7 +528,7 @@ the episodes that have it.
 | `sac/demo_fraction` | SAC | the share of each critic batch that came from `sac.demo_transitions`: 0.5 inside the window once the memory holds half a batch, more before, 0 outside. Only published when demos are configured. With `policy_delay` > 1 the actor's metrics (`loss/policy`, `policy/*`, `grad_norm/policy`) come only from the gradient steps that updated it |
 | `q/q1_mean`, `q/q2_mean`, `q/target_mean` | SAC | + `/min`, `/max` |
 | `q/explained_variance`, `q/td_abs_mean`, `q/td_abs_max`, `q/mean` | SAC, DDPG | the critic's health on its last batch, per agent: 1 - Var(y - Q) / Var(y) (Q the critics' prediction: SAC's two critics' mean, DDPG's ensemble mean; y the target), \|y - Q\| and Q. With demo rows in the batch each also as `_online` and `_demo` (the batch's online rows, its demo rows) |
-| `q/action_grad_norm` | DDPG (actor steps) | \|dQ/da\| of the critics' mean at the actor's action, per row |
+| `q/action_grad_norm` | DDPG (actor steps, `log_action_grad`) | \|dQ/da\| of the critics' mean at the actor's action, per row |
 | `ppo/kl`, `ppo/clip_fraction`, `ppo/kept` | PPO | `ppo/kept` is the per-agent KL early stop |
 | `grad_norm/*`, `lr/*` | the learner | per optimizer |
 | `stats/update_time_ms` | the learner | wall time of one update, the number to compare against another implementation. Emitted from inside the timed block, so it **lags one update** and the first point is 0 |

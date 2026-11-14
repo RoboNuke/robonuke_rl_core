@@ -436,7 +436,7 @@ def test_the_critic_health_metrics():
 
 
 def test_an_update_publishes_the_critic_health_and_the_action_slope():
-    learner = ddpg(policy_delay=1)
+    learner = ddpg(policy_delay=1, log_action_grad=True)
     fill_memory(learner)
     seen = {}
     learner.on_log.append(lambda agent, metrics, step: seen.update(metrics))
@@ -444,6 +444,15 @@ def test_an_update_publishes_the_critic_health_and_the_action_slope():
     for key in ("q/explained_variance", "q/td_abs_mean", "q/td_abs_max", "q/action_grad_norm"):
         assert key in seen, key
         assert torch.isfinite(torch.as_tensor(seen[key])).all()
+
+
+def test_the_action_slope_is_off_by_default():
+    learner = ddpg(policy_delay=1)
+    fill_memory(learner)
+    seen = {}
+    learner.on_log.append(lambda agent, metrics, step: seen.update(metrics))
+    learner._update_if_ready(timestep=0, timesteps=100)
+    assert "q/explained_variance" in seen and "q/action_grad_norm" not in seen
 
 
 def test_critic_values_scores_given_transitions_per_slot_as_the_update_does():

@@ -775,6 +775,8 @@ class DDPGCfg(SACCfg):
     #: warm-up (``critic_warmup_updates``) runs once, for every agent together. After that every agent stores only its
     #: own envs' rows. False: each agent fills and starts on its own
     shared_warmup: bool = False
+    #: log ``q/action_grad_norm`` (|dQ/da| at the actor's action) on every actor step: one extra backward pass
+    log_action_grad: bool = False
 
     ACTOR_Q_REDUCTIONS = ("min", "mean", "min_random_pair", "q1")
     MIN_CRITICS = 1
