@@ -444,3 +444,28 @@ def test_an_update_publishes_the_critic_health_and_the_action_slope():
     for key in ("q/explained_variance", "q/td_abs_mean", "q/td_abs_max", "q/action_grad_norm"):
         assert key in seen, key
         assert torch.isfinite(torch.as_tensor(seen[key])).all()
+
+
+def test_critic_values_scores_given_transitions_per_slot_as_the_update_does():
+    learner = ddpg(num_critics=2, critic_subset=2, target_policy_noise=False)  # the target min over both: not random
+    fill_memory(learner)
+    names = learner._demo_names() + (["discounts"] if learner._n_step() > 1 else [])
+    size = int(learner.memory.size)
+    sets = []
+    for agent, rows in enumerate((7, 3)):  # uneven sets per slot, chunked below their size
+        sets.append({n: learner.memory.get_tensor_by_name(n)[agent, :rows].clone() for n in names})
+    out = learner.critic_values(sets, chunk=2)
+    assert out[0][0].shape == (7,) and out[1][0].shape == (3,)
+    # the same rows through the update's own critic computation, slot by slot
+    for agent, rows in enumerate((7, 3)):
+        batch = {n: torch.cat([sets[agent][n]] * learner.num_agents) for n in names}
+        inputs, next_inputs, critic_inputs, critic_next_inputs = learner._batch_inputs(batch, train=False)
+        with torch.no_grad():
+            _, q1, q2, target, _, _ = learner._compute_critic_loss(sampled=batch, inputs=inputs, next_inputs=next_inputs,
+                                                                  critic_inputs=critic_inputs,
+                                                                  critic_next_inputs=critic_next_inputs, rows=rows)
+        q = learner._critic_prediction(q1, q2).reshape(learner.num_agents, rows)[agent]
+        torch.testing.assert_close(out[agent][0], q)
+        torch.testing.assert_close(out[agent][1], target.reshape(learner.num_agents, rows)[agent])
+    assert learner.critic_values([None, sets[1]])[0] is None
+    assert size > 0

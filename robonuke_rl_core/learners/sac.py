@@ -362,6 +362,15 @@ class SAC(LearnerBase):
             names += [name, f"next_{name}"]
         return names
 
+    def init_side_inputs(self) -> None:
+        """The critic action transform's side inputs, name -> width (stored as name and next_name; a demo file and
+        :meth:`critic_values` carry them too). Set with the memory; an eval learner, which has none, calls it itself."""
+        #: the critic action transform's side_inputs: name -> width
+        self._side_inputs = {
+            str(name): int(width)
+            for name, width in (getattr(self.critic_action_transform, "side_inputs", None) or {}).items()
+        }
+
     def _n_step(self) -> int:
         return int(self.cfg.n_step)
 
@@ -749,11 +758,7 @@ class SAC(LearnerBase):
             self._next_episode = self.num_envs
             # preallocated so a captured CUDA graph keeps reading the same tensor (growth re-captures)
             self._outcomes = torch.full((max(1 << 16, 4 * self.num_envs),), -1.0, device=self.device)
-        #: the critic action transform's side_inputs: name -> width, stored as name and next_name
-        self._side_inputs = {
-            str(name): int(width)
-            for name, width in (getattr(self.critic_action_transform, "side_inputs", None) or {}).items()
-        }
+        self.init_side_inputs()
         for name, width in sorted(self._side_inputs.items()):
             for stored in (name, f"next_{name}"):
                 self.memory.create_tensor(name=stored, size=width, dtype=torch.float32)
@@ -1793,31 +1798,78 @@ class SAC(LearnerBase):
         """The critics' value prediction for the health metrics: SAC the mean of its two critics."""
         return 0.5 * (critic_1_values + critic_2_values)
 
+    @staticmethod
+    def health_of(q: torch.Tensor, y: torch.Tensor, suffix: str = "") -> Dict[str, torch.Tensor]:
+        """The critic's health on rows ``(agents, rows)`` of prediction ``q`` and target ``y``, per agent:
+        ``q/explained_variance`` (1 - Var(y - Q) / Var(y)), ``q/td_abs_mean`` / ``q/td_abs_max`` (|y - Q|), ``q/mean``."""
+        err = y - q
+        var_y = y.var(dim=1, unbiased=False)
+        return {
+            f"q/explained_variance{suffix}": 1.0 - err.var(dim=1, unbiased=False) / var_y.clamp(min=1e-8),
+            f"q/td_abs_mean{suffix}": err.abs().mean(dim=1),
+            f"q/td_abs_max{suffix}": err.abs().amax(dim=1),
+            f"q/mean{suffix}": q.mean(dim=1),
+        }
+
     def critic_health_metrics(self, prediction: torch.Tensor, target_values: torch.Tensor, rows: int,
                               demo_rows: int = 0) -> Dict[str, torch.Tensor]:
         """Per agent, over its rows of the last critic batch -- all of them, and with demo rows in the batch also its
         online rows (``_online``) and its demo rows (``_demo``; the batch holds each agent's online rows first):
-        ``q/explained_variance`` (1 - Var(y - Q) / Var(y), Q the critics' prediction, y the target),
-        ``q/td_abs_mean`` / ``q/td_abs_max`` (|y - Q|) and ``q/mean`` (Q)."""
+        :meth:`health_of`, Q the critics' prediction, y the target."""
         q = prediction.reshape(self.num_agents, rows)
         y = target_values.reshape(self.num_agents, rows)
-
-        def health(qs: torch.Tensor, ys: torch.Tensor, suffix: str) -> Dict[str, torch.Tensor]:
-            err = ys - qs
-            var_y = ys.var(dim=1, unbiased=False)
-            return {
-                f"q/explained_variance{suffix}": 1.0 - err.var(dim=1, unbiased=False) / var_y.clamp(min=1e-8),
-                f"q/td_abs_mean{suffix}": err.abs().mean(dim=1),
-                f"q/td_abs_max{suffix}": err.abs().amax(dim=1),
-                f"q/mean{suffix}": qs.mean(dim=1),
-            }
-
-        out = health(q, y, "")
+        out = self.health_of(q, y, "")
         online = rows - int(demo_rows)
         if 0 < int(demo_rows) < rows:
-            out.update(health(q[:, :online], y[:, :online], "_online"))
-            out.update(health(q[:, online:], y[:, online:], "_demo"))
+            out.update(self.health_of(q[:, :online], y[:, :online], "_online"))
+            out.update(self.health_of(q[:, online:], y[:, online:], "_demo"))
         return out
+
+    def critic_values(self, transitions: List[Optional[Dict[str, torch.Tensor]]],
+                      chunk: int = 4096) -> List[Optional[tuple]]:
+        """The critics' prediction and TD target on given transitions, one set per agent slot (None: skip that slot),
+        as the critic update computes them (:meth:`_compute_critic_loss`: the n-step target from the target critics
+        at the target actor's next action, its smoothing noise, the terminals), with no gradient, update or
+        normalizer change. Every set holds the batch names the update reads (``_demo_names()``, ``discounts`` with
+        ``n_step`` > 1). Returns per slot ``(q, y)``, each ``(rows,)``, or None."""
+        names = self._demo_names() + (["discounts"] if self._n_step() > 1 else [])
+        sizes = [0 if t is None else int(t["rewards"].shape[0]) for t in transitions]
+        longest = max(sizes) if sizes else 0
+        if longest == 0:
+            return [None] * len(transitions)
+        if len(transitions) != self.num_agents:
+            raise ValueError(f"critic_values takes one set per agent slot ({self.num_agents}), got {len(transitions)}")
+        qs: List[List[torch.Tensor]] = [[] for _ in transitions]
+        ys: List[List[torch.Tensor]] = [[] for _ in transitions]
+        with torch.no_grad():
+            for start in range(0, longest, int(chunk)):
+                rows = min(int(chunk), longest - start)
+                batch = {}
+                for name in names:
+                    parts = []
+                    for t, size in zip(transitions, sizes):
+                        if size == 0:  # a skipped slot: any rows of the right width (its outputs are dropped)
+                            ref = next(x for x in transitions if x is not None)[name]
+                            parts.append(ref[:1].to(self.device).expand(rows, -1))
+                            continue
+                        index = torch.clamp(torch.arange(start, start + rows, device=self.device), max=size - 1)
+                        parts.append(t[name].to(self.device)[index])
+                    dtype = torch.bool if name in ("terminated", "truncated") else torch.float32
+                    batch[name] = torch.cat(parts).to(dtype)
+                inputs, next_inputs, critic_inputs, critic_next_inputs = self._batch_inputs(batch, train=False)
+                with self._batch_mode(self.critics, False):
+                    _, q1, q2, target, _, _ = self._compute_critic_loss(
+                        sampled=batch, inputs=inputs, next_inputs=next_inputs, critic_inputs=critic_inputs,
+                        critic_next_inputs=critic_next_inputs, rows=rows,
+                    )
+                q = self._critic_prediction(q1, q2).reshape(self.num_agents, rows)
+                y = target.reshape(self.num_agents, rows)
+                for agent, size in enumerate(sizes):
+                    keep = max(0, min(rows, size - start))
+                    if keep:
+                        qs[agent].append(q[agent, :keep])
+                        ys[agent].append(y[agent, :keep])
+        return [(torch.cat(q), torch.cat(y)) if q else None for q, y in zip(qs, ys)]
 
     def _batch_inputs(self, sampled, train: bool = True):
         """The (normalized) actor and critic inputs of a sampled batch; ``train`` updates the
