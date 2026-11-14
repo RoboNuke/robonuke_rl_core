@@ -1,0 +1,4 @@
+# both bases build on base.yaml: it is applied once, first, so mid's and the method's values stand
+base:
+  - ../nested/mid.yaml
+  - method_on_base.yaml

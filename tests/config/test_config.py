@@ -170,6 +170,38 @@ def test_cycle_raises_and_prints_the_chain():
     assert "cycle_a.yaml" in message and "cycle_b.yaml" in message
 
 
+def test_a_list_base_applies_its_files_in_order_then_the_file_itself():
+    from robonuke_rl_core.configfile import chain
+
+    files = [p.name for p in chain(FIXTURES / "multi/leaf.yaml")]
+    assert files == ["base.yaml", "method.yaml", "leaf.yaml"]
+    cfg = load_config(FIXTURES / "multi/leaf.yaml")
+    assert cfg.task_cfg.decimation == 4  # the task file's
+    assert cfg.experiment.seed == 7 and cfg.wandb.project == "method_project"  # the method beats the task file
+    assert cfg.wandb.group == "multi_group"  # the file beats both
+
+
+def test_a_file_reached_through_two_bases_is_applied_once_in_its_first_place():
+    from robonuke_rl_core.configfile import chain
+
+    files = [p.relative_to(FIXTURES).as_posix() for p in chain(FIXTURES / "multi/diamond.yaml")]
+    assert files == ["base.yaml", "nested/mid.yaml", "multi/method_on_base.yaml", "multi/diamond.yaml"]
+    cfg = load_config(FIXTURES / "multi/diamond.yaml")
+    assert cfg.experiment.seed == 200  # mid's, not re-overwritten by a second base.yaml layer
+    assert cfg.wandb.project == "method_on_base_project"
+
+
+def test_a_list_base_that_names_its_own_file_is_a_cycle():
+    with pytest.raises(ValueError, match="cycle"):
+        load_config(FIXTURES / "multi/self_list.yaml")
+
+
+def test_a_missing_file_in_a_list_base_is_named():
+    with pytest.raises(FileNotFoundError) as err:
+        load_config(FIXTURES / "multi/missing_in_list.yaml")
+    assert "not_there.yaml" in str(err.value) and "missing_in_list.yaml" in str(err.value)
+
+
 # ------------------------------------------------------------------ 3. unknown keys
 @pytest.mark.parametrize(
     "fixture, needle",

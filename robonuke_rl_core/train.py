@@ -92,11 +92,16 @@ def main(argv=None, setup=None) -> int:
     # at another width (they are built for it)
     transform = None
     if learner_name in q_learners:
-        from robonuke_rl_core.learners.sac import critic_action_space, critic_action_transform, demo_loader
+        from robonuke_rl_core.learners.sac import critic_action_space, critic_action_transform, demo_loader, exploration_scale
 
         transform = critic_action_transform(cfg, env)
         # a project's register_demo_loader: the demo file's transitions are built at load, with the env's own code
         loader = demo_loader(cfg, env)
+        # a project's register_exploration_scale: DDPG's adaptive exploration std reads the env's per-step scale
+        noise_scale = exploration_scale(cfg, env)
+        if getattr(learner_cfg, "exploration_std_mode", "constant") == "adaptive" and noise_scale is None:
+            raise ValueError(f"{learner_name}.exploration_std_mode: adaptive needs the env's per-step scale, and no "
+                             "register_exploration_scale builder answered for this run")
     def make_learner(learner_cfg, dirs):
         """One learner of ``learner_cfg`` with its own models, memory and optimizers (a routed SAC builds one per
         phase)."""
@@ -152,6 +157,8 @@ def main(argv=None, setup=None) -> int:
             # set before the trainer's init(): the memory stores the transform's side inputs
             learner.critic_action_transform = transform
             learner.demo_loader = loader
+            if learner_name == "ddpg":
+                learner.exploration_scale = noise_scale
             if loader is not None:
                 print("[train] demo transitions built at load by a registered demo loader (register_demo_loader)", flush=True)
             if learner.critic_action_transform is not None:

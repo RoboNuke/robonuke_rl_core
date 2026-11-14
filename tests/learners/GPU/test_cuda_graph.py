@@ -250,7 +250,7 @@ def test_a_ddpg_step_with_resfit_settings_replays_to_the_eager_step(tmp_path, de
                      demo_batch_shared=True)
     cfg = DDPGCfg(batch_size=16, gradient_steps=4, policy_delay=4, num_critics=10, critic_subset=2, actor_q_reduction="mean",
                   critic_loss="mean_abs_squared", target_policy_noise=True, target_noise_clip=0.3, exploration_std=0.05,
-                  actor_action_scale=0.1, n_step=3, polyak=0.005, weight_decay=0.01, grad_norm_clip=1.0,
+                  action_range=[-0.1, 0.1], n_step=3, polyak=0.005, weight_decay=0.01, grad_norm_clip=1.0,
                   learning_starts=0, **extra)
     model = MlpModelCfg(actor=MlpActorCfg(hidden_size=32, num_layers=2, layer_norm=True, init="default", output_init_scale=0.0),
                         critic=MlpCriticCfg(hidden_size=32, num_layers=2, layer_norm=True, init="default"))

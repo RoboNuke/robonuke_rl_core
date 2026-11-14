@@ -1,9 +1,11 @@
 """Deep Deterministic Policy Gradient (``trainer.learner: ddpg``; Lillicrap et al. 2016), with the TD3 / REDQ / ResFiT
 pieces as options (``learners/cfg.py`` ``DDPGCfg``).
 
-The actor is deterministic, ``a = actor_action_scale * tanh(mu(s))`` (the model's squashed mean); exploration is
-Gaussian noise of a fixed, scheduled std added to it when acting (``exploration_std``; ``noise_repeat``: each agent's
-draw held for k ~ truncated Zeta steps, as SAC's), the action clamped to ``action_clip``. The critics regress on
+The actor is deterministic, ``a = mid + half * tanh(mu(s))`` over ``action_range`` ``[lo, hi]`` (the model's squashed
+mean; ``tanh(mu) = 0`` is the range's midpoint); exploration is Gaussian noise of a fixed, scheduled std added to it when
+acting (``exploration_std``; ``exploration_std_mode: adaptive``: times a per-env, per-dim scale the project's env
+publishes, :func:`~robonuke_rl_core.learners.sac.register_exploration_scale`; ``noise_repeat``: each agent's draw held
+for k ~ truncated Zeta steps, as SAC's), the action clamped to the range (``clip_actions``). The critics regress on
 
     y = r + gamma^n * (1 - done) * reduce_target(Q'_k(s', a')),   a' = mu'(s') [+ clip(N(0, std), +-c)]
 
@@ -52,6 +54,13 @@ class DDPG(SAC):
         self._sync_target_policy()
         #: the exploration std now, a device tensor the captured target-smoothing noise reads (updated in place)
         self._explore_std = torch.full((), float(self.cfg.exploration_std), device=self.device)
+        #: action_range's midpoint and half width: the actor's action is mid + half * tanh(mu)
+        lo, hi = (float(v) for v in self.cfg.action_range)
+        self._range = (lo, hi)
+        self._mid, self._half = (lo + hi) / 2.0, (hi - lo) / 2.0
+        #: exploration_std_mode: adaptive -- ``() -> (num_envs, A)``, this step's per-env, per-dim scale on the noise std,
+        #: set by the trainer from the project's register_exploration_scale builder (None until then)
+        self.exploration_scale = None
         #: critic_warmup_updates, per agent: its burst has run (or none is asked for); _in_critic_warmup while one runs
         self._agent_warmed = [int(self.cfg.critic_warmup_updates) == 0] * self.num_agents
         self._in_critic_warmup = False
@@ -149,15 +158,30 @@ class DDPG(SAC):
         return cached[1]
 
     def _clamp(self, actions: torch.Tensor) -> torch.Tensor:
-        clip = self.cfg.action_clip
-        return actions if clip is None else actions.clamp(-float(clip), float(clip))
+        """``actions`` clamped to ``action_range`` (``clip_actions``), else as they are."""
+        return actions.clamp(*self._range) if self.cfg.clip_actions else actions
 
     def _deterministic(self, model, inputs) -> tuple:
-        """``(actor_action_scale * tanh(mu(s)), outputs)`` of ``model`` (the actor or its target)."""
+        """``(mid + half * tanh(mu(s)), outputs)`` of ``model`` (the actor or its target)."""
         _, outputs = model.act(inputs, role="policy")
         if "mean_actions" not in outputs:
             raise RuntimeError("DDPG's actor must return mean_actions (a squashed Gaussian actor's tanh(mu))")
-        return outputs["mean_actions"] * float(self.cfg.actor_action_scale), outputs
+        return self._mid + self._half * outputs["mean_actions"], outputs
+
+    def _noise_scale(self):
+        """``exploration_std_mode: adaptive``: this step's ``(num_envs, A)`` scale on the noise std; constant: None."""
+        if self.cfg.exploration_std_mode != "adaptive":
+            return None
+        if self.exploration_scale is None:
+            raise RuntimeError(
+                "ddpg.exploration_std_mode: adaptive scales the noise by the env's per-step scale, but no "
+                "builder answered (register_exploration_scale in the training script's setup())"
+            )
+        return self.exploration_scale()
+
+    def _uniform_warmup(self, rows: int, width: int) -> torch.Tensor:
+        """ResFiT's warm-up action: ``mid + U(-random_action_scale, random_action_scale)`` per dim."""
+        return self._mid + (torch.rand((rows, width), device=self.device) * 2.0 - 1.0) * float(self.cfg.random_action_scale)
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
         if self.training and timestep == 0 and not getattr(self, "_initial_logged", False):
@@ -169,8 +193,7 @@ class DDPG(SAC):
         random_agents = self._agent_random_phase(timestep) if self.training else [False] * self.num_agents
         around_actor = self.cfg.random_action_mode == "actor_gaussian"
         if all(random_agents) and not around_actor:
-            scale = float(self.cfg.random_action_scale)
-            return (torch.rand((rows, width), device=self.device) * 2.0 - 1.0) * scale, {}
+            return self._uniform_warmup(rows, width), {}
         inputs = {"observations": self.normalize_observations(observations)}
         with torch.no_grad(), self._batch_mode(self.policy, False):
             mean, outputs = self._deterministic(self.policy, inputs)
@@ -182,6 +205,9 @@ class DDPG(SAC):
             # steps), else a fresh one every step
             draw = self._repeated_noise(rows, mean.shape[-1]) if self.cfg.noise_repeat else torch.randn_like(mean)
             noise = draw * std
+            scale = self._noise_scale()
+            if scale is not None:  # exploration_std_mode: adaptive -- each env's and dim's std follows the env's scale
+                noise = noise * scale
             if self.cfg.exploration_noise_clip is not None:
                 noise = noise.clamp(-float(self.cfg.exploration_noise_clip), float(self.cfg.exploration_noise_clip))
             actions = self._clamp(mean + noise)
@@ -192,7 +218,7 @@ class DDPG(SAC):
                 if around_actor:  # random_action_mode: actor_gaussian, about the actor's own action
                     warm = self._clamp(mean + torch.randn_like(mean) * float(self.cfg.random_action_scale))
                 else:
-                    warm = (torch.rand((rows, width), device=self.device) * 2.0 - 1.0) * float(self.cfg.random_action_scale)
+                    warm = self._uniform_warmup(rows, width)
                 actions = torch.where(per_env[:, None], warm, actions)
         self._emit_std_by_label({"log_std": torch.full_like(mean, math.log(max(std, 1e-12)))}, timestep)
         return actions, {**outputs, "mean_actions": mean}
@@ -203,7 +229,9 @@ class DDPG(SAC):
         with torch.no_grad(), self._batch_mode(self.policy, False):
             mean, _ = self._deterministic(self.policy, {"observations": self.normalize_observations(observations)})
             if not deterministic:
-                mean = mean + torch.randn_like(mean) * self.exploration_std(0)
+                noise = torch.randn_like(mean) * self.exploration_std(0)
+                scale = self._noise_scale() if self.exploration_scale is not None else None
+                mean = mean + (noise if scale is None else noise * scale)
             return self._clamp(mean)
 
     def _log_initial_policy(self, observations: torch.Tensor) -> None:
@@ -332,9 +360,8 @@ class DDPG(SAC):
     def _compute_actor_loss(self, *, sampled, inputs, critic_inputs, rows, next_inputs=None):
         with self._batch_mode(self.policy, True):
             actions, outputs = self._deterministic(self.policy, inputs)
-        clip = self.cfg.action_clip
-        if clip is not None:  # a straight-through clamp: the value is clamped, the gradient passes
-            actions = actions + (actions.clamp(-float(clip), float(clip)) - actions).detach()
+        if self.cfg.clip_actions:  # a straight-through clamp to action_range: the value is clamped, the gradient passes
+            actions = actions + (actions.clamp(*self._range) - actions).detach()
         with self._batch_mode(self.critics, False):
             q_out, _ = self.critics.act(
                 {**critic_inputs, "taken_actions": self._critic_actions(sampled, "observations", actions)}, role="critics"

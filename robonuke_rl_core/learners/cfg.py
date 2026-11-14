@@ -704,8 +704,8 @@ class SACCfg(_CommonCfg):
 
 @dataclass
 class DDPGCfg(SACCfg):
-    """Deep Deterministic Policy Gradient (``learners/ddpg.py``): a deterministic actor ``a = actor_action_scale *
-    tanh(mu(s))``, Gaussian exploration noise of a fixed (scheduled) std around it, a target actor and target critics
+    """Deep Deterministic Policy Gradient (``learners/ddpg.py``): a deterministic actor ``a = mid + half * tanh(mu(s))``
+    over ``action_range`` ``[lo, hi]``, Gaussian exploration noise of a fixed (scheduled) std around it, a target actor and target critics
     (Polyak ``polyak``), the critic regressed on ``r + gamma^n Q'(s', mu'(s'))`` and the actor on ``-Q(s, mu(s))`` --
     no entropy. Everything but the entropy is SAC's machinery (the replay memory, n-step rows, demos, per-phase
     routing and its clocks, held rows, logging, CUDA graphs), configured by the same fields. The defaults are plain
@@ -722,9 +722,11 @@ class DDPGCfg(SACCfg):
     backup_entropy: bool = False
     #: the actor's observations as they come (SAC's running normalizer is opt-in here)
     state_preprocessor: str = "none"
-    #: the actor's output: ``actor_action_scale * tanh(mu(s))`` (ResFiT: 0.1, the residual's reach in normalized
-    #: action units)
-    actor_action_scale: float = 1.0
+    #: the actor's action range ``[lo, hi]``: its output is ``mid + half * tanh(mu(s))``, ``mid = (lo + hi) / 2``,
+    #: ``half = (hi - lo) / 2``, so ``tanh(mu) = 0`` is the midpoint (``model.actor.output_bias`` moves the start).
+    #: ResFiT: ``[-0.1, 0.1]``, the residual's reach in normalized action units; a multiplier whose neutral value is 1:
+    #: a range centred on 1
+    action_range: List[float] = field(default_factory=lambda: [-1.0, 1.0])
     #: the exploration noise's std, added to the actor's action when acting (not clipped unless
     #: ``exploration_noise_clip``): linear from ``exploration_std`` to ``exploration_std_end`` over
     #: ``exploration_std_steps`` env steps (0 or ``exploration_std_end`` None: constant). ResFiT: 0.05
@@ -732,9 +734,14 @@ class DDPGCfg(SACCfg):
     exploration_std_end: Optional[float] = None
     exploration_std_steps: int = 0
     exploration_noise_clip: Optional[float] = None
-    #: every action (acting, the target's next action, the actor's own) clamped to [-action_clip, action_clip]
-    #: (ResFiT: 1.0, its normalized range); None: no clamp
-    action_clip: Optional[float] = 1.0
+    #: ``constant``: the noise std is ``exploration_std`` (scheduled) on every env and dim. ``adaptive``: each env's and
+    #: dim's std is that times a per-step scale the project's env publishes (``register_exploration_scale``; a residual:
+    #: the base's motion in r units), so the noise follows how much the base is moving. The target smoothing noise stays
+    #: ``exploration_std``
+    exploration_std_mode: str = "constant"
+    #: every action (acting with its noise, the target's next action, the actor's own in its loss, straight-through)
+    #: clamped to ``action_range``; false: unclamped (ResFiT clamps the executed action, not r)
+    clip_actions: bool = True
     #: the critic target's next action from the target actor (DDPG, TD3); false: from the actor itself
     target_actor: bool = True
     #: TD3's target-policy smoothing: the target's next action gets N(0, the exploration std) noise clipped to
@@ -750,13 +757,13 @@ class DDPGCfg(SACCfg):
     q_target_max: Optional[float] = None
     #: ResFiT's ``action_l2_reg_weight``: ``weight * mean_rows(sum_d a_d^2)`` on the actor's action, added to its loss
     action_l2_reg_weight: float = 0.0
-    #: uniform warm-up actions in [-random_action_scale, random_action_scale] -- for a residual, the base plus that
-    #: noise (ResFiT: 0.2) -- while this learner has not started learning (``learning_starts`` / ``learning_starts_rows``
+    #: uniform warm-up actions, ``mid +- U(random_action_scale)`` (the range's midpoint; for a residual, the base plus
+    #: that noise; ResFiT: 0.2) -- while this learner has not started learning (``learning_starts`` / ``learning_starts_rows``
     #: not reached) or for the first ``random_timesteps`` env steps. 0: the actor (with its noise) from the start
     random_action_scale: float = 0.0
-    #: what a warm-up action is. "uniform": ResFiT's, ``U(-random_action_scale, random_action_scale)`` per dim, about 0.
+    #: what a warm-up action is. "uniform": ResFiT's, ``mid + U(-random_action_scale, random_action_scale)`` per dim.
     #: "actor_gaussian": the actor's own deterministic action plus ``N(0, random_action_scale)`` per dim, clamped to
-    #: ``action_clip`` -- about the actor's starting point when 0 is not the residual's neutral action
+    #: ``action_range`` (``clip_actions``) -- about the actor's starting point when 0 is not the residual's neutral action
     #: (``model.actor.output_bias``)
     random_action_mode: str = "uniform"
     #: ResFiT's critic warm-up: once this learner may first update, this many critic-only gradient steps run at once,
@@ -772,6 +779,7 @@ class DDPGCfg(SACCfg):
     ACTOR_Q_REDUCTIONS = ("min", "mean", "min_random_pair", "q1")
     MIN_CRITICS = 1
     CRITIC_LOSSES = ("mse", "mean_abs_squared")
+    EXPLORATION_STD_MODES = ("constant", "adaptive")
 
     def validate(self, cfg: Any) -> None:
         super().validate(cfg)
@@ -791,8 +799,10 @@ class DDPGCfg(SACCfg):
         used = sorted(k for k, on in sac_only.items() if on)
         if used:
             raise ValueError(f"{name}: {used} are SAC options DDPG does not implement; leave them at their defaults")
-        if self.actor_action_scale <= 0:
-            raise ValueError(f"{name}.actor_action_scale must be > 0, got {self.actor_action_scale}")
+        if len(self.action_range) != 2 or not float(self.action_range[0]) < float(self.action_range[1]):
+            raise ValueError(f"{name}.action_range is [lo, hi] with lo < hi, got {list(self.action_range)}")
+        if self.exploration_std_mode not in self.EXPLORATION_STD_MODES:
+            raise ValueError(f"{name}.exploration_std_mode must be one of {self.EXPLORATION_STD_MODES}, got {self.exploration_std_mode!r}")
         if self.shared_warmup:
             if int(self.learning_starts_rows) <= 0:
                 raise ValueError(f"{name}.shared_warmup pools the rows until learning_starts_rows: set it > 0")
@@ -803,10 +813,8 @@ class DDPGCfg(SACCfg):
             raise ValueError(f"{name}.exploration_std (and _end) must be >= 0")
         if self.exploration_std_steps < 0:
             raise ValueError(f"{name}.exploration_std_steps must be >= 0, got {self.exploration_std_steps}")
-        for field_name in ("exploration_noise_clip", "action_clip"):
-            value = getattr(self, field_name)
-            if value is not None and value <= 0:
-                raise ValueError(f"{name}.{field_name} must be > 0 or null, got {value}")
+        if self.exploration_noise_clip is not None and self.exploration_noise_clip <= 0:
+            raise ValueError(f"{name}.exploration_noise_clip must be > 0 or null, got {self.exploration_noise_clip}")
         if self.target_noise_clip <= 0:
             raise ValueError(f"{name}.target_noise_clip must be > 0, got {self.target_noise_clip}")
         if self.critic_loss not in self.CRITIC_LOSSES:

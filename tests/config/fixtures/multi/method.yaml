@@ -1,0 +1,7 @@
+# a method file: no task, no base; chained after a task file by a list base
+experiment:
+  seed: 7
+wandb:
+  project: method_project
+  tags:
+    - method

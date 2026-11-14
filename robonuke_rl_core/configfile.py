@@ -36,32 +36,42 @@ OVERRIDE_RE = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*=.*$", re.DOTALL)
 def chain(path: str | Path) -> List[Path]:
     """Follow ``base`` from ``path``; return the files most-base first.
 
-    Each ``base`` is relative to the file that names it. A missing file or a cycle raises,
-    printing the chain followed so far — a chain is only debuggable if the error shows it.
+    ``base`` is one file or a list of files, each relative to the file that names it. A list is followed in order,
+    depth-first: ``base: [a, b]`` gives ``a``'s chain, then ``b``'s, then the file itself, so ``b`` overrides ``a``
+    and the file overrides both (a task file plus a method file, e.g. ``[../base/fb_one_leg.yaml,
+    ../methods/resfit.yaml]``). A file reached a second time through another base keeps its first place (a shared
+    ancestor such as ``hpc.yaml`` is applied once, under everything that builds on it). A missing file or a cycle
+    raises, printing the chain followed so far -- a chain is only debuggable if the error shows it.
     """
     start = Path(path).expanduser()
     if not start.is_file():
         raise FileNotFoundError(f"config file not found: {start}")
     followed: List[Path] = []
-    current = start.resolve()
-    while True:
-        if current in followed:
-            shown = " -> ".join(str(p) for p in followed + [current])
+
+    def visit(current: Path, stack: List[Path]) -> None:
+        if current in stack:
+            shown = " -> ".join(str(p) for p in stack + [current])
             raise ValueError(f"'base' chain is a cycle: {shown}")
-        followed.append(current)
+        if current in followed:
+            return
         base = OmegaConf.load(current).get("base")
-        if base is None:
-            break
-        nxt = Path(str(base)).expanduser()
-        nxt = (nxt if nxt.is_absolute() else current.parent / nxt).resolve()
-        if not nxt.is_file():
-            shown = " -> ".join(str(p) for p in followed)
-            raise FileNotFoundError(
-                f"base config file not found: {nxt}\n  named by 'base: {base}' in {current}\n"
-                f"  'base' is relative to the file that names it\n  chain so far: {shown}"
-            )
-        current = nxt
-    return list(reversed(followed))
+        bases = [] if base is None else (list(base) if not isinstance(base, (str, bytes)) else [base])
+        for entry in bases:
+            if not isinstance(entry, str):
+                raise ValueError(f"'base' in {current} must be a file path or a list of file paths, got {entry!r}")
+            nxt = Path(entry).expanduser()
+            nxt = (nxt if nxt.is_absolute() else current.parent / nxt).resolve()
+            if not nxt.is_file():
+                shown = " -> ".join(str(p) for p in stack + [current])
+                raise FileNotFoundError(
+                    f"base config file not found: {nxt}\n  named by 'base: {entry}' in {current}\n"
+                    f"  'base' is relative to the file that names it\n  chain so far: {shown}"
+                )
+            visit(nxt, stack + [current])
+        followed.append(current)
+
+    visit(start.resolve(), [])
+    return followed
 
 
 def file_layer(path: Path) -> DictConfig:

@@ -1,0 +1,3 @@
+base: ../base.yaml
+wandb:
+  project: method_on_base_project

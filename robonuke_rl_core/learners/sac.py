@@ -59,7 +59,7 @@ from .cuda_graph import StepGraphs
 from .n_step import NStepWindow, n_step_rows
 
 __all__ = ["SAC", "register_critic_action", "critic_action_transform", "critic_action_space", "categorical_projection",
-           "register_demo_loader", "demo_loader"]
+           "register_demo_loader", "demo_loader", "register_exploration_scale", "exploration_scale"]
 
 #: ``fn(cfg, env) -> loader | None``, registered by a project in its training script's ``setup()``: a loader
 #: ``(data, route_label) -> transitions`` turns a demo file that does not hold ready transitions (``data``, the file's
@@ -119,6 +119,26 @@ def critic_action_transform(cfg: Any, env: Any) -> Any:
     found = [t for t in (fn(cfg, env) for fn in CRITIC_ACTION_BUILDERS) if t is not None]
     if len(found) > 1:
         raise ValueError(f"{len(found)} registered critic-action builders answered for this run; at most one may")
+    return found[0] if found else None
+
+
+#: ``fn(cfg, env) -> scale | None``, registered by a project in its training script's ``setup()``: ``scale`` is a
+#: callable ``() -> (num_envs, A)`` device tensor, this env step's per-env, per-dim factor on DDPG's exploration std
+#: (``exploration_std_mode: adaptive``; a residual: the base's motion in r units), read when the learner acts, after
+#: the env built the step's observation. At most one builder may answer
+EXPLORATION_SCALE_BUILDERS: List[Any] = []
+
+
+def register_exploration_scale(fn: Any) -> None:
+    """Add an :data:`EXPLORATION_SCALE_BUILDERS` entry; ``scripts/train.py`` asks each once its env is built."""
+    EXPLORATION_SCALE_BUILDERS.append(fn)
+
+
+def exploration_scale(cfg: Any, env: Any) -> Any:
+    """The one scale a registered builder returns for this run, or None."""
+    found = [f for f in (fn(cfg, env) for fn in EXPLORATION_SCALE_BUILDERS) if f is not None]
+    if len(found) > 1:
+        raise ValueError(f"{len(found)} registered exploration-scale builders answered for this run; at most one may")
     return found[0] if found else None
 
 

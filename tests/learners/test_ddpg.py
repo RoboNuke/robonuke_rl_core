@@ -33,8 +33,9 @@ def batch(learner):
     return sampled, inputs, next_inputs, critic_inputs, critic_next_inputs
 
 
-def test_the_action_is_the_scaled_squashed_mean_plus_scheduled_noise_clamped():
-    learner = ddpg(actor_action_scale=0.1, exploration_std=0.4, exploration_std_end=0.0, exploration_std_steps=100)
+def test_the_action_is_the_squashed_mean_on_the_range_plus_scheduled_noise_clamped():
+    learner = ddpg(action_range=[-0.1, 0.1], exploration_std=0.4, exploration_std_end=0.0, exploration_std_steps=100,
+                   clip_actions=False)
     obs = torch.randn(6, OBS_DIM)
     with torch.no_grad():
         _, out = learner.policy.act({"observations": obs}, role="policy")
@@ -49,12 +50,12 @@ def test_the_action_is_the_scaled_squashed_mean_plus_scheduled_noise_clamped():
     torch.manual_seed(0)
     noisy = torch.stack([learner.act(obs, None, timestep=50, timesteps=100)[0] for _ in range(400)])
     assert float((noisy - mean).std()) == pytest.approx(0.2, rel=0.1)  # the std at step 50
-    clamped = ddpg(actor_action_scale=1.0, exploration_std=5.0, action_clip=1.0)
+    clamped = ddpg(exploration_std=5.0)  # clip_actions (the default): clamped to [-1, 1]
     assert float(clamped.act(obs, None, timestep=1, timesteps=100)[0].abs().max()) <= 1.0
 
 
 def test_noise_repeat_holds_the_exploration_draw_per_agent_for_its_drawn_length():
-    learner = ddpg(actor_action_scale=1.0, exploration_std=0.3, action_clip=10.0, noise_repeat=True, noise_repeat_max=8)
+    learner = ddpg(exploration_std=0.3, clip_actions=False, noise_repeat=True, noise_repeat_max=8)
     learner.enable_training_mode(True)
     obs = torch.randn(6, OBS_DIM)
     with torch.no_grad():
@@ -81,7 +82,8 @@ def test_noise_repeat_holds_the_exploration_draw_per_agent_for_its_drawn_length(
 
 
 def test_resfits_warm_up_acts_uniformly_until_this_learner_starts_learning():
-    learner = ddpg(random_action_scale=0.2, learning_starts_rows=10**6, actor_action_scale=0.1, exploration_std=0.0)
+    learner = ddpg(random_action_scale=0.2, learning_starts_rows=10**6, action_range=[-0.1, 0.1], exploration_std=0.0,
+                   clip_actions=False)
     obs = torch.randn(6, OBS_DIM)
     torch.manual_seed(0)
     warm = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(200)])
@@ -94,9 +96,9 @@ def test_resfits_warm_up_acts_uniformly_until_this_learner_starts_learning():
 
 def test_the_actor_gaussian_warm_up_acts_about_the_actors_own_action():
     # random_action_mode: actor_gaussian with model.actor.output_bias: the actor starts at tanh(bias) for every state
-    # (a zero output layer), and the warm-up draws N(0, random_action_scale) about it, clamped to action_clip
+    # (a zero output layer), and the warm-up draws N(0, random_action_scale) about it, clamped to the range
     learner = ddpg(random_action_scale=0.05, random_action_mode="actor_gaussian", learning_starts_rows=10**6,
-                   actor_action_scale=1.0, action_clip=1.0, exploration_std=0.0,
+                   exploration_std=0.0,
                    model_overrides={"output_init_scale": 0.0, "output_bias": math.atanh(0.6)})
     obs = torch.randn(6, OBS_DIM)
     learner.enable_training_mode(False)
@@ -109,13 +111,61 @@ def test_the_actor_gaussian_warm_up_acts_about_the_actors_own_action():
     assert float(warm.abs().max()) <= 1.0
 
 
+def test_an_off_centre_range_starts_at_its_midpoint_and_clamps_to_its_ends():
+    # a multiplier-style range: tanh(mu) = 0 is the midpoint 1, the actor's start with a zero output layer
+    learner = ddpg(action_range=[-1.5, 3.5], exploration_std=0.0, model_overrides={"output_init_scale": 0.0})
+    obs = torch.randn(6, OBS_DIM)
+    learner.enable_training_mode(False)
+    torch.testing.assert_close(learner.act(obs, None, timestep=0, timesteps=100)[0], torch.full((6, ACT_DIM), 1.0))
+    learner.enable_training_mode(True)
+    learner.cfg.exploration_std = 10.0
+    learner._agent_rows_ready = [True] * learner.num_agents
+    torch.manual_seed(0)
+    acted = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(50)])
+    assert float(acted.min()) == pytest.approx(-1.5) and float(acted.max()) == pytest.approx(3.5)  # clamped to the range
+    loose = ddpg(action_range=[-1.5, 3.5], exploration_std=10.0, clip_actions=False, model_overrides={"output_init_scale": 0.0})
+    loose.enable_training_mode(True)
+    loose._agent_rows_ready = [True] * loose.num_agents
+    wide = torch.stack([loose.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(50)])
+    assert float(wide.max()) > 3.5 and float(wide.min()) < -1.5  # clip_actions: false leaves the noise unclamped
+
+
+def test_the_uniform_warm_up_is_about_the_ranges_midpoint():
+    learner = ddpg(action_range=[-1.5, 3.5], random_action_scale=0.5, learning_starts_rows=10**6, exploration_std=0.0)
+    obs = torch.randn(6, OBS_DIM)
+    torch.manual_seed(0)
+    warm = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(300)])
+    assert float(warm.min()) >= 0.5 and float(warm.max()) <= 1.5  # 1 +- 0.5
+    assert float(warm.mean()) == pytest.approx(1.0, abs=0.02)
+
+
+def test_adaptive_exploration_scales_each_envs_and_dims_std_by_the_envs_scale():
+    learner = ddpg(exploration_std=0.2, exploration_std_mode="adaptive", clip_actions=False)
+    learner._agent_rows_ready = [True] * learner.num_agents
+    learner.enable_training_mode(True)
+    obs = torch.randn(6, OBS_DIM)
+    with pytest.raises(RuntimeError, match="register_exploration_scale"):
+        learner.act(obs, None, timestep=1, timesteps=100)  # adaptive with no scale: refused, never a silent constant
+    scale = torch.ones(6, ACT_DIM)
+    scale[0] = 0.0  # env 0 still: no noise
+    scale[1, 0] = 5.0  # env 1, dim 0: five times the std
+    learner.exploration_scale = lambda: scale
+    with torch.no_grad():
+        mean = learner.policy.act({"observations": obs}, role="policy")[1]["mean_actions"]
+    torch.manual_seed(0)
+    noise = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(400)]) - mean
+    assert float(noise[:, 0].abs().max()) == 0.0
+    assert float(noise[:, 1, 0].std()) == pytest.approx(1.0, rel=0.1)
+    assert float(noise[:, 2:].std()) == pytest.approx(0.2, rel=0.1)
+
+
 def test_the_warm_up_mode_must_be_known():
     with pytest.raises(ValueError, match="random_action_mode"):
         DDPGCfg(random_action_mode="normal").validate(None)
 
 
 def test_the_critic_target_is_r_plus_gamma_min_of_target_critics_at_the_target_actors_action():
-    learner = ddpg(num_critics=2, critic_subset=2, discount_factor=0.9, actor_action_scale=0.5)
+    learner = ddpg(num_critics=2, critic_subset=2, discount_factor=0.9, action_range=[-0.5, 0.5])
     fill_memory(learner)
     with torch.no_grad():  # the target actor differs from the actor, so the source of a' shows
         for p in learner.target_policy.parameters():
@@ -126,7 +176,7 @@ def test_the_critic_target_is_r_plus_gamma_min_of_target_critics_at_the_target_a
                                                          rows=learner.cfg.batch_size)
     with torch.no_grad():
         _, out = learner.target_policy.act(next_inputs, role="policy")
-        a_next = (out["mean_actions"] * 0.5).clamp(-1, 1)
+        a_next = (out["mean_actions"] * 0.5).clamp(-0.5, 0.5)
         q, _ = learner.target_critics.act({**critic_next_inputs, "taken_actions": a_next}, role="target_critics")
         terminal = sampled["terminated"] & ~sampled["truncated"]
         expected = sampled["rewards"] + 0.9 * (~terminal) * q.min(dim=0).values
@@ -173,7 +223,7 @@ def test_the_critic_loss_forms():
 
 @pytest.mark.parametrize("reduction", ["mean", "min", "q1"])
 def test_the_actor_maximizes_the_reduced_q_at_its_noise_free_action(reduction):
-    learner = ddpg(num_critics=3, critic_subset=2, actor_q_reduction=reduction, actor_action_scale=0.3,
+    learner = ddpg(num_critics=3, critic_subset=2, actor_q_reduction=reduction, action_range=[-0.3, 0.3],
                    action_l2_reg_weight=0.5)
     fill_memory(learner)
     sampled, inputs, _, critic_inputs, _ = batch(learner)
@@ -295,7 +345,8 @@ def test_the_config_refuses_sac_only_options_and_bad_values():
         DDPGCfg(shared_warmup=True).validate(None)
     for bad in ({"learn_entropy": True}, {"critic_distribution": "categorical"}, {"noise_repeat": True, "noise_repeat_max": 0},
                 {"cross_batch_value": True}, {"action_l2_weight": 1.0}, {"critic_loss": "huber"},
-                {"q_target_min": 0.0}, {"actor_action_scale": 0.0}, {"actor_q_reduction": "min_random_pair"},
+                {"q_target_min": 0.0}, {"action_range": [0.5, 0.5]}, {"action_range": [-1.0]},
+                {"exploration_std_mode": "scaled"}, {"actor_q_reduction": "min_random_pair"},
                 {"exploration_std": -1.0}):
         with pytest.raises(ValueError):
             DDPGCfg(**bad).validate(None)

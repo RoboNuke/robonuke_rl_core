@@ -53,7 +53,8 @@ Load order: class defaults and task defaults → most-base file → … → pass
 
 `load_config(path, overrides)`:
 
-1. Follow `base` from the passed file (each `base` is relative to the file that names it);
+1. Follow `base` from the passed file (each `base` is relative to the file that names it; a
+   list is followed in order, depth-first, a file reached twice kept at its first place);
    raise on a missing file or a cycle, printing the chain; drop each file's `base` key.
 2. Check every leftover CLI arg is `a.b.c=value` and build that layer with `from_dotlist`.
 3. Per layer: reject `${...}` interpolation and `task.cfg.seed`, and record every

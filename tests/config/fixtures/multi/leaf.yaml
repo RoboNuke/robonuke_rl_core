@@ -1,0 +1,6 @@
+# two bases: the task chain (base.yaml), then the method file; this file beats both
+base:
+  - ../base.yaml
+  - method.yaml
+wandb:
+  group: multi_group

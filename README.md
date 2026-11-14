@@ -99,7 +99,10 @@ a config class, a learner, a model or a loss.
 
 Every configurable parameter of every registered section. One YAML file sets `base` and
 overrides only what differs from these defaults; the CLI overrides anything with a dotted
-path. `required` means no default: some layer must set it.
+path. `required` means no default: some layer must set it. `base` is one file or a list of
+files: `base: [task.yaml, method.yaml]` applies `task.yaml`'s chain, then `method.yaml`'s, then
+the file itself (a file reached twice keeps its first place), so a method that is a set of
+values (a baseline's learner and residual settings, no task) adds onto any task file.
 
 The task's own config is not listed here: **any field of the Isaac Lab env cfg can be
 overridden under `task.cfg.*`** (for example `task.cfg.scene.num_envs`). A few fields cannot
@@ -278,7 +281,10 @@ A demo transitions file must then carry every side input and its `next_` value a
 ## ddpg
 
 Deep Deterministic Policy Gradient (`learners/ddpg.py`, a subclass of SAC's learner). The actor is deterministic,
-`a = actor_action_scale * tanh(mu(s))`. Exploration is Gaussian noise of a fixed or scheduled std. There is a target
+`a = mid + half * tanh(mu(s))` over `action_range: [lo, hi]` (`mid = (lo + hi) / 2`, `half = (hi - lo) / 2`): a
+zero-initialized output layer starts at the range's midpoint, and `model.actor.output_bias` moves the start inside it.
+Exploration is Gaussian noise of a fixed or scheduled std, optionally scaled per env and dim by the env
+(`exploration_std_mode: adaptive`). There is a target
 actor and there are target critics (both Polyak `polyak`). The critic regresses on `r + gamma^n Q'(s', mu'(s'))` and the
 actor minimizes `-Q(s, mu(s))`. There is no entropy term.
 
@@ -289,7 +295,7 @@ regularizer options, which DDPG refuses at load: `learn_entropy`, `backup_entrop
 `target_entropy(_sigma)`, `entropy_lr_schedule`, `unsquashed_actor`, `progressive_exploration_steps`,
 `critic_distribution: categorical`, `cross_batch_value`, `periodic_reset_enabled`, `retrain_every`,
 `action_l2_weight`, `success_clone_weight`, `failure_anchor_weight`, `demo_actor_clone` and `reference_dropout`.
-`potential_terms` works as in SAC (the shaping is added where transitions are stored, which DDPG shares). `noise_repeat` (with `noise_repeat_zeta_s`, `noise_repeat_max`) holds DDPG's exploration draw as it holds SAC's: each agent keeps one standard-normal draw for k ~ truncated Zeta steps, the action `mean + exploration_std * draw` (clipped by `exploration_noise_clip`, clamped to `action_clip`); the warm-up's random actions (either `random_action_mode`) and the target-smoothing noise are drawn fresh. Only `model.architecture: mlp` builds DDPG's models (`policy`, `target_policy`, `critics`,
+`potential_terms` works as in SAC (the shaping is added where transitions are stored, which DDPG shares). `noise_repeat` (with `noise_repeat_zeta_s`, `noise_repeat_max`) holds DDPG's exploration draw as it holds SAC's: each agent keeps one standard-normal draw for k ~ truncated Zeta steps, the action `mean + exploration_std * draw` (clipped by `exploration_noise_clip`, clamped to `action_range` with `clip_actions`); the warm-up's random actions (either `random_action_mode`) and the target-smoothing noise are drawn fresh. Only `model.architecture: mlp` builds DDPG's models (`policy`, `target_policy`, `critics`,
 `target_critics`). `model.actor.squash` must be true. The actor's log-std parameters are built but never trained.
 
 The defaults are plain DDPG: one critic and no target smoothing. The TD3, REDQ and ResFiT pieces (Ankile et al. 2025,
@@ -311,12 +317,13 @@ DDPG's own fields:
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |
-| `actor_action_scale` | float | `1.0` | the actor's output is `actor_action_scale * tanh(mu)`. ResFiT: 0.1, the residual's reach in normalized action units |
+| `action_range` | list of 2 floats | `[-1.0, 1.0]` | `[lo, hi]`: the actor's output is `mid + half * tanh(mu)`. ResFiT: `[-0.1, 0.1]`, the residual's reach in normalized action units. A multiplier whose neutral value is 1: a range centred on 1 (e.g. `[-1.5, 3.5]`). Replaces `actor_action_scale` |
 | `exploration_std` | float | `0.1` | std of the Gaussian noise added to the actor's action when acting (ResFiT: 0.05). Also the std of the target-smoothing noise |
 | `exploration_std_end` | float or null | `null` | the std at the end of a linear schedule. Null: constant |
 | `exploration_std_steps` | int | `0` | env steps the schedule runs over; 0: constant |
 | `exploration_noise_clip` | float or null | `null` | clamp the exploration noise to ±this. Null: unclipped (ResFiT) |
-| `action_clip` | float or null | `1.0` | every action (acting, the target's next action, the actor's own in its loss, straight-through) is clamped to ±this. Null: no clamp |
+| `exploration_std_mode` | str | `"constant"` | `constant`: the noise std is `exploration_std` on every env and dim. `adaptive`: each env's and dim's std is that times the per-step `(num_envs, A)` scale a project's builder supplies (`register_exploration_scale(fn)`, `fn(cfg, env) -> (() -> tensor) or None`, registered in the training script's `setup()`; a residual publishes the base's motion in r units). Adaptive with no builder answering is refused. The target-smoothing noise stays `exploration_std` |
+| `clip_actions` | bool | `True` | every action (acting with its noise, the target's next action, the actor's own in its loss, straight-through) is clamped to `action_range`. False: unclamped (ResFiT clamps the executed action, not r). Replaces `action_clip` |
 | `target_actor` | bool | `True` | the critic target's next action comes from the target actor (DDPG, TD3). False: from the actor itself |
 | `target_policy_noise` | bool | `False` | TD3's target-policy smoothing: the target's next action gets N(0, exploration std) noise, clipped to ±`target_noise_clip` (ResFiT: on) |
 | `target_noise_clip` | float | `0.3` | the smoothing noise's clip |
@@ -324,8 +331,8 @@ DDPG's own fields:
 | `q_target_min` | float or null | `null` | clamp the critic target to [`q_target_min`, `q_target_max`] (ResFiT's `clip_q_target_to_reward_range`). Set both or neither |
 | `q_target_max` | float or null | `null` | see `q_target_min` |
 | `action_l2_reg_weight` | float | `0.0` | ResFiT's `action_l2_reg_weight`: `weight * mean_rows(sum_d a_d^2)` added to the actor's loss |
-| `random_action_scale` | float | `0.0` | uniform actions in ±this until this learner starts learning (`learning_starts` / `learning_starts_rows`, per route with `route_clock`) or for the first `random_timesteps` env steps. For a residual, the base plus that noise (ResFiT: 0.2). 0: the actor with its noise from the start |
-| `random_action_mode` | str | `"uniform"` | what a warm-up action is: `uniform` (ResFiT's, `U(-random_action_scale, random_action_scale)` about 0) or `actor_gaussian` (the actor's own deterministic action plus `N(0, random_action_scale)`, clamped to `action_clip`: about the actor's starting point, for a residual whose neutral action is not 0, `model.actor.output_bias`) |
+| `random_action_scale` | float | `0.0` | uniform actions in `mid` ± this until this learner starts learning (`learning_starts` / `learning_starts_rows`, per route with `route_clock`) or for the first `random_timesteps` env steps. For a residual, the base plus that noise (ResFiT: 0.2). 0: the actor with its noise from the start |
+| `random_action_mode` | str | `"uniform"` | what a warm-up action is: `uniform` (ResFiT's, `mid + U(-random_action_scale, random_action_scale)`) or `actor_gaussian` (the actor's own deterministic action plus `N(0, random_action_scale)`, clamped to `action_range` with `clip_actions`: about the actor's starting point, wherever `model.actor.output_bias` put it) |
 | `critic_warmup_updates` | int | `0` | ResFiT's critic warm-up: when this learner may first update, this many critic-only gradient steps run at once, before the next env step. The actor learns from the next update on. Per route with `route_clock` |
 | `shared_warmup` | bool | `false` | with `experiment.num_agents` > 1: until the agents start learning (`learning_starts_rows`, > 0), every env's stored row goes to every agent's memory (the warm-up acts on the actors' untrained starting point), so all agents reach `learning_starts_rows` together and their `critic_warmup_updates` burst runs once, for every agent at once (per route). Every agent's `route_clock` and `<phase>_step` count the pooled steps too (`num_agents` x faster than its own envs' steps), so the phase axis keeps counting the steps the memory holds. After that each agent stores only its own envs' rows. Not with `hold_still_key` |
 
@@ -435,7 +442,7 @@ max_log_std: log(5)}` and `critic: {activation: Tanh, layer_norm: true, init: xa
 | `actor.activation` | str | `"ReLU"` | a `torch.nn` activation class name: `ReLU`, `SiLU`, `Tanh`, `ELU`, `GELU`, ... (checked at load) |
 | `actor.init` | str | `"orthogonal"` | hidden-layer init: `default` (PyTorch's own `nn.Linear` init on the hidden layers, ResFiT's; the heads orthogonal with gain `output_init_scale`, or zero at 0), `orthogonal` (gain `sqrt(2)`, the CleanRL / Policy Decorator convention) or `kaiming` (`kaiming_normal_` fan-in, ResiP's `layer_init`), the output heads orthogonal; or `xavier` (SERL's `default_init`: `xavier_uniform` on every layer, the heads with gain `output_init_scale`). Biases zero |
 | `actor.output_init_scale` | float | `0.01` | the gain of the mean head's init (and of the log-std head's when state dependent): ResiP's and Policy Decorator's 0.01 starts the policy near zero action; SERL's 1.0; 0 zeroes the head's weights (ResFiT's residual starts at exactly zero) |
-| `actor.output_bias` | float or null | `null` | the mean head's initial bias, every dim (null: zero); with `output_init_scale: 0` the squashed actor starts at `tanh(output_bias)` for every state (hybrid_demos' `residual.action_frame: multiply` starts at its no-change multiplier). MLP actor only |
+| `actor.output_bias` | float or null | `null` | the mean head's initial bias, every dim (null: zero); with `output_init_scale: 0` the squashed actor starts at `tanh(output_bias)` for every state, i.e. DDPG's `mid + half * tanh(output_bias)` over its `action_range` (the default: the midpoint). MLP actor only |
 | `actor.init_log_std` | float | `0.0` | the log std every action dim starts at, whatever the bound (ResiP: `-1.0`) |
 | `actor.learn_std` | bool | `True` | `false` freezes the state-independent log std at `init_log_std` (ResiP): it is a buffer, not a parameter, so no optimizer touches it, though the checkpoint carries it. Needs `use_state_dependent_std: false` |
 | `actor.use_state_dependent_std` | bool | `False` | a second head predicts the log std from the state (classic SAC) instead of one learned value per dim |

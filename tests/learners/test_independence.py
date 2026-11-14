@@ -108,7 +108,7 @@ def _kept(learner) -> dict:
         ("ddpg", {"architecture": "mlp"}),
         ("ddpg", {"architecture": "mlp", "num_critics": 4, "critic_subset": 2, "target_policy_noise": True,
                   "gradient_steps": 2, "policy_delay": 2, "critic_loss": "mean_abs_squared", "grad_norm_clip": 0.5,
-                  "actor_action_scale": 0.1, "action_l2_reg_weight": 0.1}),
+                  "action_range": [-0.1, 0.1], "action_l2_reg_weight": 0.1}),
         ("ddpg", {"architecture": "mlp", "num_critics": 3, "critic_subset": 2, "actor_q_reduction": "min_random_pair"}),
     ],
 )

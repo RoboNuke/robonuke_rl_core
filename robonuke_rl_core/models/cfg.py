@@ -182,8 +182,8 @@ class MlpActorCfg:
     #: a LayerNorm between every hidden layer's Linear and its activation (SERL's ``use_layer_norm``)
     layer_norm: bool = False
     #: the mean head's initial bias, every dim (null: zero). With ``output_init_scale: 0`` the actor starts at
-    #: ``tanh(output_bias)`` for every state: a residual whose neutral action is not 0 (hybrid_demos'
-    #: ``residual.action_frame: multiply``, neutral at ``atanh`` of its no-change point)
+    #: ``tanh(output_bias)`` for every state -- DDPG's action ``mid + half * tanh(output_bias)`` over its
+    #: ``action_range``, so the default starts at the range's midpoint and a bias moves the start inside the range
     output_bias: Optional[float] = None
 
 
@@ -223,7 +223,7 @@ class MlpModelCfg:
         sac = getattr(cfg, "sac", None) if cfg is not None else None
         unsquashed_ok = bool(getattr(sac, "unsquashed_actor", False))
         if trainer is not None and getattr(trainer, "learner", None) == "ddpg" and not self.actor.squash:
-            raise ValueError("trainer.learner: ddpg acts with actor_action_scale * tanh(mu): set model.actor.squash: true")
+            raise ValueError("trainer.learner: ddpg acts with mid + half * tanh(mu) over its action_range: set model.actor.squash: true")
         if trainer is not None and getattr(trainer, "learner", None) == "sac" and not self.actor.squash and not unsquashed_ok:
             raise ValueError(
                 "model.actor.squash: false is a plain Gaussian; SAC's actor is tanh-squashed (its "
