@@ -60,7 +60,8 @@ from .noise import HeldDraw
 from .n_step import NStepWindow, n_step_rows
 
 __all__ = ["SAC", "register_critic_action", "critic_action_transform", "critic_action_space", "categorical_projection",
-           "register_demo_loader", "demo_loader", "register_exploration_scale", "exploration_scale"]
+           "register_demo_loader", "demo_loader", "register_exploration_scale", "exploration_scale",
+           "register_neutral_action", "neutral_action"]
 
 #: ``fn(cfg, env) -> loader | None``, registered by a project in its training script's ``setup()``: a loader
 #: ``(data, route_label) -> transitions`` turns a demo file that does not hold ready transitions (``data``, the file's
@@ -142,6 +143,26 @@ def exploration_scale(cfg: Any, env: Any) -> Any:
     if len(found) > 1:
         raise ValueError(f"{len(found)} registered exploration-scale builders answered for this run; at most one may")
     return found[0] if found else None
+
+
+#: ``fn(cfg, env) -> float | None``, registered by a project in its training script's ``setup()``: the action that
+#: leaves the env as it is without the agent (a residual: the base alone -- 0 for an additive residual, 1 for a
+#: multiplicative one). The learner acts with it in ``base_only_episodes`` and progressive exploration's off steps, and
+#: stores it where ``executed_action_mask`` says the env ignored the agent. At most one builder may answer; none: 0
+NEUTRAL_ACTION_BUILDERS: List[Any] = []
+
+
+def register_neutral_action(fn: Any) -> None:
+    """Add a :data:`NEUTRAL_ACTION_BUILDERS` entry; ``train.py`` asks each once its env is built."""
+    NEUTRAL_ACTION_BUILDERS.append(fn)
+
+
+def neutral_action(cfg: Any, env: Any) -> float:
+    """The one neutral action a registered builder returns for this run, or 0."""
+    found = [f for f in (fn(cfg, env) for fn in NEUTRAL_ACTION_BUILDERS) if f is not None]
+    if len(found) > 1:
+        raise ValueError(f"{len(found)} registered neutral-action builders answered for this run; at most one may")
+    return float(found[0]) if found else 0.0
 
 
 def categorical_projection(probs: torch.Tensor, atoms: torch.Tensor, min_value: float, max_value: float) -> torch.Tensor:
@@ -271,6 +292,10 @@ class SAC(LearnerBase):
         )
         #: True while an update's metrics are not to be published (DDPG's critic warm-up burst, all but its end)
         self._suppress_update_metrics = False
+        #: the action that leaves the env as it is without the agent (register_neutral_action; a residual: the base
+        #: alone, 0 additive, 1 multiplicative): base_only_episodes, progressive exploration's off steps, and the stored
+        #: action where executed_action_mask says the env ignored the agent. Set by the trainer
+        self.neutral_action = 0.0
         #: noise_repeat: the held standard-normal draw per env, per agent (learners/noise.py HeldDraw, shared with
         #: DDPG's noise phases)
         self._hold = (HeldDraw(self.num_agents, self.cfg.noise_repeat_zeta_s, self.cfg.noise_repeat_max, self.device)
@@ -814,16 +839,16 @@ class SAC(LearnerBase):
         return self.state_normalizer(states, train=train)
 
     # ------------------------------------------------------------------ interaction
-    def _warming_up(self) -> bool:
-        """``warmup_episodes``: still within the first episodes, run on zero actions with no updates."""
-        return int(self.cfg.warmup_episodes) > getattr(self, "_finished_episodes", 0)
+    def _base_only(self) -> bool:
+        """``base_only_episodes``: still within the first episodes, run on the neutral action with no updates."""
+        return int(self.cfg.base_only_episodes) > getattr(self, "_finished_episodes", 0)
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
         if self.training and timestep == 0 and not getattr(self, "_initial_logged", False):
             self._log_initial_policy(observations)
-        if self.training and self._warming_up():
+        if self.training and self._base_only():
             width = self._space_width(self.action_space)
-            return torch.zeros((observations.shape[0], width), device=self.device), {}
+            return torch.full((observations.shape[0], width), self.neutral_action, device=self.device), {}
         if self.training and timestep < self.cfg.random_timesteps:
             return self._explore_progressively(self.random_actions(observations.shape[0]), timestep), {}
         inputs = {"observations": self.normalize_observations(observations)}
@@ -943,8 +968,8 @@ class SAC(LearnerBase):
 
     def _explore_progressively(self, actions: torch.Tensor, timestep: int) -> torch.Tensor:
         """``progressive_exploration_steps`` H (Policy Decorator): while training, each env runs
-        this step on its actions with probability ``min(timestep / H, 1)`` and on zeros
-        otherwise, one uniform per env drawn EVERY env step (Policy Decorator's
+        this step on its actions with probability ``min(timestep / H, 1)`` and on the neutral action
+        (``neutral_action``) otherwise, one uniform per env drawn EVERY env step (Policy Decorator's
         ``mask = rand(num_envs) < min(step / H, 1)`` inside its step loop), so an env's draw
         depends on nothing but the step count. What this returns is what the env executes and
         the memory stores. Off (H = 0) or outside training it draws nothing.
@@ -957,7 +982,7 @@ class SAC(LearnerBase):
         self.emit_per_agent(
             {"exploration/policy_share": keep.float().view(self.num_agents, -1).mean(dim=1)}, timestep
         )
-        return torch.where(keep, actions, torch.zeros_like(actions))
+        return torch.where(keep, actions, torch.full_like(actions, self.neutral_action))
 
     def _emit_interval_metrics(self, timestep: int) -> None:
         """A routed residual's progress, every ``write_interval`` from the first step (before it learns too): its phase
@@ -1000,7 +1025,7 @@ class SAC(LearnerBase):
             step=timestep,
         )
         if self.training:
-            # the env's own episode ends (warmup_episodes counts them): a device counter, read with the step's
+            # the env's own episode ends (base_only_episodes counts them): a device counter, read with the step's
             # single host read (_read_host)
             self._finished_count_t.add_((terminated | truncated).sum())
         shaping = self._potential_shaping(infos, terminated | truncated) if self._potential_terms else None
@@ -1054,7 +1079,9 @@ class SAC(LearnerBase):
             # a last-step field of an n-step window (the "next_" prefix): set on every row whose window ends on a stall
             extra["next__stalled"] = self._infos_flags(infos, self.cfg.hold_stall_key, n) * (terminated | truncated).reshape(n, 1).to(torch.float32)
         if self.cfg.executed_action_mask:
-            actions = actions * self._executed_mask(infos, actions)
+            # where the env ignored the agent it ran the neutral action (a residual: the base alone)
+            mask = self._executed_mask(infos, actions)
+            actions = actions * mask + self.neutral_action * (1.0 - mask)
         if getattr(self, "_track_outcomes", False):
             extra["episode_ids"] = self._env_episode.to(torch.float32).unsqueeze(-1)
             self._record_outcomes(infos, env_terminated, env_truncated)
@@ -1107,7 +1134,7 @@ class SAC(LearnerBase):
     def _host_read_values(self, route_count_t: Optional[torch.Tensor]) -> torch.Tensor:
         """What the update decision needs from the device this step, as one float tensor: per agent its phase steps
         this step (``route_clock``: its envs that started the step in the route's label, every env's when pooled), per
-        agent its memory fill (``learning_starts_rows``), and the env episodes finished so far (``warmup_episodes``)."""
+        agent its memory fill (``learning_starts_rows``), and the env episodes finished so far (``base_only_episodes``)."""
         n = self.num_agents
         route = route_count_t.to(torch.float32) if route_count_t is not None else torch.zeros(n, device=self.device)
         return torch.cat((route, self.memory.fills_on_device().to(torch.float32), self.memory.written_on_device().to(torch.float32),
@@ -1302,8 +1329,8 @@ class SAC(LearnerBase):
         return out
 
     def _update_if_ready(self, *, timestep: int, timesteps: int) -> None:
-        if self._warming_up() and not self.cfg.warmup_trains_critics:
-            return  # warmup_episodes: no update until the base's episodes have finished
+        if self._base_only() and not self.cfg.base_only_trains_critics:
+            return  # base_only_episodes: no update until the base's episodes have finished
         ready = self._agent_online_rows_ready()  # learning_starts_rows: each agent its own data
         start, every = int(self.cfg.learning_starts), int(self.cfg.update_every)
         if self.cfg.route_clock:
@@ -1641,7 +1668,7 @@ class SAC(LearnerBase):
                 return
             if due != self._agent_due:
                 self._set_due(due)
-        # warmup_trains_critics: the actor stays frozen until the warm-up episodes have ended; each agent's actor only
+        # base_only_trains_critics: the actor stays frozen until the warm-up episodes have ended; each agent's actor only
         # when that agent is due and its own actor may learn
         due = list(self._agent_due)
         agent_policy_on = [d and self._agent_actor_may_learn(agent, timestep) for agent, d in enumerate(due)]
@@ -1697,7 +1724,7 @@ class SAC(LearnerBase):
 
     def _actor_may_learn(self, timestep: int) -> bool:
         """Whether this update's gradient steps may include the actor's (``policy_learning_starts``, the warm-up)."""
-        return timestep >= self._policy_learning_starts() and not self._warming_up()
+        return timestep >= self._policy_learning_starts() and not self._base_only()
 
     def _gradient_step(self, mode, rows: int, timestep: int, graph: bool) -> Dict[str, Dict[str, torch.Tensor]]:
         """One critic step, the actor and temperature step when ``mode`` says so, the targets'

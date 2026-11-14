@@ -75,6 +75,33 @@ def test_the_executed_action_mask_zeroes_the_stored_action():
         step(learner, 1, actions=acts)
 
 
+def test_an_ignored_action_is_stored_as_the_neutral_action():
+    """A multiplicative residual's neutral action is 1: a switched-off step ran the base, i.e. the multiplier 1."""
+    learner = build_learner("sac", num_agents=1, envs_per_agent=2, rollout=4, executed_action_mask="residual_active")
+    learner.neutral_action = 1.0
+    acts = torch.tensor([[0.3, -0.4], [0.7, 0.1]])
+    step(learner, 0, actions=acts, infos_extra={"residual_active": torch.tensor([0.0, 1.0])})
+    batch = learner.memory.sample(names=["actions"], batch_size=64)[0][0]
+    assert {tuple(round(v, 4) for v in row.tolist()) for row in batch} == {(1.0, 1.0), (0.7, 0.1)}
+
+
+def test_the_neutral_action_is_the_one_registered_builder_or_zero():
+    from robonuke_rl_core.learners import sac
+
+    saved = list(sac.NEUTRAL_ACTION_BUILDERS)
+    try:
+        sac.NEUTRAL_ACTION_BUILDERS.clear()
+        assert sac.neutral_action(None, None) == 0.0
+        sac.register_neutral_action(lambda cfg, env: None)
+        sac.register_neutral_action(lambda cfg, env: 1.0)
+        assert sac.neutral_action(None, None) == 1.0
+        sac.register_neutral_action(lambda cfg, env: 0.0)
+        with pytest.raises(ValueError, match="at most one"):
+            sac.neutral_action(None, None)
+    finally:
+        sac.NEUTRAL_ACTION_BUILDERS[:] = saved
+
+
 def test_demo_actor_clone_needs_demos_and_a_clone_weight():
     from robonuke_rl_core.learners.cfg import SACCfg
 
@@ -305,8 +332,8 @@ def test_the_actor_loss_weighs_only_online_rows():
 def test_warmup_can_train_the_critics_while_the_actor_stays_frozen():
     from robonuke_rl_core.learners.cfg import SACCfg
 
-    learner = build_learner("sac", num_agents=1, envs_per_agent=2, rollout=32, warmup_episodes=5,
-                            warmup_trains_critics=True, learning_starts=0, batch_size=2)
+    learner = build_learner("sac", num_agents=1, envs_per_agent=2, rollout=32, base_only_episodes=5,
+                            base_only_trains_critics=True, learning_starts=0, batch_size=2)
     learner.enable_training_mode(True)
     seen = []
     learner.on_log.append(lambda agent, metrics, step: seen.append(metrics))

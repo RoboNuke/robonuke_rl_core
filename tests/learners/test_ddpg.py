@@ -197,6 +197,13 @@ def test_each_agent_acts_with_its_own_phase_and_each_phase_with_its_own_options(
     assert float(noise[:, :3].abs().max()) == pytest.approx(0.1) and float(noise[:, 3:].abs().max()) == pytest.approx(0.5)
 
 
+def test_base_only_episodes_act_with_the_neutral_action_and_no_noise():
+    learner = ddpg(base_only_episodes=1, train_noise=N(scale=1.0))
+    learner.neutral_action = 1.0
+    actions, _ = learner.act(torch.randn(6, OBS_DIM), None, timestep=0, timesteps=100)
+    assert torch.equal(actions, torch.ones_like(actions))
+
+
 def test_the_noise_options_must_be_known():
     for bad in ({"center": "base"}, {"distribution": "normal"}, {"scale": None}, {"scale": -1.0}, {"clip": 0.0},
                 {"repeat": True, "repeat_max": 0}, {"target_clip": 0.0},

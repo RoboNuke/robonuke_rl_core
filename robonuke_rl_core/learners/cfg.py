@@ -114,10 +114,10 @@ class _CommonCfg:
     discount_factor: float = 0.99
     #: env steps of uniform random actions before the policy is used
     random_timesteps: int = 0
-    #: run the first this many episodes (counted over every env) on zero actions -- for a residual, the base alone,
-    #: no exploration noise -- storing them as ordinary transitions, with no updates until they have finished, so
+    #: run the first this many episodes (counted over every env) on the neutral action (``register_neutral_action``;
+    #: default 0) -- for a residual, the base alone, no exploration noise -- storing them as ordinary transitions, with no updates until they have finished, so
     #: the memory starts with the base's own outcomes (its successes among them). 0 is off
-    warmup_episodes: int = 0
+    base_only_episodes: int = 0
     #: env steps before the first update
     learning_starts: int = 0
     weight_decay: float = 0.0
@@ -260,9 +260,9 @@ class SACCfg(_CommonCfg):
     #: sample every row, the actor samples its own batch from the online rows only, so it never sees a demo and
     #: always gets a full batch
     demo_storage: str = "sample"
-    #: warmup_episodes: let the critics train on the warm-up's transitions (from learning_starts) while the actor
-    #: stays frozen until the warm-up has ended. False: nothing trains during the warm-up
-    warmup_trains_critics: bool = False
+    #: base_only_episodes: let the critics train on those episodes' transitions (from learning_starts) while the actor
+    #: stays frozen until they have ended. False: nothing trains during them
+    base_only_trains_critics: bool = False
     #: no update at all (critics or actor) until every agent's memory holds this many of its own online rows (demo
     #: rows not counted): a routed residual starts training only once its phase has given it this much data, however
     #: long that takes. 0 is off (learning_starts alone)
@@ -280,11 +280,11 @@ class SACCfg(_CommonCfg):
     cuda_graph: bool = False
     #: Policy Decorator's progressive exploration over this many env steps (its H): while
     #: training, each env runs this step on the policy's actions with probability
-    #: ``min(timestep / H, 1)`` (one draw per env, every env step) and on zeros otherwise (for
-    #: a residual policy: the base alone); the zeros are what is executed and stored.
-    #: ``random_timesteps`` actions too. 0 is off
+    #: ``min(timestep / H, 1)`` (one draw per env, every env step) and on the neutral action otherwise
+    #: (``register_neutral_action``, default 0; for a residual policy: the base alone); that is what is executed and
+    #: stored. ``random_timesteps`` actions too. 0 is off
     progressive_exploration_steps: int = 0
-    #: env step the progressive exploration ramp starts at: before it every env runs on zeros (share 0), from
+    #: env step the progressive exploration ramp starts at: before it every env runs on the neutral action (share 0), from
     #: it the share is ``min((timestep - start) / progressive_exploration_steps, 1)``. 0 starts the ramp at once
     progressive_exploration_start: int = 0
     #: n-step TD targets: each critic target sums the next ``n_step`` rewards (fewer where the
@@ -370,8 +370,9 @@ class SACCfg(_CommonCfg):
     #: weight whatever the value scale (TD3+BC: 2.5). None leaves the Q term as it is
     actor_q_scale: Optional[float] = None
     #: an ``infos`` key holding, per env and step, 1 where the env executed the agent's action and 0 where it ignored
-    #: it (a residual switched off for that step): the stored action is multiplied by it, so the memory and the
-    #: critics see the action that was executed. None: every stored action is the agent's
+    #: it (a residual switched off for that step): where it is 0 the stored action is the neutral action
+    #: (``register_neutral_action``; a residual: the base alone), so the memory and the critics see the action that
+    #: was executed. None: every stored action is the agent's
     executed_action_mask: Optional[str] = None
     #: ``std_label_names`` groups whose transitions the memory stores: a transition is added only when the label of
     #: the observation it starts from (``std_by_label``) is one of these (e.g. one_leg's ``insert`` and ``screw``, a
@@ -678,8 +679,8 @@ class SACCfg(_CommonCfg):
             raise ValueError(f"{name}.actor_q_scale must be > 0, got {self.actor_q_scale}")
         if self.learning_starts_rows < 0:
             raise ValueError(f"{name}.learning_starts_rows must be >= 0, got {self.learning_starts_rows}")
-        if self.warmup_episodes < 0:
-            raise ValueError(f"{name}.warmup_episodes must be >= 0, got {self.warmup_episodes}")
+        if self.base_only_episodes < 0:
+            raise ValueError(f"{name}.base_only_episodes must be >= 0, got {self.base_only_episodes}")
         if self.parts_term_reduction not in ("sum", "mean"):
             raise ValueError(f"{name}.parts_term_reduction must be 'sum' or 'mean', got {self.parts_term_reduction!r}")
         if self.demo_actor_clone and self.demo_storage in ("memory", "memory_critic"):

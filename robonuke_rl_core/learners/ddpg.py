@@ -131,7 +131,7 @@ class DDPG(SAC):
     def _agent_started(self, timestep: int):
         """Per agent, whether it may update: its own online rows (``learning_starts_rows``) and its own clock
         (``learning_starts``: env steps, or with ``route_clock`` its own steps in the phase) are there."""
-        if self._warming_up():
+        if self._base_only():
             return [False] * self.num_agents
         ready = self._agent_online_rows_ready()
         clocks = self._agent_route_steps if self.cfg.route_clock else [int(timestep)] * self.num_agents
@@ -177,8 +177,8 @@ class DDPG(SAC):
             self._log_initial_policy(observations)
         rows = observations.shape[0]
         width = self._space_width(self.action_space)
-        if self.training and self._warming_up():
-            return torch.zeros((rows, width), device=self.device), {}
+        if self.training and self._base_only():
+            return torch.full((rows, width), self.neutral_action, device=self.device), {}
         if not self.training:
             return self.eval_actions(observations), {}
         random_agents = self._agent_random_phase(timestep)

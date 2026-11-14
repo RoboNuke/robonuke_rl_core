@@ -210,8 +210,8 @@ def test_a_routed_residual_logs_its_steps_memory_and_updates():
     assert float(last["route/memory_rows"]) == 3.0 and float(last["route/updates"]) >= 1.0
 
 
-def test_warmup_episodes_run_on_zero_actions_with_no_updates_then_learning_starts():
-    learner = _held_learner(warmup_episodes=2, learning_starts=0, batch_size=2)
+def test_base_only_episodes_run_on_zero_actions_with_no_updates_then_learning_starts():
+    learner = _held_learner(base_only_episodes=2, learning_starts=0, batch_size=2)
     learner.enable_training_mode(True)
     updates = []
     learner.update = lambda **kw: updates.append(kw["timestep"])
@@ -230,6 +230,14 @@ def test_warmup_episodes_run_on_zero_actions_with_no_updates_then_learning_start
     _held_step(learner, t, 2, still=0)
     learner.post_interaction(timestep=t, timesteps=100)
     assert updates == [4, t]
+
+
+def test_base_only_episodes_act_with_the_neutral_action():
+    learner = _held_learner(base_only_episodes=2, learning_starts=0, batch_size=2)
+    learner.enable_training_mode(True)
+    learner.neutral_action = 1.0  # a multiplicative residual's base alone
+    actions, _ = learner.act(torch.randn(1, OBS_DIM), None, timestep=0, timesteps=100)
+    assert torch.equal(actions, torch.ones_like(actions))
 
 
 def _shaped_step(learner, t, phase_next, tip, done=False):
