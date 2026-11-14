@@ -283,8 +283,8 @@ A demo transitions file must then carry every side input and its `next_` value a
 Deep Deterministic Policy Gradient (`learners/ddpg.py`, a subclass of SAC's learner). The actor is deterministic,
 `a = mid + half * tanh(mu(s))` over `action_range: [lo, hi]` (`mid = (lo + hi) / 2`, `half = (hi - lo) / 2`): a
 zero-initialized output layer starts at the range's midpoint, and `model.actor.output_bias` moves the start inside it.
-Exploration is Gaussian noise of a fixed or scheduled std, optionally scaled per env and dim by the env
-(`exploration_std_mode: adaptive`). There is a target
+The action noise has two phases with the same options, `warmup_noise` (until the learner starts learning) and
+`train_noise` (after), drawn in one place (`learners/noise.py`); eval acts without noise. There is a target
 actor and there are target critics (both Polyak `polyak`). The critic regresses on `r + gamma^n Q'(s', mu'(s'))` and the
 actor minimizes `-Q(s, mu(s))`. There is no entropy term.
 
@@ -294,8 +294,9 @@ schedules, `weight_decay`, `grad_norm_clip`, CUDA graphs and logging. The except
 regularizer options, which DDPG refuses at load: `learn_entropy`, `backup_entropy`, `initial_entropy_value`,
 `target_entropy(_sigma)`, `entropy_lr_schedule`, `unsquashed_actor`, `progressive_exploration_steps`,
 `critic_distribution: categorical`, `cross_batch_value`, `periodic_reset_enabled`, `retrain_every`,
-`action_l2_weight`, `success_clone_weight`, `failure_anchor_weight`, `demo_actor_clone` and `reference_dropout`.
-`potential_terms` works as in SAC (the shaping is added where transitions are stored, which DDPG shares). `noise_repeat` (with `noise_repeat_zeta_s`, `noise_repeat_max`) holds DDPG's exploration draw as it holds SAC's: each agent keeps one standard-normal draw for k ~ truncated Zeta steps, the action `mean + exploration_std * draw` (clipped by `exploration_noise_clip`, clamped to `action_range` with `clip_actions`); the warm-up's random actions (either `random_action_mode`) and the target-smoothing noise are drawn fresh. Only `model.architecture: mlp` builds DDPG's models (`policy`, `target_policy`, `critics`,
+`action_l2_weight`, `success_clone_weight`, `failure_anchor_weight`, `demo_actor_clone`, `reference_dropout` and
+`noise_repeat` (DDPG holds draws per phase: `warmup_noise.repeat`, `train_noise.repeat`).
+`potential_terms` works as in SAC (the shaping is added where transitions are stored, which DDPG shares). Only `model.architecture: mlp` builds DDPG's models (`policy`, `target_policy`, `critics`,
 `target_critics`). `model.actor.squash` must be true. The actor's log-std parameters are built but never trained.
 
 The defaults are plain DDPG: one critic and no target smoothing. The TD3, REDQ and ResFiT pieces (Ankile et al. 2025,
@@ -318,26 +319,40 @@ DDPG's own fields:
 | field | type | default | what it does |
 | --- | --- | --- | --- |
 | `action_range` | list of 2 floats | `[-1.0, 1.0]` | `[lo, hi]`: the actor's output is `mid + half * tanh(mu)`. ResFiT: `[-0.1, 0.1]`, the residual's reach in normalized action units. A multiplier whose neutral value is 1: a range centred on 1 (e.g. `[-1.5, 3.5]`). Replaces `actor_action_scale` |
-| `exploration_std` | float | `0.1` | std of the Gaussian noise added to the actor's action when acting (ResFiT: 0.05). Also the std of the target-smoothing noise |
-| `exploration_std_end` | float or null | `null` | the std at the end of a linear schedule. Null: constant |
-| `exploration_std_steps` | int | `0` | env steps the schedule runs over; 0: constant |
-| `exploration_noise_clip` | float or null | `null` | clamp the exploration noise to ±this. Null: unclipped (ResFiT) |
-| `exploration_std_mode` | str | `"constant"` | `constant`: the noise std is `exploration_std` on every env and dim. `adaptive`: each env's and dim's std is that times the per-step `(num_envs, A)` scale a project's builder supplies (`register_exploration_scale(fn)`, `fn(cfg, env) -> (() -> tensor) or None`, registered in the training script's `setup()`; a residual publishes the base's motion in r units). Adaptive with no builder answering is refused. The target-smoothing noise stays `exploration_std` |
 | `clip_actions` | bool | `True` | every action (acting with its noise, the target's next action, the actor's own in its loss, straight-through) is clamped to `action_range`. False: unclamped (ResFiT clamps the executed action, not r). Replaces `action_clip` |
 | `target_actor` | bool | `True` | the critic target's next action comes from the target actor (DDPG, TD3). False: from the actor itself |
-| `target_policy_noise` | bool | `False` | TD3's target-policy smoothing: the target's next action gets N(0, exploration std) noise, clipped to ±`target_noise_clip` (ResFiT: on) |
-| `target_noise_clip` | float | `0.3` | the smoothing noise's clip |
 | `critic_loss` | str | `"mse"` | `mse`: the mean over critics of each one's squared TD error. `mean_abs_squared`: ResFiT's `(mean_k \|Q_k - y\|)^2` |
 | `q_target_min` | float or null | `null` | clamp the critic target to [`q_target_min`, `q_target_max`] (ResFiT's `clip_q_target_to_reward_range`). Set both or neither |
 | `q_target_max` | float or null | `null` | see `q_target_min` |
 | `action_l2_reg_weight` | float | `0.0` | ResFiT's `action_l2_reg_weight`: `weight * mean_rows(sum_d a_d^2)` added to the actor's loss |
-| `random_action_scale` | float | `0.0` | uniform actions in `mid` ± this until this learner starts learning (`learning_starts` / `learning_starts_rows`, per route with `route_clock`) or for the first `random_timesteps` env steps. For a residual, the base plus that noise (ResFiT: 0.2). 0: the actor with its noise from the start |
-| `random_action_mode` | str | `"uniform"` | what a warm-up action is: `uniform` (ResFiT's, `mid + U(-random_action_scale, random_action_scale)`) or `actor_gaussian` (the actor's own deterministic action plus `N(0, random_action_scale)`, clamped to `action_range` with `clip_actions`: about the actor's starting point, wherever `model.actor.output_bias` put it) |
-| `critic_warmup_updates` | int | `0` | ResFiT's critic warm-up: when this learner may first update, this many critic-only gradient steps run at once, before the next env step. The actor learns from the next update on. Per route with `route_clock` |
+| `warmup_noise` | noise block | gaussian 0.1 about the actor | the action noise while this learner has not started learning (`learning_starts` / `learning_starts_rows`, per route with `route_clock`) or for the first `random_timesteps` env steps, and the target smoothing of its critic warm-up burst. ResFiT: `center: mid`, `distribution: uniform`, `scale: 0.2` |
+| `train_noise` | noise block | gaussian 0.1 about the actor | the action noise from then on, and every later critic update's target smoothing (ResFiT: gaussian 0.05, `target_smoothing` with `target_clip: 0.3`). Eval acts without noise |
+| `critic_warmup_updates` | int | `0` | ResFiT's critic warm-up: when this learner may first update, this many critic-only gradient steps run at once, before the next env step. The actor learns from the next update on. Per route with `route_clock`. Right after each agent's burst, `ckpt_critic_warmup.ckpt` is written beside its numbered checkpoints (each phase's folder with routes): the critics after the warm-up, before any update on online data, its env step in the file's `step` |
 | `shared_warmup` | bool | `false` | with `experiment.num_agents` > 1: until the agents start learning (`learning_starts_rows`, > 0), every env's stored row goes to every agent's memory (the warm-up acts on the actors' untrained starting point), so all agents reach `learning_starts_rows` together and their `critic_warmup_updates` burst runs once, for every agent at once (per route). Every agent's `route_clock` and `<phase>_step` count the pooled steps too (`num_agents` x faster than its own envs' steps), so the phase axis keeps counting the steps the memory holds. After that each agent stores only its own envs' rows. Not with `hold_still_key` |
 | `log_action_grad` | bool | `false` | log `q/action_grad_norm` on every actor step; costs one extra backward pass through the critics per actor step |
 
-Metrics, on top of SAC's (no `entropy/*`): `policy/exploration_std` (the current noise std; also `policy/std`),
+**A noise block** (`warmup_noise`, `train_noise`: the same fields, each phase its own values; `learners/noise.py` draws
+both, so every noise draw goes through one place). Per draw: `clip(d * scale, ±clip) * factor`, added to the actor's
+action or the range's midpoint, then clamped with `clip_actions`.
+
+| field | type | default | what it does |
+| --- | --- | --- | --- |
+| `center` | str | `"actor"` | `actor`: the noise is added to the actor's action. `mid`: to `action_range`'s midpoint, ignoring the actor (ResFiT's uniform warm-up) |
+| `distribution` | str | `"gaussian"` | `gaussian`: `N(0, scale)` per dim. `uniform`: `U(-scale, scale)` per dim |
+| `scale` | float or null | `0.1` | the gaussian's std or the uniform's half width. Null: `action_range`'s half width, uniform only (with `center: mid`: uniform over the whole range) |
+| `scale_end` | float or null | `null` | the scale at the end of a linear schedule over env steps. Null: constant |
+| `scale_steps` | int | `0` | env steps the schedule runs over; 0: constant |
+| `clip` | float or null | `null` | the scaled draw clipped to ±this, before `adaptive`'s factor (a clip is then that many times the motion). Null: unclipped |
+| `adaptive` | bool | `false` | times a per-row, per-dim factor computed from the raw observation by a project's builder (`register_exploration_scale(fn)`, `fn(cfg, env) -> (observations -> (rows, A)) or None`, registered in the training script's `setup()`; a residual: the base's motion in r units). No builder answering is refused |
+| `repeat` | bool | `false` | correlated noise (FlashSAC's): each agent holds one draw for k env steps, k ~ Zeta(`repeat_zeta_s`) truncated at `repeat_max` |
+| `repeat_zeta_s` | float | `2.0` | the Zeta exponent, `P(k) ~ k^-s` |
+| `repeat_max` | int | `16` | the longest hold, in env steps |
+| `target_smoothing` | bool | `false` | TD3's target-policy smoothing in this phase's critic updates: the target's next action plus `N(0, target_scale)` clipped to ±`target_clip` |
+| `target_scale` | float or null | `null` | the smoothing std. Null: this phase's `scale` at that step |
+| `target_clip` | float | `0.3` | the smoothing noise's clip |
+| `target_adaptive` | bool | `false` | the smoothing noise times the factor of the next observation (as `adaptive`) |
+
+Metrics, on top of SAC's (no `entropy/*`): `policy/exploration_std` (the training noise's scale now; also `policy/std`),
 `policy/mean_action` (mean |deterministic action|), `q/ensemble_std` (the critics' spread over the batch) and
 `q/action_grad_norm` (|dQ/da| of the critics' mean at the actor's own action, per row: the slope the actor follows;
 only with `log_action_grad`).
@@ -346,7 +361,7 @@ usual), so the interval it lands in shows the critic as the actor first meets it
 
 **Several agents (`experiment.num_agents` > 1) keep separate schedules.** Each agent has its own `route_clock` (its
 envs' steps in the phase), its own `learning_starts_rows` (its own online rows), and its own update and `policy_delay`
-counts and LR schedule. DDPG adds its own uniform warm-up (`random_action_scale`) and critic warm-up burst
+counts and LR schedule. DDPG adds its own warm-up phase (`warmup_noise`) and critic warm-up burst
 (`critic_warmup_updates`) per agent (with `shared_warmup`, one pooled warm-up and one burst for all agents). An update steps only the agents that are due. Every optimizer step and every
 target update (critics and the target actor) is masked to those agents, so an agent that is not due keeps its weights,
 targets, optimizer moments and step counts exactly. A block batch's online share is sized by the due agents' data

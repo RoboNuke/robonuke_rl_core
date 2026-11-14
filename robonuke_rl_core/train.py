@@ -97,10 +97,13 @@ def main(argv=None, setup=None) -> int:
         transform = critic_action_transform(cfg, env)
         # a project's register_demo_loader: the demo file's transitions are built at load, with the env's own code
         loader = demo_loader(cfg, env)
-        # a project's register_exploration_scale: DDPG's adaptive exploration std reads the env's per-step scale
+        # a project's register_exploration_scale: DDPG's adaptive noise (either phase, acting or target smoothing)
+        # multiplies by a per-env, per-dim factor computed from the observation
         noise_scale = exploration_scale(cfg, env)
-        if getattr(learner_cfg, "exploration_std_mode", "constant") == "adaptive" and noise_scale is None:
-            raise ValueError(f"{learner_name}.exploration_std_mode: adaptive needs the env's per-step scale, and no "
+        adaptive = [f"{learner_name}.{phase}" for phase in ("warmup_noise", "train_noise")
+                    if getattr(getattr(learner_cfg, phase, None), "adaptive_anywhere", False)]
+        if adaptive and noise_scale is None:
+            raise ValueError(f"{adaptive} adaptive needs a per-env, per-dim factor from the observation, and no "
                              "register_exploration_scale builder answered for this run")
     def make_learner(learner_cfg, dirs):
         """One learner of ``learner_cfg`` with its own models, memory and optimizers (a routed SAC builds one per

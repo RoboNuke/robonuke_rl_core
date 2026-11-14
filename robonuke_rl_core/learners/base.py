@@ -37,6 +37,7 @@ __all__ = [
     "run_dirs",
     "CHECKPOINT_EXTENSION",
     "CHECKPOINT_BEST",
+    "CHECKPOINT_CRITIC_WARMUP",
     "checkpoint_name",
     "SUCCESS_METRIC",
     "BEST_SUCCESS_METRIC",
@@ -45,6 +46,9 @@ __all__ = [
 #: one place for the checkpoint file naming, so eval, wandb and the loader cannot disagree
 CHECKPOINT_EXTENSION = "ckpt"
 CHECKPOINT_BEST = f"ckpt_best.{CHECKPOINT_EXTENSION}"
+#: DDPG: each agent's state right after its critic warm-up burst (``critic_warmup_updates``), before any update on its
+#: own online data; one per agent (per phase with routes), its env step in the file's ``step``
+CHECKPOINT_CRITIC_WARMUP = f"ckpt_critic_warmup.{CHECKPOINT_EXTENSION}"
 
 #: the env episode channel the best-checkpoint success rate is measured from
 SUCCESS_METRIC = "episode/success"

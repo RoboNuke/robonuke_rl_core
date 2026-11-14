@@ -2,15 +2,14 @@
 pieces as options (``learners/cfg.py`` ``DDPGCfg``).
 
 The actor is deterministic, ``a = mid + half * tanh(mu(s))`` over ``action_range`` ``[lo, hi]`` (the model's squashed
-mean; ``tanh(mu) = 0`` is the range's midpoint); exploration is Gaussian noise of a fixed, scheduled std added to it when
-acting (``exploration_std``; ``exploration_std_mode: adaptive``: times a per-env, per-dim scale the project's env
-publishes, :func:`~robonuke_rl_core.learners.sac.register_exploration_scale`; ``noise_repeat``: each agent's draw held
-for k ~ truncated Zeta steps, as SAC's), the action clamped to the range (``clip_actions``). The critics regress on
+mean; ``tanh(mu) = 0`` is the range's midpoint). Every noise draw goes through :class:`~robonuke_rl_core.learners.noise.
+ActionNoise`: ``warmup_noise`` until this learner starts learning, ``train_noise`` after, each with the same options
+(gaussian or uniform, about the actor or the midpoint, scheduled scale, clip, adaptive factor, held draws, target
+smoothing); eval acts without noise. The action is clamped to the range (``clip_actions``). The critics regress on
 
-    y = r + gamma^n * (1 - done) * reduce_target(Q'_k(s', a')),   a' = mu'(s') [+ clip(N(0, std), +-c)]
+    y = r + gamma^n * (1 - done) * reduce_target(Q'_k(s', a')),   a' = mu'(s') [+ the phase's target smoothing]
 
-(``target_actor``: the target actor mu', Polyak-averaged as the target critics; ``target_policy_noise``: TD3's
-smoothing; the reduction a min over a random ``critic_subset`` of the ``num_critics`` target critics), by ``mse`` (the
+(``target_actor``: the target actor mu', Polyak-averaged as the target critics; the reduction a min over a random ``critic_subset`` of the ``num_critics`` target critics), by ``mse`` (the
 mean over critics of each one's squared error) or ResFiT's ``mean_abs_squared``. The actor maximizes
 ``reduce_actor(Q_k(s, mu(s)))`` (``actor_q_reduction``: ``mean`` over the critics, ResFiT's ``ensemble_mean``; ``min``;
 ``min_random_pair``; ``q1``), plus ``action_l2_reg_weight * mean(sum_d a_d^2)``; it updates every ``policy_delay``-th
@@ -20,9 +19,9 @@ Everything else is :class:`~robonuke_rl_core.learners.sac.SAC`'s, unchanged: per
 optimizers (``num_agents``), the replay memory, n-step rows, demos (``demo_transitions``, mixed into batches, the actor
 on the same mixed batch with ``demo_batch_shared``), per-phase routing (``route_labels``, each phase its own learner and
 clocks), held rows, CUDA graphs, checkpoints and the update metrics -- minus the entropy temperature. On top of SAC's:
-ResFiT's uniform warm-up actions until this learner starts learning (``random_action_scale``) and its critic warm-up
-(``critic_warmup_updates`` critic-only gradient steps at once before the actor learns), both counted per learner, so a
-routed phase's clocks are its own.
+the warm-up phase until this learner starts learning (``warmup_noise``; ResFiT's: uniform about the midpoint) and the
+critic warm-up (``critic_warmup_updates`` critic-only gradient steps at once before the actor learns, its target
+smoothing the warm-up's), both counted per learner, so a routed phase's clocks are its own.
 """
 
 from __future__ import annotations
@@ -34,6 +33,8 @@ import torch
 
 from ..losses.losses import LossContext
 from ..optim import BlockAdamW, clip_grad_norm_per_agent
+from .base import CHECKPOINT_CRITIC_WARMUP
+from .noise import ActionNoise
 from .sac import SAC, masked_lerp_
 
 __all__ = ["DDPG"]
@@ -54,15 +55,16 @@ class DDPG(SAC):
         super().__init__(**kwargs)
         self.target_policy = self.models["target_policy"]
         self._sync_target_policy()
-        #: the exploration std now, a device tensor the captured target-smoothing noise reads (updated in place)
-        self._explore_std = torch.full((), float(self.cfg.exploration_std), device=self.device)
         #: action_range's midpoint and half width: the actor's action is mid + half * tanh(mu)
         lo, hi = (float(v) for v in self.cfg.action_range)
         self._range = (lo, hi)
         self._mid, self._half = (lo + hi) / 2.0, (hi - lo) / 2.0
-        #: exploration_std_mode: adaptive -- ``() -> (num_envs, A)``, this step's per-env, per-dim scale on the noise std,
-        #: set by the trainer from the project's register_exploration_scale builder (None until then)
-        self.exploration_scale = None
+        #: every noise draw: the warm-up's and the training's (learners/noise.py)
+        self.noise = ActionNoise(self.cfg.warmup_noise, self.cfg.train_noise, action_range=self._range,
+                                 num_agents=self.num_agents, device=self.device)
+        self.noise.load_smoothing("train", 0)
+        #: the training noise's scale at the last acting step (logged as policy/exploration_std)
+        self._explore_std = torch.full((), self.noise.scale("train", 0), device=self.device)
         #: critic_warmup_updates, per agent: its burst has run (or none is asked for); _in_critic_warmup while one runs
         self._agent_warmed = [int(self.cfg.critic_warmup_updates) == 0] * self.num_agents
         self._in_critic_warmup = False
@@ -117,12 +119,14 @@ class DDPG(SAC):
         return super()._upgrade_checkpoint_models(models, path)
 
     # ------------------------------------------------------------------ acting
-    def exploration_std(self, timestep: int) -> float:
-        """The exploration noise's std at env step ``timestep`` (linear ``exploration_std`` -> ``_end``)."""
-        start, end, steps = float(self.cfg.exploration_std), self.cfg.exploration_std_end, int(self.cfg.exploration_std_steps)
-        if end is None or steps <= 0:
-            return start
-        return start + (float(end) - start) * min(max(timestep, 0) / steps, 1.0)
+    @property
+    def exploration_scale(self):
+        """The adaptive factor, ``observations -> (rows, A)`` (set by the trainer from ``register_exploration_scale``)."""
+        return self.noise.factor
+
+    @exploration_scale.setter
+    def exploration_scale(self, fn) -> None:
+        self.noise.factor = fn
 
     def _agent_started(self, timestep: int):
         """Per agent, whether it may update: its own online rows (``learning_starts_rows``) and its own clock
@@ -138,15 +142,13 @@ class DDPG(SAC):
         return all(self._agent_started(timestep))
 
     def _agent_random_phase(self, timestep: int):
-        """ResFiT's warm-up, per agent: uniform actions until that agent starts learning (or for ``random_timesteps``)."""
-        if float(self.cfg.random_action_scale) <= 0:
-            return [False] * self.num_agents
+        """The warm-up phase, per agent (``warmup_noise``): until that agent starts learning (or for ``random_timesteps``)."""
         if timestep < int(self.cfg.random_timesteps):
             return [True] * self.num_agents
         return [not started for started in self._agent_started(timestep)]
 
     def _random_phase(self, timestep: int) -> bool:
-        """Every agent is in its uniform warm-up (:meth:`_agent_random_phase`)."""
+        """Every agent is in its warm-up phase (:meth:`_agent_random_phase`)."""
         return all(self._agent_random_phase(timestep))
 
     def _random_agent_mask(self, random_agents) -> torch.Tensor:
@@ -170,21 +172,6 @@ class DDPG(SAC):
             raise RuntimeError("DDPG's actor must return mean_actions (a squashed Gaussian actor's tanh(mu))")
         return self._mid + self._half * outputs["mean_actions"], outputs
 
-    def _noise_scale(self):
-        """``exploration_std_mode: adaptive``: this step's ``(num_envs, A)`` scale on the noise std; constant: None."""
-        if self.cfg.exploration_std_mode != "adaptive":
-            return None
-        if self.exploration_scale is None:
-            raise RuntimeError(
-                "ddpg.exploration_std_mode: adaptive scales the noise by the env's per-step scale, but no "
-                "builder answered (register_exploration_scale in the training script's setup())"
-            )
-        return self.exploration_scale()
-
-    def _uniform_warmup(self, rows: int, width: int) -> torch.Tensor:
-        """ResFiT's warm-up action: ``mid + U(-random_action_scale, random_action_scale)`` per dim."""
-        return self._mid + (torch.rand((rows, width), device=self.device) * 2.0 - 1.0) * float(self.cfg.random_action_scale)
-
     def act(self, observations, states, *, timestep: int, timesteps: int):
         if self.training and timestep == 0 and not getattr(self, "_initial_logged", False):
             self._log_initial_policy(observations)
@@ -192,48 +179,38 @@ class DDPG(SAC):
         width = self._space_width(self.action_space)
         if self.training and self._warming_up():
             return torch.zeros((rows, width), device=self.device), {}
-        random_agents = self._agent_random_phase(timestep) if self.training else [False] * self.num_agents
-        around_actor = self.cfg.random_action_mode == "actor_gaussian"
-        if all(random_agents) and not around_actor:
-            return self._uniform_warmup(rows, width), {}
-        inputs = {"observations": self.normalize_observations(observations)}
-        with torch.no_grad(), self._batch_mode(self.policy, False):
-            mean, outputs = self._deterministic(self.policy, inputs)
-            if not self.training:
-                return self._clamp(mean), {**outputs, "mean_actions": mean}
-            std = self.exploration_std(timestep)
-            self._explore_std.fill_(std)
-            # noise_repeat: FlashSAC's held draw (each agent keeps one standard-normal draw for k ~ truncated Zeta
-            # steps), else a fresh one every step
-            draw = self._repeated_noise(rows, mean.shape[-1]) if self.cfg.noise_repeat else torch.randn_like(mean)
-            noise = draw * std
-            scale = self._noise_scale()
-            if scale is not None:  # exploration_std_mode: adaptive -- each env's and dim's std follows the env's scale
-                noise = noise * scale
-            if self.cfg.exploration_noise_clip is not None:
-                noise = noise.clamp(-float(self.cfg.exploration_noise_clip), float(self.cfg.exploration_noise_clip))
-            actions = self._clamp(mean + noise)
-            if any(random_agents):
-                # the agents still in their warm-up act at random; the others with their actors (agent i owns
-                # envs [i * envs_per_agent, (i + 1) * envs_per_agent))
+        if not self.training:
+            return self.eval_actions(observations), {}
+        random_agents = self._agent_random_phase(timestep)
+        # the phases in use this step: the warm-up for the agents not yet learning, the training noise for the others
+        # (agent i owns envs [i * envs_per_agent, (i + 1) * envs_per_agent))
+        phases = (["warmup"] if any(random_agents) else []) + (["train"] if not all(random_agents) else [])
+        mean, outputs = None, {}
+        if any(self.noise.needs_actor(phase) for phase in phases):
+            inputs = {"observations": self.normalize_observations(observations)}
+            with torch.no_grad(), self._batch_mode(self.policy, False):
+                mean, outputs = self._deterministic(self.policy, inputs)
+        std = self.noise.scale("train", timestep)
+        self._explore_std.fill_(std)
+        with torch.no_grad():
+            drawn = {phase: self.noise.draw(phase, mean, observations, rows, width, timestep) for phase in phases}
+            if len(drawn) == 2:
                 per_env = self._random_agent_mask(random_agents).repeat_interleave(rows // self.num_agents)
-                if around_actor:  # random_action_mode: actor_gaussian, about the actor's own action
-                    warm = self._clamp(mean + torch.randn_like(mean) * float(self.cfg.random_action_scale))
-                else:
-                    warm = self._uniform_warmup(rows, width)
-                actions = torch.where(per_env[:, None], warm, actions)
-        self._emit_std_by_label({"log_std": torch.full_like(mean, math.log(max(std, 1e-12)))}, timestep)
-        return actions, {**outputs, "mean_actions": mean}
+                actions = torch.where(per_env[:, None], drawn["warmup"], drawn["train"])
+            else:
+                actions = next(iter(drawn.values()))
+            actions = self._clamp(actions)
+        if mean is not None:
+            self._emit_std_by_label({"log_std": torch.full_like(mean, math.log(max(std, 1e-12)))}, timestep)
+            outputs = {**outputs, "mean_actions": mean}
+        return actions, outputs
 
     def eval_actions(self, observations: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        """The eval policy's action: the scaled, clamped mean; not ``deterministic``: plus the exploration noise at its
-        starting std."""
+        """The eval policy's action: the scaled, clamped mean. DDPG evaluates without noise."""
+        if not deterministic:
+            raise ValueError("DDPG evaluates its deterministic action only: eval has no noise (deterministic: true)")
         with torch.no_grad(), self._batch_mode(self.policy, False):
             mean, _ = self._deterministic(self.policy, {"observations": self.normalize_observations(observations)})
-            if not deterministic:
-                noise = torch.randn_like(mean) * self.exploration_std(0)
-                scale = self._noise_scale() if self.exploration_scale is not None else None
-                mean = mean + (noise if scale is None else noise * scale)
             return self._clamp(mean)
 
     def _log_initial_policy(self, observations: torch.Tensor) -> None:
@@ -245,7 +222,7 @@ class DDPG(SAC):
         rows = observations.shape[0] // self.num_agents
         with torch.no_grad(), self._batch_mode(self.policy, False):
             mean, _ = self._deterministic(self.policy, {"observations": self.normalize_observations(observations)})
-        std = torch.full((self.num_agents,), self.exploration_std(0), device=self.device)
+        std = torch.full((self.num_agents,), self.noise.scale("train", 0), device=self.device)
         metrics = {
             "policy/mean_action": mean.abs().reshape(self.num_agents, rows, -1).mean(dim=(1, 2)),
             "policy/exploration_std": std,
@@ -286,6 +263,7 @@ class DDPG(SAC):
             # ResFiT's critic warm-up, per agent: critic_warmup_updates critic-only gradient steps now, before the next
             # env step, for the agents that just started (the others untouched)
             self._in_critic_warmup = True
+            self.noise.load_smoothing("warmup", timestep)  # the burst's target smoothing is the warm-up's
             rounds = -(-int(self.cfg.critic_warmup_updates) // int(self.cfg.gradient_steps))
             # only the burst's end is published: its last WARMUP_LOGGED_UPDATES gradient steps, one point per update
             # as usual, so the interval it lands in holds the critic as the actor will meet it
@@ -296,9 +274,26 @@ class DDPG(SAC):
             self._suppress_update_metrics = False
             self._in_critic_warmup = False
             self._agent_warmed = [w or n for w, n in zip(self._agent_warmed, newly)]
+            self._save_critic_warmup_checkpoints(newly, timestep)
             return
         # agents that have not started or not warmed up take no step (their rows-ready / clock gate in SAC's schedule)
+        self.noise.load_smoothing("train", timestep)
         super()._update_if_ready(timestep=timestep, timesteps=timesteps)
+
+    def _save_critic_warmup_checkpoints(self, agents, timestep: int) -> None:
+        """``ckpt_critic_warmup.ckpt`` for each agent in ``agents`` (the ones whose burst just ran): the critics right
+        after the warm-up, before any update on normal data, whatever env step that is (its ``step``). Written where the
+        numbered checkpoints go (with routes, each phase's own folder), and only when they are written at all."""
+        if self.trainer_cfg.checkpoint_interval <= 0 or self.run_dirs is None:
+            return
+        for agent, now in enumerate(agents):
+            if not now:
+                continue
+            directory = self.checkpoint_dir(agent)
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / CHECKPOINT_CRITIC_WARMUP
+            torch.save(self._build_checkpoint(agent, timestep), path)
+            self._announce_checkpoint(agent, timestep, path)
 
     # ------------------------------------------------------------------ losses
     @staticmethod
@@ -327,10 +322,7 @@ class DDPG(SAC):
             source = self.target_policy if self.cfg.target_actor else self.policy
             with self._batch_mode(source, False):
                 next_actions, _ = self._deterministic(source, next_inputs)
-            if self.cfg.target_policy_noise:
-                clip = float(self.cfg.target_noise_clip)
-                next_actions = next_actions + (torch.randn_like(next_actions) * self._explore_std).clamp(-clip, clip)
-            next_actions = self._clamp(next_actions)
+            next_actions = self._clamp(self.noise.smooth(next_actions, sampled["next_observations"]))
             next_critic_actions = self._critic_actions(sampled, "next_observations", next_actions)
             with self._batch_mode(self.target_critics, True):
                 target_out, _ = self.target_critics.act(
@@ -438,8 +430,8 @@ class DDPG(SAC):
         }
 
     def _emit_update_metrics(self, **kwargs) -> None:
-        """SAC's update metrics, plus the exploration std (``policy/exploration_std``, also as ``policy/std``) and the
-        critics' spread across the ensemble (``q/ensemble_std``)."""
+        """SAC's update metrics, plus the training noise's scale (``policy/exploration_std``, also as ``policy/std``) and
+        the critics' spread across the ensemble (``q/ensemble_std``)."""
         aux = dict(kwargs.get("aux_metrics") or {})
         std = self._explore_std.reshape(1).expand(self.num_agents).clone()
         aux.update({"policy/exploration_std": std, "policy/std": std, "q/ensemble_std": self._q_spread})

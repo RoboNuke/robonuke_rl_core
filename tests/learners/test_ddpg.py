@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from helpers import ACT_DIM, OBS_DIM, build_learner, fill_memory
-from robonuke_rl_core.learners.cfg import DDPGCfg
+from robonuke_rl_core.learners.cfg import DDPGCfg, NoiseCfg
 
 
 def ddpg(**overrides):
@@ -33,9 +33,17 @@ def batch(learner):
     return sampled, inputs, next_inputs, critic_inputs, critic_next_inputs
 
 
+def N(**kw):
+    return NoiseCfg(**kw)
+
+
+def started(learner):
+    learner._agent_rows_ready = [True] * learner.num_agents
+    return learner
+
+
 def test_the_action_is_the_squashed_mean_on_the_range_plus_scheduled_noise_clamped():
-    learner = ddpg(action_range=[-0.1, 0.1], exploration_std=0.4, exploration_std_end=0.0, exploration_std_steps=100,
-                   clip_actions=False)
+    learner = ddpg(action_range=[-0.1, 0.1], train_noise=N(scale=0.4, scale_end=0.0, scale_steps=100), clip_actions=False)
     obs = torch.randn(6, OBS_DIM)
     with torch.no_grad():
         _, out = learner.policy.act({"observations": obs}, role="policy")
@@ -44,29 +52,32 @@ def test_the_action_is_the_squashed_mean_on_the_range_plus_scheduled_noise_clamp
     eval_action, _ = learner.act(obs, None, timestep=0, timesteps=100)
     torch.testing.assert_close(eval_action, mean)  # eval: the scaled mean, no noise
     torch.testing.assert_close(learner.eval_actions(obs, deterministic=True), mean)
+    with pytest.raises(ValueError, match="no noise"):
+        learner.eval_actions(obs, deterministic=False)
     learner.enable_training_mode(True)
-    assert learner.exploration_std(0) == pytest.approx(0.4) and learner.exploration_std(50) == pytest.approx(0.2)
-    assert learner.exploration_std(500) == pytest.approx(0.0)
+    assert learner.noise.scale("train", 0) == pytest.approx(0.4) and learner.noise.scale("train", 50) == pytest.approx(0.2)
+    assert learner.noise.scale("train", 500) == pytest.approx(0.0)
     torch.manual_seed(0)
     noisy = torch.stack([learner.act(obs, None, timestep=50, timesteps=100)[0] for _ in range(400)])
     assert float((noisy - mean).std()) == pytest.approx(0.2, rel=0.1)  # the std at step 50
-    clamped = ddpg(exploration_std=5.0)  # clip_actions (the default): clamped to [-1, 1]
+    clamped = ddpg(train_noise=N(scale=5.0))  # clip_actions (the default): clamped to [-1, 1]
     assert float(clamped.act(obs, None, timestep=1, timesteps=100)[0].abs().max()) <= 1.0
 
 
-def test_noise_repeat_holds_the_exploration_draw_per_agent_for_its_drawn_length():
-    learner = ddpg(exploration_std=0.3, clip_actions=False, noise_repeat=True, noise_repeat_max=8)
+def test_correlated_noise_holds_each_agents_draw_for_its_drawn_length():
+    learner = ddpg(train_noise=N(scale=0.3, repeat=True, repeat_max=8), clip_actions=False)
     learner.enable_training_mode(True)
     obs = torch.randn(6, OBS_DIM)
     with torch.no_grad():
         mean = learner.policy.act({"observations": obs}, role="policy")[1]["mean_actions"]
     torch.manual_seed(0)
+    hold = learner.noise.held["train"]
     draws, lengths = [], []
     for step in range(200):
         actions, _ = learner.act(obs, None, timestep=step, timesteps=1000)
-        torch.testing.assert_close(actions, mean + 0.3 * learner._held_noise)  # the held draw is the exploration noise
-        draws.append(learner._held_noise.clone())
-        lengths.append(learner._noise_length.clone())
+        torch.testing.assert_close(actions, mean + 0.3 * hold.held)  # the held draw is the noise
+        draws.append(hold.held.clone())
+        lengths.append(hold.length.clone())
     draws, lengths = torch.stack(draws), torch.stack(lengths)
     assert int(lengths.max()) <= 8
     for agent in range(2):
@@ -75,30 +86,26 @@ def test_noise_repeat_holds_the_exploration_draw_per_agent_for_its_drawn_length(
         starts = [0] + [t + 1 for t in range(len(changed)) if changed[t]]
         for start, end in zip(starts, starts[1:]):
             assert end - start == int(lengths[start, agent])  # each hold lasts its drawn length
-    plain = ddpg()
-    plain.enable_training_mode(True)
-    plain.act(torch.randn(6, OBS_DIM), None, timestep=5, timesteps=100)
-    assert plain._held_noise is None  # off: a fresh draw every step
+    assert ddpg().noise.held["train"] is None  # off: a fresh draw every step
 
 
-def test_resfits_warm_up_acts_uniformly_until_this_learner_starts_learning():
-    learner = ddpg(random_action_scale=0.2, learning_starts_rows=10**6, action_range=[-0.1, 0.1], exploration_std=0.0,
-                   clip_actions=False)
+def test_resfits_warm_up_acts_uniformly_about_the_midpoint_until_this_learner_starts_learning():
+    learner = ddpg(warmup_noise=N(center="mid", distribution="uniform", scale=0.2), train_noise=N(scale=0.0),
+                   learning_starts_rows=10**6, action_range=[-0.1, 0.1], clip_actions=False)
     obs = torch.randn(6, OBS_DIM)
     torch.manual_seed(0)
     warm = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(200)])
     assert float(warm.abs().max()) <= 0.2 and float(warm.abs().max()) > 0.18  # uniform in [-0.2, 0.2]
-    learner._agent_rows_ready = [True] * learner.num_agents  # its rows are there: the actor (here noise-free) from now on
+    started(learner)  # its rows are there: the actor (here noise-free) from now on
     with torch.no_grad():
         _, out = learner.policy.act({"observations": obs}, role="policy")
     torch.testing.assert_close(learner.act(obs, None, timestep=300, timesteps=1000)[0], out["mean_actions"] * 0.1)
 
 
-def test_the_actor_gaussian_warm_up_acts_about_the_actors_own_action():
-    # random_action_mode: actor_gaussian with model.actor.output_bias: the actor starts at tanh(bias) for every state
-    # (a zero output layer), and the warm-up draws N(0, random_action_scale) about it, clamped to the range
-    learner = ddpg(random_action_scale=0.05, random_action_mode="actor_gaussian", learning_starts_rows=10**6,
-                   exploration_std=0.0,
+def test_a_gaussian_warm_up_acts_about_the_actors_own_action():
+    # with model.actor.output_bias the actor starts at tanh(bias) for every state (a zero output layer); the warm-up draws
+    # N(0, 0.05) about it, clamped to the range
+    learner = ddpg(warmup_noise=N(scale=0.05), train_noise=N(scale=0.0), learning_starts_rows=10**6,
                    model_overrides={"output_init_scale": 0.0, "output_bias": math.atanh(0.6)})
     obs = torch.randn(6, OBS_DIM)
     learner.enable_training_mode(False)
@@ -111,27 +118,36 @@ def test_the_actor_gaussian_warm_up_acts_about_the_actors_own_action():
     assert float(warm.abs().max()) <= 1.0
 
 
+def test_a_uniform_phase_with_no_scale_covers_the_whole_range():
+    learner = ddpg(action_range=[-1.5, 3.5], warmup_noise=N(center="mid", distribution="uniform", scale=None),
+                   learning_starts_rows=10**6)
+    assert learner.noise.scale("warmup", 0) == pytest.approx(2.5)  # the range's half width
+    torch.manual_seed(0)
+    warm = torch.stack([learner.act(torch.randn(6, OBS_DIM), None, timestep=t + 1, timesteps=100)[0] for t in range(300)])
+    assert float(warm.min()) >= -1.5 and float(warm.max()) <= 3.5
+    assert float(warm.min()) < -1.4 and float(warm.max()) > 3.4 and float(warm.mean()) == pytest.approx(1.0, abs=0.05)
+
+
 def test_an_off_centre_range_starts_at_its_midpoint_and_clamps_to_its_ends():
     # a multiplier-style range: tanh(mu) = 0 is the midpoint 1, the actor's start with a zero output layer
-    learner = ddpg(action_range=[-1.5, 3.5], exploration_std=0.0, model_overrides={"output_init_scale": 0.0})
+    learner = started(ddpg(action_range=[-1.5, 3.5], train_noise=N(scale=10.0), model_overrides={"output_init_scale": 0.0}))
     obs = torch.randn(6, OBS_DIM)
     learner.enable_training_mode(False)
     torch.testing.assert_close(learner.act(obs, None, timestep=0, timesteps=100)[0], torch.full((6, ACT_DIM), 1.0))
     learner.enable_training_mode(True)
-    learner.cfg.exploration_std = 10.0
-    learner._agent_rows_ready = [True] * learner.num_agents
     torch.manual_seed(0)
     acted = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(50)])
     assert float(acted.min()) == pytest.approx(-1.5) and float(acted.max()) == pytest.approx(3.5)  # clamped to the range
-    loose = ddpg(action_range=[-1.5, 3.5], exploration_std=10.0, clip_actions=False, model_overrides={"output_init_scale": 0.0})
+    loose = started(ddpg(action_range=[-1.5, 3.5], train_noise=N(scale=10.0), clip_actions=False,
+                         model_overrides={"output_init_scale": 0.0}))
     loose.enable_training_mode(True)
-    loose._agent_rows_ready = [True] * loose.num_agents
     wide = torch.stack([loose.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(50)])
     assert float(wide.max()) > 3.5 and float(wide.min()) < -1.5  # clip_actions: false leaves the noise unclamped
 
 
 def test_the_uniform_warm_up_is_about_the_ranges_midpoint():
-    learner = ddpg(action_range=[-1.5, 3.5], random_action_scale=0.5, learning_starts_rows=10**6, exploration_std=0.0)
+    learner = ddpg(action_range=[-1.5, 3.5], warmup_noise=N(center="mid", distribution="uniform", scale=0.5),
+                   learning_starts_rows=10**6)
     obs = torch.randn(6, OBS_DIM)
     torch.manual_seed(0)
     warm = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(300)])
@@ -139,29 +155,56 @@ def test_the_uniform_warm_up_is_about_the_ranges_midpoint():
     assert float(warm.mean()) == pytest.approx(1.0, abs=0.02)
 
 
-def test_adaptive_exploration_scales_each_envs_and_dims_std_by_the_envs_scale():
-    learner = ddpg(exploration_std=0.2, exploration_std_mode="adaptive", clip_actions=False)
-    learner._agent_rows_ready = [True] * learner.num_agents
+def test_adaptive_noise_scales_each_rows_and_dims_draw_by_the_factor_of_its_observation():
+    learner = started(ddpg(train_noise=N(scale=0.2, adaptive=True), clip_actions=False))
     learner.enable_training_mode(True)
     obs = torch.randn(6, OBS_DIM)
     with pytest.raises(RuntimeError, match="register_exploration_scale"):
-        learner.act(obs, None, timestep=1, timesteps=100)  # adaptive with no scale: refused, never a silent constant
-    scale = torch.ones(6, ACT_DIM)
-    scale[0] = 0.0  # env 0 still: no noise
-    scale[1, 0] = 5.0  # env 1, dim 0: five times the std
-    learner.exploration_scale = lambda: scale
+        learner.act(obs, None, timestep=1, timesteps=100)  # adaptive with no factor: refused, never a silent constant
+    factor = torch.ones(6, ACT_DIM)
+    factor[0] = 0.0  # env 0 still: no noise
+    factor[1, 0] = 5.0  # env 1, dim 0: five times the std
+    seen = []
+    learner.exploration_scale = lambda o: seen.append(o) or factor
     with torch.no_grad():
         mean = learner.policy.act({"observations": obs}, role="policy")[1]["mean_actions"]
     torch.manual_seed(0)
     noise = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(400)]) - mean
+    assert seen[0] is obs  # the factor reads the raw observation the learner acts on
     assert float(noise[:, 0].abs().max()) == 0.0
     assert float(noise[:, 1, 0].std()) == pytest.approx(1.0, rel=0.1)
     assert float(noise[:, 2:].std()) == pytest.approx(0.2, rel=0.1)
 
 
-def test_the_warm_up_mode_must_be_known():
-    with pytest.raises(ValueError, match="random_action_mode"):
-        DDPGCfg(random_action_mode="normal").validate(None)
+def test_the_clip_bounds_the_scaled_draw_before_the_adaptive_factor():
+    learner = started(ddpg(train_noise=N(scale=10.0, clip=0.1, adaptive=True), clip_actions=False))
+    learner.exploration_scale = lambda o: torch.full((o.shape[0], ACT_DIM), 3.0)
+    obs = torch.randn(6, OBS_DIM)
+    with torch.no_grad():
+        mean = learner.policy.act({"observations": obs}, role="policy")[1]["mean_actions"]
+    noise = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(20)]) - mean
+    assert float(noise.abs().max()) == pytest.approx(0.3)  # clipped to 0.1, then 3 x
+
+
+def test_each_agent_acts_with_its_own_phase_and_each_phase_with_its_own_options():
+    learner = ddpg(warmup_noise=N(scale=10.0, clip=0.1), train_noise=N(scale=10.0, clip=0.5), clip_actions=False,
+                   learning_starts_rows=10**6)
+    learner._agent_rows_ready = [False, True]  # agent 0 still warming up, agent 1 learning
+    obs = torch.randn(6, OBS_DIM)
+    with torch.no_grad():
+        mean = learner.policy.act({"observations": obs}, role="policy")[1]["mean_actions"]
+    noise = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(20)]) - mean
+    assert float(noise[:, :3].abs().max()) == pytest.approx(0.1) and float(noise[:, 3:].abs().max()) == pytest.approx(0.5)
+
+
+def test_the_noise_options_must_be_known():
+    for bad in ({"center": "base"}, {"distribution": "normal"}, {"scale": None}, {"scale": -1.0}, {"clip": 0.0},
+                {"repeat": True, "repeat_max": 0}, {"target_clip": 0.0},
+                {"distribution": "uniform", "scale": None, "scale_end": 0.1}):
+        with pytest.raises(ValueError):
+            NoiseCfg(**bad).validate("ddpg.train_noise")
+    with pytest.raises(ValueError, match="warmup_noise.distribution"):
+        DDPGCfg(warmup_noise=N(distribution="normal")).validate(None)
 
 
 def test_the_critic_target_is_r_plus_gamma_min_of_target_critics_at_the_target_actors_action():
@@ -190,17 +233,36 @@ def test_the_critic_target_is_r_plus_gamma_min_of_target_critics_at_the_target_a
 
 
 def test_target_policy_smoothing_stays_within_its_clip():
-    learner = ddpg(num_critics=1, target_policy_noise=True, exploration_std=10.0, target_noise_clip=1e-7)
+    learner = ddpg(num_critics=1, train_noise=N(scale=10.0, target_smoothing=True, target_clip=1e-7))
     fill_memory(learner)
-    learner._explore_std.fill_(10.0)
     sampled, inputs, next_inputs, critic_inputs, critic_next_inputs = batch(learner)
     rows = learner.cfg.batch_size
-    smoothed = learner._compute_critic_loss(sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=critic_inputs,
-                                            critic_next_inputs=critic_next_inputs, rows=rows)[3]
-    learner.cfg.target_policy_noise = False
-    plain = learner._compute_critic_loss(sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=critic_inputs,
-                                         critic_next_inputs=critic_next_inputs, rows=rows)[3]
-    torch.testing.assert_close(smoothed, plain, atol=1e-5, rtol=0)  # noise of std 10 clipped to 1e-7
+
+    def target():
+        return learner._compute_critic_loss(sampled=sampled, inputs=inputs, next_inputs=next_inputs,
+                                            critic_inputs=critic_inputs, critic_next_inputs=critic_next_inputs, rows=rows)[3]
+
+    learner.noise.load_smoothing("train", 0)
+    smoothed = target()
+    learner.cfg.train_noise.target_smoothing = False
+    learner.noise.load_smoothing("train", 0)
+    torch.testing.assert_close(smoothed, target(), atol=1e-5, rtol=0)  # noise of std 10 clipped to 1e-7
+
+
+def test_each_phase_loads_its_own_target_smoothing_and_the_adaptive_one_reads_the_next_observation():
+    learner = ddpg(warmup_noise=N(scale=0.2, target_smoothing=True, target_scale=0.3, target_clip=0.5, target_adaptive=True),
+                   train_noise=N(scale=0.4, scale_end=0.0, scale_steps=100, target_smoothing=True, target_clip=0.7))
+    smooth = learner.noise._smooth
+    learner.noise.load_smoothing("warmup", 0)  # the critic warm-up burst
+    assert [float(smooth[k]) for k in ("on", "std", "clip", "adaptive")] == pytest.approx([1.0, 0.3, 0.5, 1.0])
+    learner.noise.load_smoothing("train", 50)  # target_scale null: the phase's scale at that step
+    assert [float(smooth[k]) for k in ("on", "std", "clip", "adaptive")] == pytest.approx([1.0, 0.2, 0.7, 0.0])
+    learner.noise.load_smoothing("warmup", 0)
+    next_obs = torch.randn(4, OBS_DIM)
+    seen = []
+    learner.exploration_scale = lambda o: seen.append(o) or torch.zeros(o.shape[0], ACT_DIM)
+    out = learner.noise.smooth(torch.zeros(4, ACT_DIM), next_obs)
+    assert seen[0] is next_obs and float(out.abs().max()) == 0.0  # a zero factor: no smoothing noise
 
 
 def test_the_critic_loss_forms():
@@ -265,13 +327,35 @@ def test_the_critic_warm_up_trains_the_critics_alone_at_once_then_the_actor_join
     assert not torch.equal(actor_params(learner), actor0)  # from the next update on, it learns
 
 
+def test_the_critics_right_after_their_warm_up_are_saved_once_per_agent_whatever_the_step(tmp_path):
+    learner = ddpg(critic_warmup_updates=4, learning_starts_rows=10**6, run_dirs_list=[tmp_path / "a0", tmp_path / "a1"],
+                   trainer_overrides={"checkpoint_interval": 1000})
+    fill_memory(learner)
+    learner._agent_rows_ready = [False, True]  # agent 1 starts first
+    learner._update_if_ready(timestep=37, timesteps=100)
+    path1 = tmp_path / "a1" / "checkpoints" / "ckpt_critic_warmup.ckpt"
+    assert path1.is_file() and not (tmp_path / "a0" / "checkpoints" / "ckpt_critic_warmup.ckpt").exists()
+    saved = torch.load(path1, weights_only=False)
+    assert saved["step"] == 37
+    loaded = ddpg()
+    loaded.load_agent(path1, slot=0)
+    for (_, a), (_, b) in zip(learner.critics.named_parameters(), loaded.critics.named_parameters()):
+        torch.testing.assert_close(b[0], a[1])  # exactly agent 1's critics after its burst
+    learner._update_if_ready(timestep=38, timesteps=100)  # a normal update: the saved file stays as it was
+    assert torch.load(path1, weights_only=False)["step"] == 37
+    learner._agent_rows_ready = [True, True]
+    learner._update_if_ready(timestep=90, timesteps=100)  # agent 0's own burst, at its own step
+    assert torch.load(tmp_path / "a0" / "checkpoints" / "ckpt_critic_warmup.ckpt", weights_only=False)["step"] == 90
+    assert torch.load(path1, weights_only=False)["step"] == 37
+
+
 def test_routed_phases_keep_their_own_warm_up_and_learning_starts():
     from robonuke_rl_core.learners.routed import RoutedSAC
 
     names = ["corner", "grasp", "insert", "screw", "success"]
     kw = dict(num_agents=1, envs_per_agent=2, rollout=64, architecture="mlp", std_by_label="eval_state/phase/id",
-              std_label_names=names, route_clock=True, learning_starts_rows=6, critic_warmup_updates=2, random_action_scale=0.2,
-              exploration_std=0.0)
+              std_label_names=names, route_clock=True, learning_starts_rows=6, critic_warmup_updates=2,
+              warmup_noise=N(center="mid", distribution="uniform", scale=0.2), train_noise=N(scale=0.0))
     routed = RoutedSAC({r: build_learner("ddpg", route_label=r, **kw) for r in ("insert", "screw")}, names)
     routed.enable_training_mode(True)
     obs = torch.randn(2, OBS_DIM)
@@ -293,7 +377,7 @@ def test_shared_warmup_pools_every_envs_rows_until_the_agents_start_together_the
     names = ["corner", "grasp", "insert", "screw", "success"]
     kw = dict(num_agents=2, envs_per_agent=1, rollout=64, architecture="mlp", std_by_label="eval_state/phase/id",
               std_label_names=names, route_clock=True, learning_starts_rows=6, critic_warmup_updates=2,
-              random_action_scale=0.2, exploration_std=0.0, shared_warmup=True)
+              warmup_noise=N(center="mid", distribution="uniform", scale=0.2), train_noise=N(scale=0.0), shared_warmup=True)
     routed = RoutedSAC({r: build_learner("ddpg", route_label=r, **kw) for r in ("insert", "screw")}, names)
     routed.enable_training_mode(True)
     insert = routed.learners["insert"]
@@ -339,15 +423,14 @@ def test_checkpoints_carry_the_target_actor(tmp_path):
 
 def test_the_config_refuses_sac_only_options_and_bad_values():
     DDPGCfg().validate(None)
-    DDPGCfg(noise_repeat=True).validate(None)  # held exploration noise, as SAC's
+    DDPGCfg(train_noise=N(repeat=True)).validate(None)  # held noise, as SAC's noise_repeat
     DDPGCfg(shared_warmup=True, learning_starts_rows=10).validate(None)
     with pytest.raises(ValueError, match="learning_starts_rows"):
         DDPGCfg(shared_warmup=True).validate(None)
-    for bad in ({"learn_entropy": True}, {"critic_distribution": "categorical"}, {"noise_repeat": True, "noise_repeat_max": 0},
+    for bad in ({"learn_entropy": True}, {"critic_distribution": "categorical"}, {"noise_repeat": True},
                 {"cross_batch_value": True}, {"action_l2_weight": 1.0}, {"critic_loss": "huber"},
                 {"q_target_min": 0.0}, {"action_range": [0.5, 0.5]}, {"action_range": [-1.0]},
-                {"exploration_std_mode": "scaled"}, {"actor_q_reduction": "min_random_pair"},
-                {"exploration_std": -1.0}):
+                {"actor_q_reduction": "min_random_pair"}, {"train_noise": N(scale=-1.0)}):
         with pytest.raises(ValueError):
             DDPGCfg(**bad).validate(None)
 
@@ -456,7 +539,7 @@ def test_the_action_slope_is_off_by_default():
 
 
 def test_critic_values_scores_given_transitions_per_slot_as_the_update_does():
-    learner = ddpg(num_critics=2, critic_subset=2, target_policy_noise=False)  # the target min over both: not random
+    learner = ddpg(num_critics=2, critic_subset=2)  # no target smoothing, the target min over both: not random
     fill_memory(learner)
     names = learner._demo_names() + (["discounts"] if learner._n_step() > 1 else [])
     size = int(learner.memory.size)

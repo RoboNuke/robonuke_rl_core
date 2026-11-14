@@ -224,7 +224,7 @@ def test_a_ddpg_step_with_resfit_settings_replays_to_the_eager_step(tmp_path, de
     and replays to what the same step does eagerly."""
     if not torch.cuda.is_available():
         pytest.fail("this GPU test needs CUDA")
-    from robonuke_rl_core.learners.cfg import DDPGCfg
+    from robonuke_rl_core.learners.cfg import DDPGCfg, NoiseCfg
     from robonuke_rl_core.learners.ddpg import DDPG
     from robonuke_rl_core.models.cfg import MlpActorCfg, MlpCriticCfg, MlpModelCfg
 
@@ -249,7 +249,7 @@ def test_a_ddpg_step_with_resfit_settings_replays_to_the_eager_step(tmp_path, de
         extra = dict(demo_transitions=str(path), demo_storage="sample", demo_sampling_start=0, demo_sampling_end=10**9,
                      demo_batch_shared=True)
     cfg = DDPGCfg(batch_size=16, gradient_steps=4, policy_delay=4, num_critics=10, critic_subset=2, actor_q_reduction="mean",
-                  critic_loss="mean_abs_squared", target_policy_noise=True, target_noise_clip=0.3, exploration_std=0.05,
+                  critic_loss="mean_abs_squared", train_noise=NoiseCfg(scale=0.05, target_smoothing=True, target_clip=0.3),
                   action_range=[-0.1, 0.1], n_step=3, polyak=0.005, weight_decay=0.01, grad_norm_clip=1.0,
                   learning_starts=0, **extra)
     model = MlpModelCfg(actor=MlpActorCfg(hidden_size=32, num_layers=2, layer_norm=True, init="default", output_init_scale=0.0),

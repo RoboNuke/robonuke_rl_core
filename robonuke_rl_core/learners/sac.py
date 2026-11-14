@@ -56,6 +56,7 @@ from .windows import stage_to_device
 from .base import LearnerBase
 from .cfg import sac_critic_outputs
 from .cuda_graph import StepGraphs
+from .noise import HeldDraw
 from .n_step import NStepWindow, n_step_rows
 
 __all__ = ["SAC", "register_critic_action", "critic_action_transform", "critic_action_space", "categorical_projection",
@@ -123,9 +124,10 @@ def critic_action_transform(cfg: Any, env: Any) -> Any:
 
 
 #: ``fn(cfg, env) -> scale | None``, registered by a project in its training script's ``setup()``: ``scale`` is a
-#: callable ``() -> (num_envs, A)`` device tensor, this env step's per-env, per-dim factor on DDPG's exploration std
-#: (``exploration_std_mode: adaptive``; a residual: the base's motion in r units), read when the learner acts, after
-#: the env built the step's observation. At most one builder may answer
+#: callable ``observations -> (rows, A)``, the per-row, per-dim factor on DDPG's adaptive noise (``NoiseCfg.adaptive``,
+#: ``target_adaptive``; a residual: the base's motion in r units), from the raw observations (the env's when acting, a
+#: replay batch's next observations in target smoothing): device ops only, no host read, as it runs inside a captured
+#: critic update. At most one builder may answer
 EXPLORATION_SCALE_BUILDERS: List[Any] = []
 
 
@@ -269,16 +271,10 @@ class SAC(LearnerBase):
         )
         #: True while an update's metrics are not to be published (DDPG's critic warm-up burst, all but its end)
         self._suppress_update_metrics = False
-        #: noise_repeat: the held standard-normal draw per env, and per agent the steps it has
-        #: been held and the length drawn for it (count 0: draw at the next step)
-        self._held_noise: Optional[torch.Tensor] = None
-        self._noise_count = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
-        self._noise_length = torch.ones(self.num_agents, dtype=torch.long, device=self.device)
-        if self.cfg.noise_repeat:
-            # FlashSAC's _build_truncated_zeta_cdf: P(k) ~ k^-s on 1..max
-            lengths = torch.arange(1, int(self.cfg.noise_repeat_max) + 1, dtype=torch.float32, device=self.device)
-            pmf = lengths ** (-float(self.cfg.noise_repeat_zeta_s))
-            self._zeta_cdf = torch.cumsum(pmf / pmf.sum(), dim=0)
+        #: noise_repeat: the held standard-normal draw per env, per agent (learners/noise.py HeldDraw, shared with
+        #: DDPG's noise phases)
+        self._hold = (HeldDraw(self.num_agents, self.cfg.noise_repeat_zeta_s, self.cfg.noise_repeat_max, self.device)
+                      if self.cfg.noise_repeat else None)
 
         # state_preprocessor (none: no normalizer)
         self.observation_normalizer = self.make_normalizer(self.observation_space)
@@ -872,26 +868,10 @@ class SAC(LearnerBase):
         for hook in self.on_flush:  # published now, as wandb step 0
             hook(0)
 
-    def _repeated_noise(self, rows: int, width: Optional[int] = None) -> torch.Tensor:
-        """``noise_repeat``: FlashSAC's ``_sample_flashsac_actions`` per agent. Every step a
-        fresh standard-normal draw and a fresh length k ~ truncated Zeta are made; an agent
-        whose held draw has been used k times (or never drawn) takes them, the others keep
-        theirs. The draws' shapes depend on nothing but the env count, and an agent's counter
-        on nothing but its own draws. Episode ends do not cut a hold short (nor in FlashSAC). ``width``: the draw's
-        (default the policy's action width)."""
-        width = int(self.policy.num_continuous) if width is None else int(width)
-        if self._held_noise is None or self._held_noise.shape != (rows, width):
-            self._held_noise = torch.zeros(rows, width, device=self.device)
-            self._noise_count.zero_()
-        redraw = (self._noise_count == 0) | (self._noise_count >= self._noise_length)  # (N,)
-        fresh = torch.randn(rows, width, device=self.device)
-        uniform = torch.rand(self.num_agents, 1, device=self.device)
-        length = torch.argmax((uniform < self._zeta_cdf).to(torch.int32), dim=1) + 1
-        per_row = redraw.repeat_interleave(rows // self.num_agents).unsqueeze(-1)
-        self._held_noise = torch.where(per_row, fresh, self._held_noise)
-        self._noise_length = torch.where(redraw, length, self._noise_length)
-        self._noise_count = torch.where(redraw, torch.zeros_like(self._noise_count), self._noise_count) + 1
-        return self._held_noise
+    def _repeated_noise(self, rows: int) -> torch.Tensor:
+        """``noise_repeat``: each agent's held standard-normal draw (:class:`~robonuke_rl_core.learners.noise.HeldDraw`,
+        FlashSAC's ``_sample_flashsac_actions``), ``(rows, the policy's action width)``."""
+        return self._hold(torch.randn(rows, int(self.policy.num_continuous), device=self.device))
 
     def _std_labels_from(self, infos: Any) -> Optional[torch.Tensor]:
         """``std_by_label``'s per-env labels in this step's ``infos`` (long, ``(num_envs,)``), or None."""

@@ -266,7 +266,7 @@ trainer) is refused by `record_transition`. With no request the loop is skrl's.
 **Several agents (`experiment.num_agents` > 1) keep separate schedules.** Each agent has its own `route_clock` (its
 envs' steps in the phase -- every agent's envs' while `shared_warmup` pools the rows: the steps its memory received
 rows for, counted on the labels at step time), its own `learning_starts_rows` (its own online rows), and its own update and `policy_delay`
-counts and LR schedule. DDPG adds its own uniform warm-up (`random_action_scale`) and critic warm-up burst
+counts and LR schedule. DDPG adds its own warm-up phase (`warmup_noise`) and critic warm-up burst
 (`critic_warmup_updates`) per agent. An update steps only the agents that are due. Every optimizer step and every
 target update (critics and the target actor) is masked to those agents, so an agent that is not due keeps its weights,
 targets, optimizer moments and step counts exactly. A block batch's online share is sized by the due agents' data
@@ -601,7 +601,8 @@ Both lists live on the learner and are **empty by default** (nothing is logged, 
 
 Per agent, at `{trainer.output_dir}/{wandb.project}/{wandb.group}/{run_name}/checkpoints/`:
 `ckpt_{step}.ckpt` every `trainer.checkpoint_interval` steps, plus `ckpt_best.ckpt` whenever an
-agent's mean episode return over a write interval improves. A file holds that agent's model
+agent's mean episode return over a write interval improves, plus (DDPG with `critic_warmup_updates`)
+`ckpt_critic_warmup.ckpt` right after that agent's critic warm-up burst, whatever its step. A file holds that agent's model
 weights, optimizer state, normalizer stats, learner extras, the step and the mean return.
 `load_agent(path, slot)` loads one file into any slot; optimizer state only with
 `with_optimizer=True`, which needs `num_agents == 1`.

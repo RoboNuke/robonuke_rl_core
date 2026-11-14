@@ -13,7 +13,7 @@ from typing import Any, List, Optional
 
 from omegaconf import MISSING
 
-__all__ = ["TrainerCfg", "SACCfg", "DDPGCfg", "PPOCfg", "LEARNERS", "register_learner", "known_learners", "sac_critic_outputs"]
+__all__ = ["TrainerCfg", "SACCfg", "NoiseCfg", "DDPGCfg", "PPOCfg", "LEARNERS", "register_learner", "known_learners", "sac_critic_outputs"]
 
 #: the package's own learners: ``models/factory`` builds their networks and eval loads them
 LEARNERS = ("sac", "ppo", "ddpg")
@@ -703,6 +703,72 @@ class SACCfg(_CommonCfg):
 
 
 @dataclass
+class NoiseCfg:
+    """One phase's action noise (``ddpg.warmup_noise``, ``ddpg.train_noise``; ``learners/noise.py`` draws both): the same
+    options for the warm-up and for training, each phase set on its own. ``r`` units throughout (``action_range``'s)."""
+
+    #: what the noise is added to: "actor", the actor's own action; "mid", ``action_range``'s midpoint (ResFiT's
+    #: uniform warm-up acts there, ignoring the actor)
+    center: str = "actor"
+    #: "gaussian": ``N(0, scale)`` per dim; "uniform": ``U(-scale, scale)`` per dim
+    distribution: str = "gaussian"
+    #: the gaussian's std or the uniform's half width, linear to ``scale_end`` over ``scale_steps`` env steps (``scale_end``
+    #: null or ``scale_steps`` 0: constant). Null: ``action_range``'s half width -- uniform only (with ``center: mid``,
+    #: uniform over the whole range)
+    scale: Optional[float] = 0.1
+    scale_end: Optional[float] = None
+    scale_steps: int = 0
+    #: the draw (``scale`` applied, before ``adaptive``) clipped to +-this; null: unclipped
+    clip: Optional[float] = None
+    #: times a per-env, per-dim factor computed from the observation (``register_exploration_scale``; a residual: the
+    #: base's motion in r units), after the clip: a clip is then that many times the motion
+    adaptive: bool = False
+    #: correlated noise (FlashSAC's): each agent holds one draw for k env steps, k ~ Zeta(``repeat_zeta_s``) truncated at
+    #: ``repeat_max`` (P(k) ~ k^-s), then draws afresh
+    repeat: bool = False
+    repeat_zeta_s: float = 2.0
+    repeat_max: int = 16
+    #: TD3's target-policy smoothing in the critic updates of this phase (the warm-up's: the critic warm-up burst):
+    #: the target's next action plus ``N(0, target_scale)`` clipped to +-``target_clip`` (then times the factor with
+    #: ``target_adaptive``, computed from the next observation)
+    target_smoothing: bool = False
+    #: null: this phase's ``scale`` at that step
+    target_scale: Optional[float] = None
+    target_clip: float = 0.3
+    target_adaptive: bool = False
+
+    CENTERS = ("actor", "mid")
+    DISTRIBUTIONS = ("gaussian", "uniform")
+
+    def validate(self, where: str) -> None:
+        if self.center not in self.CENTERS:
+            raise ValueError(f"{where}.center must be one of {self.CENTERS}, got {self.center!r}")
+        if self.distribution not in self.DISTRIBUTIONS:
+            raise ValueError(f"{where}.distribution must be one of {self.DISTRIBUTIONS}, got {self.distribution!r}")
+        if self.scale is None:
+            if self.distribution != "uniform":
+                raise ValueError(f"{where}.scale: null (the range's half width) is for distribution: uniform only")
+            if self.scale_end is not None:
+                raise ValueError(f"{where}.scale: null (the range's half width) has no schedule: leave scale_end null")
+        elif self.scale < 0 or (self.scale_end is not None and self.scale_end < 0):
+            raise ValueError(f"{where}.scale (and scale_end) must be >= 0")
+        if self.scale_steps < 0:
+            raise ValueError(f"{where}.scale_steps must be >= 0, got {self.scale_steps}")
+        if self.clip is not None and self.clip <= 0:
+            raise ValueError(f"{where}.clip must be > 0 or null, got {self.clip}")
+        if self.repeat and (self.repeat_max < 1 or self.repeat_zeta_s <= 0):
+            raise ValueError(f"{where}.repeat needs repeat_max >= 1 and repeat_zeta_s > 0")
+        if self.target_clip <= 0 or (self.target_scale is not None and self.target_scale < 0):
+            raise ValueError(f"{where}.target_clip must be > 0 and target_scale >= 0 or null")
+        if self.target_scale is None and self.scale is None:
+            raise ValueError(f"{where}.target_scale: null takes this phase's scale, which is null here: set it")
+
+    @property
+    def adaptive_anywhere(self) -> bool:
+        return bool(self.adaptive or (self.target_smoothing and self.target_adaptive))
+
+
+@dataclass
 class DDPGCfg(SACCfg):
     """Deep Deterministic Policy Gradient (``learners/ddpg.py``): a deterministic actor ``a = mid + half * tanh(mu(s))``
     over ``action_range`` ``[lo, hi]``, Gaussian exploration noise of a fixed (scheduled) std around it, a target actor and target critics
@@ -727,27 +793,18 @@ class DDPGCfg(SACCfg):
     #: ResFiT: ``[-0.1, 0.1]``, the residual's reach in normalized action units; a multiplier whose neutral value is 1:
     #: a range centred on 1
     action_range: List[float] = field(default_factory=lambda: [-1.0, 1.0])
-    #: the exploration noise's std, added to the actor's action when acting (not clipped unless
-    #: ``exploration_noise_clip``): linear from ``exploration_std`` to ``exploration_std_end`` over
-    #: ``exploration_std_steps`` env steps (0 or ``exploration_std_end`` None: constant). ResFiT: 0.05
-    exploration_std: float = 0.1
-    exploration_std_end: Optional[float] = None
-    exploration_std_steps: int = 0
-    exploration_noise_clip: Optional[float] = None
-    #: ``constant``: the noise std is ``exploration_std`` (scheduled) on every env and dim. ``adaptive``: each env's and
-    #: dim's std is that times a per-step scale the project's env publishes (``register_exploration_scale``; a residual:
-    #: the base's motion in r units), so the noise follows how much the base is moving. The target smoothing noise stays
-    #: ``exploration_std``
-    exploration_std_mode: str = "constant"
+    #: the action noise while this learner has not started learning (``learning_starts`` / ``learning_starts_rows`` not
+    #: reached, or the first ``random_timesteps`` env steps), and in its critic warm-up burst's target smoothing.
+    #: ResFiT: uniform about the midpoint, ``center: mid``, ``distribution: uniform``, ``scale: 0.2``
+    warmup_noise: NoiseCfg = field(default_factory=NoiseCfg)
+    #: the action noise from then on, and in every later critic update's target smoothing. ResFiT: gaussian 0.05,
+    #: target smoothing clipped at 0.3. Eval acts without noise
+    train_noise: NoiseCfg = field(default_factory=NoiseCfg)
     #: every action (acting with its noise, the target's next action, the actor's own in its loss, straight-through)
     #: clamped to ``action_range``; false: unclamped (ResFiT clamps the executed action, not r)
     clip_actions: bool = True
     #: the critic target's next action from the target actor (DDPG, TD3); false: from the actor itself
     target_actor: bool = True
-    #: TD3's target-policy smoothing: the target's next action gets N(0, the exploration std) noise clipped to
-    #: +-target_noise_clip
-    target_policy_noise: bool = False
-    target_noise_clip: float = 0.3
     #: "mse": the mean over critics of each one's squared TD error (DDPG, TD3); "mean_abs_squared": ResFiT's
     #: ``(mean_k |Q_k - y|)^2`` -- the critics' mean absolute TD error, squared
     critic_loss: str = "mse"
@@ -757,15 +814,6 @@ class DDPGCfg(SACCfg):
     q_target_max: Optional[float] = None
     #: ResFiT's ``action_l2_reg_weight``: ``weight * mean_rows(sum_d a_d^2)`` on the actor's action, added to its loss
     action_l2_reg_weight: float = 0.0
-    #: uniform warm-up actions, ``mid +- U(random_action_scale)`` (the range's midpoint; for a residual, the base plus
-    #: that noise; ResFiT: 0.2) -- while this learner has not started learning (``learning_starts`` / ``learning_starts_rows``
-    #: not reached) or for the first ``random_timesteps`` env steps. 0: the actor (with its noise) from the start
-    random_action_scale: float = 0.0
-    #: what a warm-up action is. "uniform": ResFiT's, ``mid + U(-random_action_scale, random_action_scale)`` per dim.
-    #: "actor_gaussian": the actor's own deterministic action plus ``N(0, random_action_scale)`` per dim, clamped to
-    #: ``action_range`` (``clip_actions``) -- about the actor's starting point when 0 is not the residual's neutral action
-    #: (``model.actor.output_bias``)
-    random_action_mode: str = "uniform"
     #: ResFiT's critic warm-up: once this learner may first update, this many critic-only gradient steps run at once,
     #: before the next env step; the actor learns from the update after. 0: none
     critic_warmup_updates: int = 0
@@ -781,7 +829,6 @@ class DDPGCfg(SACCfg):
     ACTOR_Q_REDUCTIONS = ("min", "mean", "min_random_pair", "q1")
     MIN_CRITICS = 1
     CRITIC_LOSSES = ("mse", "mean_abs_squared")
-    EXPLORATION_STD_MODES = ("constant", "adaptive")
 
     def validate(self, cfg: Any) -> None:
         super().validate(cfg)
@@ -797,38 +844,29 @@ class DDPGCfg(SACCfg):
             "action_l2_weight": self.action_l2_weight > 0, "success_clone_weight": self.success_clone_weight > 0,
             "failure_anchor_weight": self.failure_anchor_weight > 0, "demo_actor_clone": self.demo_actor_clone,
             "reference_dropout": self.reference_dropout > 0,
+            "noise_repeat (DDPG: warmup_noise.repeat / train_noise.repeat)": self.noise_repeat,
         }
         used = sorted(k for k, on in sac_only.items() if on)
         if used:
             raise ValueError(f"{name}: {used} are SAC options DDPG does not implement; leave them at their defaults")
         if len(self.action_range) != 2 or not float(self.action_range[0]) < float(self.action_range[1]):
             raise ValueError(f"{name}.action_range is [lo, hi] with lo < hi, got {list(self.action_range)}")
-        if self.exploration_std_mode not in self.EXPLORATION_STD_MODES:
-            raise ValueError(f"{name}.exploration_std_mode must be one of {self.EXPLORATION_STD_MODES}, got {self.exploration_std_mode!r}")
+        self.warmup_noise.validate(f"{name}.warmup_noise")
+        self.train_noise.validate(f"{name}.train_noise")
         if self.shared_warmup:
             if int(self.learning_starts_rows) <= 0:
                 raise ValueError(f"{name}.shared_warmup pools the rows until learning_starts_rows: set it > 0")
             if self.hold_still_key:
                 raise ValueError(f"{name}.shared_warmup writes every env's row to every agent; held rows (hold_still_key) "
                                  "are written per agent: use one or the other")
-        if self.exploration_std < 0 or (self.exploration_std_end is not None and self.exploration_std_end < 0):
-            raise ValueError(f"{name}.exploration_std (and _end) must be >= 0")
-        if self.exploration_std_steps < 0:
-            raise ValueError(f"{name}.exploration_std_steps must be >= 0, got {self.exploration_std_steps}")
-        if self.exploration_noise_clip is not None and self.exploration_noise_clip <= 0:
-            raise ValueError(f"{name}.exploration_noise_clip must be > 0 or null, got {self.exploration_noise_clip}")
-        if self.target_noise_clip <= 0:
-            raise ValueError(f"{name}.target_noise_clip must be > 0, got {self.target_noise_clip}")
         if self.critic_loss not in self.CRITIC_LOSSES:
             raise ValueError(f"{name}.critic_loss must be one of {self.CRITIC_LOSSES}, got {self.critic_loss!r}")
         if (self.q_target_min is None) != (self.q_target_max is None):
             raise ValueError(f"{name}.q_target_min and q_target_max go together: set both or neither")
         if self.q_target_min is not None and not self.q_target_min < self.q_target_max:
             raise ValueError(f"{name}.q_target_min ({self.q_target_min}) must be below q_target_max ({self.q_target_max})")
-        if self.action_l2_reg_weight < 0 or self.random_action_scale < 0 or self.critic_warmup_updates < 0:
-            raise ValueError(f"{name}: action_l2_reg_weight, random_action_scale and critic_warmup_updates must be >= 0")
-        if self.random_action_mode not in ("uniform", "actor_gaussian"):
-            raise ValueError(f"{name}.random_action_mode must be 'uniform' or 'actor_gaussian', got {self.random_action_mode!r}")
+        if self.action_l2_reg_weight < 0 or self.critic_warmup_updates < 0:
+            raise ValueError(f"{name}: action_l2_reg_weight and critic_warmup_updates must be >= 0")
         if self.actor_q_reduction == "min_random_pair" and self.num_critics < 2:
             raise ValueError(f"{name}.actor_q_reduction min_random_pair needs num_critics >= 2")
 

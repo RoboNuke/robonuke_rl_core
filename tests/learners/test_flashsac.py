@@ -373,7 +373,7 @@ def test_joined_halves_keep_each_agents_rows_together():
 # ---------------------------------------------------------------------- noise repetition
 def test_the_zeta_lengths_are_flashsacs():
     learner = build_learner("sac", num_agents=1, noise_repeat=True)
-    torch.testing.assert_close(learner._zeta_cdf, flashsac_zeta_cdf(2.0, 16))
+    torch.testing.assert_close(learner._hold.cdf, flashsac_zeta_cdf(2.0, 16))
 
 
 def test_held_noise_is_piecewise_constant_per_agent_and_drives_the_action():
@@ -383,10 +383,10 @@ def test_held_noise_is_piecewise_constant_per_agent_and_drives_the_action():
     draws, lengths = [], []
     for step in range(300):
         actions, outputs = learner.act(observations, None, timestep=step, timesteps=1000)
-        draws.append(learner._held_noise.clone())
-        lengths.append(learner._noise_length.clone())
+        draws.append(learner._hold.held.clone())
+        lengths.append(learner._hold.length.clone())
         mean, log_std = learner.policy.net.forward_flat(observations)
-        torch.testing.assert_close(actions, torch.tanh(mean + log_std.exp() * learner._held_noise))
+        torch.testing.assert_close(actions, torch.tanh(mean + log_std.exp() * learner._hold.held))
     draws = torch.stack(draws)
     lengths = torch.stack(lengths)
     assert int(lengths.min()) >= 1 and int(lengths.max()) <= 16
@@ -405,13 +405,13 @@ def test_without_training_or_the_option_no_noise_is_held():
     learner = build_learner("sac", num_agents=1, noise_repeat=True)
     learner.enable_training_mode(False)
     learner.act(torch.randn(2, OBS_DIM), None, timestep=0, timesteps=10)
-    assert learner._held_noise is None
+    assert learner._hold.held is None
     plain = build_learner("sac", num_agents=1)
     plain.act(torch.randn(2, OBS_DIM), None, timestep=0, timesteps=10)
-    assert plain._held_noise is None
+    assert plain._hold is None
 
 
 def test_the_random_warm_up_is_not_held():
     learner = build_learner("sac", num_agents=1, noise_repeat=True, random_timesteps=5)
     learner.act(torch.randn(2, OBS_DIM), None, timestep=0, timesteps=10)
-    assert learner._held_noise is None
+    assert learner._hold.held is None

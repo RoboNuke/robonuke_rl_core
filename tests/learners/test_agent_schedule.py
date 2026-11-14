@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from helpers import ACT_DIM, OBS_DIM, build_learner
+from robonuke_rl_core.learners.cfg import NoiseCfg
 
 NAMES = ["corner", "grasp", "insert", "screw"]
 INSERT = NAMES.index("insert")
@@ -17,7 +18,8 @@ INSERT = NAMES.index("insert")
 def routed_ddpg(**extra):
     kwargs = dict(num_agents=3, envs_per_agent=1, architecture="mlp", rollout=64, std_by_label="eval_state/phase/id",
                   std_label_names=NAMES, route_label="insert", route_clock=True, learning_starts=0, learning_starts_rows=3,
-                  batch_size=2, gradient_steps=1, policy_delay=1, random_action_scale=0.2, exploration_std=0.0,
+                  batch_size=2, gradient_steps=1, policy_delay=1,
+                  warmup_noise=NoiseCfg(center="mid", distribution="uniform", scale=0.2), train_noise=NoiseCfg(scale=0.0),
                   critic_warmup_updates=2)
     kwargs.update(extra)
     return build_learner("ddpg", **kwargs)
