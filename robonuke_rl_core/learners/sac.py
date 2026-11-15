@@ -128,7 +128,8 @@ def critic_action_transform(cfg: Any, env: Any) -> Any:
 #: callable ``observations -> (rows, A)``, the per-row, per-dim factor on DDPG's adaptive noise (``NoiseCfg.adaptive``,
 #: ``target_adaptive``; a residual: the base's motion in r units), from the raw observations (the env's when acting, a
 #: replay batch's next observations in target smoothing): device ops only, no host read, as it runs inside a captured
-#: critic update. At most one builder may answer
+#: critic update. At most one builder may answer. A scale with a ``for_route(route)`` method is bound per learner:
+#: train.py gives each learner ``scale.for_route(<its route_label>)`` (None unrouted), e.g. a per-phase residual scale
 EXPLORATION_SCALE_BUILDERS: List[Any] = []
 
 

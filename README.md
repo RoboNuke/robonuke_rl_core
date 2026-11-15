@@ -346,7 +346,7 @@ action or the range's midpoint, then clamped with `clip_actions`.
 | `scale_end` | float or null | `null` | the scale at the end of a linear schedule over env steps. Null: constant |
 | `scale_steps` | int | `0` | env steps the schedule runs over; 0: constant |
 | `clip` | float or null | `null` | the scaled draw clipped to ±this, before `adaptive`'s factor (a clip is then that many times the motion). Null: unclipped |
-| `adaptive` | bool | `false` | times a per-row, per-dim factor computed from the raw observation by a project's builder (`register_exploration_scale(fn)`, `fn(cfg, env) -> (observations -> (rows, A)) or None`, registered in the training script's `setup()`; a residual: the base's motion in r units). No builder answering is refused |
+| `adaptive` | bool | `false` | times a per-row, per-dim factor computed from the raw observation by a project's builder (`register_exploration_scale(fn)`, `fn(cfg, env) -> (observations -> (rows, A)) or None`, registered in the training script's `setup()`; a residual: the base's motion in r units; a scale with a `for_route(route)` method is bound to each learner's own `route_label`). No builder answering is refused |
 | `repeat` | bool | `false` | correlated noise (FlashSAC's): each agent holds one draw for k env steps, k ~ Zeta(`repeat_zeta_s`) truncated at `repeat_max` |
 | `repeat_zeta_s` | float | `2.0` | the Zeta exponent, `P(k) ~ k^-s` |
 | `repeat_max` | int | `16` | the longest hold, in env steps |

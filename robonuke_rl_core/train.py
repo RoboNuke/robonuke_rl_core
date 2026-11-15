@@ -165,7 +165,9 @@ def main(argv=None, setup=None) -> int:
             learner.demo_loader = loader
             learner.neutral_action = neutral
             if learner_name == "ddpg":
-                learner.exploration_scale = noise_scale
+                # a scale that depends on the learner's phase (for_route) is bound to this learner's route (None unrouted)
+                bind = getattr(noise_scale, "for_route", None)
+                learner.exploration_scale = bind(learner_cfg.route_label or None) if bind is not None else noise_scale
             if loader is not None:
                 print("[train] demo transitions built at load by a registered demo loader (register_demo_loader)", flush=True)
             if learner.critic_action_transform is not None:
