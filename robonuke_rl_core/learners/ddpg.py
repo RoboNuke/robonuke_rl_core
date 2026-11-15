@@ -27,13 +27,13 @@ smoothing the warm-up's), both counted per learner, so a routed phase's clocks a
 from __future__ import annotations
 
 import math
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from ..losses.losses import LossContext
 from ..optim import BlockAdamW, clip_grad_norm_per_agent
-from .base import CHECKPOINT_CRITIC_WARMUP, MEMORY_CRITIC_WARMUP
+from .base import CHECKPOINT_CRITIC_WARMUP, MEMORY_CRITIC_WARMUP, rollout_checkpoint_name
 from .noise import ActionNoise
 from .sac import SAC, masked_lerp_
 
@@ -68,6 +68,10 @@ class DDPG(SAC):
         #: critic_warmup_updates, per agent: its burst has run (or none is asked for); _in_critic_warmup while one runs
         self._agent_warmed = [int(self.cfg.critic_warmup_updates) == 0] * self.num_agents
         self._in_critic_warmup = False
+        #: init_rollout_checkpoint_saves, per agent: its env episodes finished when its warm-up ended (None before),
+        #: the count its last rollout checkpoint saw, and how many it has written
+        self._rollout_seen: List[Optional[int]] = [None] * self.num_agents
+        self._rollout_saves = [0] * self.num_agents
         #: the critics' spread (std across the ensemble of Q(s, a) on the last batch), per agent
         self._q_spread = torch.zeros(self.num_agents, device=self.device)
 
@@ -275,10 +279,36 @@ class DDPG(SAC):
             self._in_critic_warmup = False
             self._agent_warmed = [w or n for w, n in zip(self._agent_warmed, newly)]
             self._save_critic_warmup_checkpoints(newly, timestep)
+            # the rollouts counted for init_rollout_checkpoint_saves are the ones that end after the burst
+            self._rollout_seen = [self._agent_finished_episodes[a] if n else s for a, (s, n) in enumerate(zip(self._rollout_seen, newly))]
             return
         # agents that have not started or not warmed up take no step (their rows-ready / clock gate in SAC's schedule)
         self.noise.load_smoothing("train", timestep)
         super()._update_if_ready(timestep=timestep, timesteps=timesteps)
+        if self.cfg.init_rollout_checkpoint_saves > 0:
+            self._save_rollout_checkpoints(started, timestep)
+
+    def _save_rollout_checkpoints(self, started, timestep: int) -> None:
+        """``init_rollout_checkpoint_saves``: ``ckpt_rollout_<k>_<step>.ckpt`` for each agent one of whose envs
+        ended an episode this step, after this step's update, for its first ``init_rollout_checkpoint_saves`` such
+        steps after its warm-up (no warm-up: after it starts learning). Host lists only (the step's host read)."""
+        if self.trainer_cfg.checkpoint_interval <= 0 or self.run_dirs is None:
+            return
+        for agent in range(self.num_agents):
+            if not (started[agent] and self._agent_warmed[agent]):
+                continue
+            finished = self._agent_finished_episodes[agent]
+            if self._rollout_seen[agent] is None:  # no warm-up burst: counting starts when the agent starts learning
+                self._rollout_seen[agent] = finished
+            if finished <= self._rollout_seen[agent] or self._rollout_saves[agent] >= self.cfg.init_rollout_checkpoint_saves:
+                continue
+            self._rollout_seen[agent] = finished
+            self._rollout_saves[agent] += 1
+            directory = self.checkpoint_dir(agent)
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / rollout_checkpoint_name(self._rollout_saves[agent], timestep)
+            torch.save(self._build_checkpoint(agent, timestep), path)
+            self._announce_checkpoint(agent, timestep, path)
 
     def _save_critic_warmup_checkpoints(self, agents, timestep: int) -> None:
         """``ckpt_critic_warmup.ckpt`` for each agent in ``agents`` (the ones whose burst just ran): the critics right

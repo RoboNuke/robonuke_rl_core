@@ -389,6 +389,69 @@ def test_saving_the_warm_up_memory_needs_a_warm_up():
     DDPGCfg(save_memory_with_critic_warmup=True, critic_warmup_updates=10).validate(None)
 
 
+def _env_step(learner, timestep, ended=()):
+    """One training env step through the learner's own record path (the envs in ``ended`` finish an episode), then
+    its update."""
+    n = learner.num_envs
+    terminated = torch.zeros(n, 1, dtype=torch.bool)
+    terminated[list(ended)] = True
+    obs = torch.randn(n, OBS_DIM)
+    actions, _ = learner.act(obs, None, timestep=timestep, timesteps=10**6)
+    learner.record_transition(observations=obs, states=None, actions=actions, rewards=torch.zeros(n, 1),
+                              next_observations=torch.randn(n, OBS_DIM), next_states=None, terminated=terminated,
+                              truncated=torch.zeros(n, 1, dtype=torch.bool), infos={}, timestep=timestep,
+                              timesteps=10**6)
+    learner._update_if_ready(timestep=timestep, timesteps=10**6)
+
+
+def test_the_first_rollouts_after_the_critic_warm_up_each_end_with_a_checkpoint(tmp_path):
+    learner = ddpg(critic_warmup_updates=4, init_rollout_checkpoint_saves=2, run_dirs_list=[tmp_path / "a0", tmp_path / "a1"],
+                   trainer_overrides={"checkpoint_interval": 1000})
+    fill_memory(learner)  # every env ends one episode before the warm-up: not counted
+    _env_step(learner, 100)  # the burst
+    assert learner._rollout_seen == [3, 3]
+    a0, a1 = tmp_path / "a0" / "checkpoints", tmp_path / "a1" / "checkpoints"
+    names = lambda d: sorted(p.name for p in d.glob("ckpt_rollout_*.ckpt"))  # noqa: E731
+    assert names(a0) == names(a1) == []
+    _env_step(learner, 101)  # no episode ends
+    assert names(a0) == names(a1) == []
+    _env_step(learner, 102, ended=[0, 1])  # two of agent 0's envs (0-2) end on one step: one rollout checkpoint
+    assert names(a0) == ["ckpt_rollout_1_102.ckpt"] and names(a1) == []
+    saved = torch.load(a0 / "ckpt_rollout_1_102.ckpt", weights_only=False)
+    assert saved["step"] == 102 and saved["agent_idx"] == 0
+    loaded = ddpg()
+    loaded.load_agent(a0 / "ckpt_rollout_1_102.ckpt", slot=1)
+    for (_, a), (_, b) in zip(learner.policy.named_parameters(), loaded.policy.named_parameters()):
+        torch.testing.assert_close(b[1], a[0])  # the actor after this step's update
+    _env_step(learner, 103, ended=[4])  # agent 1's env
+    _env_step(learner, 104, ended=[2])
+    _env_step(learner, 105, ended=[0, 5])  # agent 0 has written its 2; agent 1 its second
+    assert names(a0) == ["ckpt_rollout_1_102.ckpt", "ckpt_rollout_2_104.ckpt"]
+    assert names(a1) == ["ckpt_rollout_1_103.ckpt", "ckpt_rollout_2_105.ckpt"]
+    assert not list(a0.glob("ckpt_[0-9]*.ckpt"))  # the numbered checkpoints are untouched
+
+
+def test_without_a_warm_up_the_rollouts_count_from_the_learning_start(tmp_path):
+    learner = ddpg(init_rollout_checkpoint_saves=1, run_dirs_list=[tmp_path / "a0", tmp_path / "a1"],
+                   trainer_overrides={"checkpoint_interval": 1000})
+    fill_memory(learner)
+    _env_step(learner, 100)
+    assert not list(tmp_path.rglob("ckpt_rollout_*"))
+    _env_step(learner, 101, ended=[3])
+    assert [p.name for p in tmp_path.rglob("ckpt_rollout_*")] == ["ckpt_rollout_1_101.ckpt"]
+
+
+def test_rollout_checkpoints_are_off_by_default_and_refuse_a_negative_count(tmp_path):
+    learner = ddpg(critic_warmup_updates=4, run_dirs_list=[tmp_path / "a0", tmp_path / "a1"],
+                   trainer_overrides={"checkpoint_interval": 1000})
+    fill_memory(learner)
+    _env_step(learner, 100)
+    _env_step(learner, 101, ended=[0, 3])
+    assert not list(tmp_path.rglob("ckpt_rollout_*"))
+    with pytest.raises(ValueError, match="init_rollout_checkpoint_saves must be >= 0"):
+        DDPGCfg(init_rollout_checkpoint_saves=-1).validate(None)
+
+
 def test_routed_phases_keep_their_own_warm_up_and_learning_starts():
     from robonuke_rl_core.learners.routed import RoutedSAC
 

@@ -681,12 +681,13 @@ class SAC(LearnerBase):
             self._agent_route_count_now = [0] * n
             self._pooled_now = False
             self._agent_rows_ready = [False] * n
-            #: the step's host read (_read_host): each agent's memory fill and the env episodes finished so far, as
-            #: the update decision last saw them; None before the first training step
+            #: the step's host read (_read_host): each agent's memory fill and the env episodes finished so far (in
+            #: all, and per agent: its own envs'), as the update decision last saw them; None before the first step
             self._fills_now: Optional[List[int]] = None
             self._written_now: Optional[List[int]] = None
             self._finished_episodes = 0
-            self._finished_count_t = torch.zeros((), dtype=torch.long, device=self.device)
+            self._agent_finished_episodes = [0] * n
+            self._finished_count_t = torch.zeros(n, dtype=torch.long, device=self.device)
             self._label_index_cache: Dict[tuple, torch.Tensor] = {}
             #: a parent (RoutedSAC) that reads every learner's host values in one go sets this; the learner then
             #: leaves its pending device values for the parent (_pending_host_read) instead of reading itself
@@ -1025,9 +1026,9 @@ class SAC(LearnerBase):
             step=timestep,
         )
         if self.training:
-            # the env's own episode ends (base_only_episodes counts them): a device counter, read with the step's
-            # single host read (_read_host)
-            self._finished_count_t.add_((terminated | truncated).sum())
+            # the env's own episode ends, per agent (its envs' block; base_only_episodes counts them all): a device
+            # counter, read with the step's single host read (_read_host)
+            self._finished_count_t.add_((terminated | truncated).reshape(self.num_agents, -1).sum(dim=1))
         shaping = self._potential_shaping(infos, terminated | truncated) if self._potential_terms else None
         #: the label of the observation this transition starts from (store_labels)
         start_labels = getattr(self, "_std_labels", None)
@@ -1134,18 +1135,20 @@ class SAC(LearnerBase):
     def _host_read_values(self, route_count_t: Optional[torch.Tensor]) -> torch.Tensor:
         """What the update decision needs from the device this step, as one float tensor: per agent its phase steps
         this step (``route_clock``: its envs that started the step in the route's label, every env's when pooled), per
-        agent its memory fill (``learning_starts_rows``), and the env episodes finished so far (``base_only_episodes``)."""
+        agent its memory fill (``learning_starts_rows``), and per agent the env episodes its envs finished so far
+        (``base_only_episodes``: their sum)."""
         n = self.num_agents
         route = route_count_t.to(torch.float32) if route_count_t is not None else torch.zeros(n, device=self.device)
         return torch.cat((route, self.memory.fills_on_device().to(torch.float32), self.memory.written_on_device().to(torch.float32),
-                          self._finished_count_t.to(torch.float32).view(1)))
+                          self._finished_count_t.to(torch.float32)))
 
     def _apply_host_read(self, values: List[float]) -> None:
         """The host side of :meth:`_host_read_values`."""
         n = self.num_agents
         self._fills_now = [int(v) for v in values[n : 2 * n]]
         self._written_now = [int(v) for v in values[2 * n : 3 * n]]
-        self._finished_episodes = int(values[3 * n])
+        self._agent_finished_episodes = [int(v) for v in values[3 * n : 4 * n]]
+        self._finished_episodes = sum(self._agent_finished_episodes)
         if self.cfg.route_label:
             counts = [int(round(v)) for v in values[:n]]
             self._agent_route_count_now = counts

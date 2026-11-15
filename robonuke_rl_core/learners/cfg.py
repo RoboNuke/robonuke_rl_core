@@ -822,6 +822,11 @@ class DDPGCfg(SACCfg):
     #: trained on -- to ``memory_critic_warmup.pt`` beside it (``save_memory``'s format; with demo_storage: sample the
     #: demos are their own file and are not in it). Needs critic_warmup_updates > 0
     save_memory_with_critic_warmup: bool = False
+    #: after each agent's critic warm-up (with critic_warmup_updates 0: once it starts learning), a checkpoint at the
+    #: end of each of its first this-many rollouts -- every env step on which one of its envs ends an episode, after
+    #: that step's update -- as ``ckpt_rollout_<k>_<step>.ckpt`` (k = 1, 2, ...) beside the numbered ones, to see how
+    #: the first updates move the actor and the critics. Written only when checkpoints are. 0: none
+    init_rollout_checkpoint_saves: int = 0
     #: with experiment.num_agents > 1: until the agents start learning (``learning_starts_rows``), every env's stored
     #: row goes to every agent's memory -- the warm-up acts on the actors' untrained starting point -- so all agents
     #: reach ``learning_starts_rows`` at once (N envs' rows per step instead of each agent's own), and their critic
@@ -872,6 +877,8 @@ class DDPGCfg(SACCfg):
             raise ValueError(f"{name}.q_target_min ({self.q_target_min}) must be below q_target_max ({self.q_target_max})")
         if self.action_l2_reg_weight < 0 or self.critic_warmup_updates < 0:
             raise ValueError(f"{name}: action_l2_reg_weight and critic_warmup_updates must be >= 0")
+        if self.init_rollout_checkpoint_saves < 0:
+            raise ValueError(f"{name}.init_rollout_checkpoint_saves must be >= 0 (0 is off), got {self.init_rollout_checkpoint_saves}")
         if self.save_memory_with_critic_warmup and self.critic_warmup_updates == 0:
             raise ValueError(f"{name}.save_memory_with_critic_warmup needs critic_warmup_updates > 0 (no warm-up, no "
                              "memory to save)")

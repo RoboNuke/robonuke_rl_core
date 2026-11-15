@@ -40,6 +40,7 @@ __all__ = [
     "CHECKPOINT_CRITIC_WARMUP",
     "MEMORY_CRITIC_WARMUP",
     "checkpoint_name",
+    "rollout_checkpoint_name",
     "SUCCESS_METRIC",
     "BEST_SUCCESS_METRIC",
 ]
@@ -63,6 +64,12 @@ BEST_SUCCESS_METRIC = "episode/best_success_rate"
 def checkpoint_name(step: int) -> str:
     """The file name for a periodic checkpoint at ``step``."""
     return f"ckpt_{int(step)}.{CHECKPOINT_EXTENSION}"
+
+
+def rollout_checkpoint_name(k: int, step: int) -> str:
+    """The file name for the ``k``-th rollout checkpoint after the critic warm-up (DDPG
+    ``init_rollout_checkpoint_saves``), written at ``step``."""
+    return f"ckpt_rollout_{int(k)}_{int(step)}.{CHECKPOINT_EXTENSION}"
 
 
 @dataclass
