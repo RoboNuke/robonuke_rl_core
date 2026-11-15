@@ -602,7 +602,8 @@ Both lists live on the learner and are **empty by default** (nothing is logged, 
 Per agent, at `{trainer.output_dir}/{wandb.project}/{wandb.group}/{run_name}/checkpoints/`:
 `ckpt_{step}.ckpt` every `trainer.checkpoint_interval` steps, plus `ckpt_best.ckpt` whenever an
 agent's mean episode return over a write interval improves, plus (DDPG with `critic_warmup_updates`)
-`ckpt_critic_warmup.ckpt` right after that agent's critic warm-up burst, whatever its step. A file holds that agent's model
+`ckpt_critic_warmup.ckpt` right after that agent's critic warm-up burst, whatever its step (`save_memory_with_critic_warmup`:
+with `memory_critic_warmup.pt`, the memory the burst trained on, beside it). A file holds that agent's model
 weights, optimizer state, normalizer stats, learner extras, the step and the mean return.
 `load_agent(path, slot)` loads one file into any slot; optimizer state only with
 `with_optimizer=True`, which needs `num_agents == 1`.

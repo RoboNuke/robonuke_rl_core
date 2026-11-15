@@ -33,7 +33,7 @@ import torch
 
 from ..losses.losses import LossContext
 from ..optim import BlockAdamW, clip_grad_norm_per_agent
-from .base import CHECKPOINT_CRITIC_WARMUP
+from .base import CHECKPOINT_CRITIC_WARMUP, MEMORY_CRITIC_WARMUP
 from .noise import ActionNoise
 from .sac import SAC, masked_lerp_
 
@@ -283,7 +283,8 @@ class DDPG(SAC):
     def _save_critic_warmup_checkpoints(self, agents, timestep: int) -> None:
         """``ckpt_critic_warmup.ckpt`` for each agent in ``agents`` (the ones whose burst just ran): the critics right
         after the warm-up, before any update on normal data, whatever env step that is (its ``step``). Written where the
-        numbered checkpoints go (with routes, each phase's own folder), and only when they are written at all."""
+        numbered checkpoints go (with routes, each phase's own folder), and only when they are written at all;
+        ``save_memory_with_critic_warmup``: with the agent's replay memory as it was trained on beside it."""
         if self.trainer_cfg.checkpoint_interval <= 0 or self.run_dirs is None:
             return
         for agent, now in enumerate(agents):
@@ -293,6 +294,8 @@ class DDPG(SAC):
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / CHECKPOINT_CRITIC_WARMUP
             torch.save(self._build_checkpoint(agent, timestep), path)
+            if self.cfg.save_memory_with_critic_warmup:
+                self.save_memory(agent, timestep, name=MEMORY_CRITIC_WARMUP)
             self._announce_checkpoint(agent, timestep, path)
 
     # ------------------------------------------------------------------ losses

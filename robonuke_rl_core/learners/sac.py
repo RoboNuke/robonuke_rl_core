@@ -2214,8 +2214,8 @@ class SAC(LearnerBase):
                 self.save_memory(agent, step)
         return paths
 
-    def save_memory(self, agent: int, step: int) -> Path:
-        """Write agent ``agent``'s replay memory to ``<checkpoint dir>/memory_<step>.pt``: ``{"rows": {name: (rows,
+    def save_memory(self, agent: int, step: int, name: Optional[str] = None) -> Path:
+        """Write agent ``agent``'s replay memory to ``<checkpoint dir>/memory_<step>.pt`` (or ``name``): ``{"rows": {name: (rows,
         dim) tensor}, "meta": {...}}``, the rows in the order they were written (oldest first: the ring buffer unrolled
         from the agent's write pointer once it wrapped). Not announced to the ``on_checkpoint`` hooks, so a logger does
         not upload it."""
@@ -2236,7 +2236,7 @@ class SAC(LearnerBase):
         }
         directory = self.checkpoint_dir(agent)
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"memory_{int(step)}.pt"
+        path = directory / (name if name is not None else f"memory_{int(step)}.pt")
         torch.save({"rows": rows, "meta": meta}, path)
         return path
 

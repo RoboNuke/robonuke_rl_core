@@ -38,6 +38,7 @@ __all__ = [
     "CHECKPOINT_EXTENSION",
     "CHECKPOINT_BEST",
     "CHECKPOINT_CRITIC_WARMUP",
+    "MEMORY_CRITIC_WARMUP",
     "checkpoint_name",
     "SUCCESS_METRIC",
     "BEST_SUCCESS_METRIC",
@@ -49,6 +50,8 @@ CHECKPOINT_BEST = f"ckpt_best.{CHECKPOINT_EXTENSION}"
 #: DDPG: each agent's state right after its critic warm-up burst (``critic_warmup_updates``), before any update on its
 #: own online data; one per agent (per phase with routes), its env step in the file's ``step``
 CHECKPOINT_CRITIC_WARMUP = f"ckpt_critic_warmup.{CHECKPOINT_EXTENSION}"
+#: the replay memory the critic warm-up trained on (DDPG ``save_memory_with_critic_warmup``), beside the checkpoint above
+MEMORY_CRITIC_WARMUP = "memory_critic_warmup.pt"
 
 #: the env episode channel the best-checkpoint success rate is measured from
 SUCCESS_METRIC = "episode/success"

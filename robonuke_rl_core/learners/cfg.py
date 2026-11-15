@@ -818,6 +818,10 @@ class DDPGCfg(SACCfg):
     #: ResFiT's critic warm-up: once this learner may first update, this many critic-only gradient steps run at once,
     #: before the next env step; the actor learns from the update after. 0: none
     critic_warmup_updates: int = 0
+    #: with ``ckpt_critic_warmup.ckpt``, also write each warmed agent's replay memory -- the rows its critic warm-up
+    #: trained on -- to ``memory_critic_warmup.pt`` beside it (``save_memory``'s format; with demo_storage: sample the
+    #: demos are their own file and are not in it). Needs critic_warmup_updates > 0
+    save_memory_with_critic_warmup: bool = False
     #: with experiment.num_agents > 1: until the agents start learning (``learning_starts_rows``), every env's stored
     #: row goes to every agent's memory -- the warm-up acts on the actors' untrained starting point -- so all agents
     #: reach ``learning_starts_rows`` at once (N envs' rows per step instead of each agent's own), and their critic
@@ -868,6 +872,9 @@ class DDPGCfg(SACCfg):
             raise ValueError(f"{name}.q_target_min ({self.q_target_min}) must be below q_target_max ({self.q_target_max})")
         if self.action_l2_reg_weight < 0 or self.critic_warmup_updates < 0:
             raise ValueError(f"{name}: action_l2_reg_weight and critic_warmup_updates must be >= 0")
+        if self.save_memory_with_critic_warmup and self.critic_warmup_updates == 0:
+            raise ValueError(f"{name}.save_memory_with_critic_warmup needs critic_warmup_updates > 0 (no warm-up, no "
+                             "memory to save)")
         if self.actor_q_reduction == "min_random_pair" and self.num_critics < 2:
             raise ValueError(f"{name}.actor_q_reduction min_random_pair needs num_critics >= 2")
 

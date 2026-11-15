@@ -356,6 +356,39 @@ def test_the_critics_right_after_their_warm_up_are_saved_once_per_agent_whatever
     assert torch.load(path1, weights_only=False)["step"] == 37
 
 
+def test_the_memory_the_critic_warm_up_trained_on_is_saved_beside_its_checkpoint(tmp_path):
+    learner = ddpg(critic_warmup_updates=4, learning_starts_rows=10**6, save_memory_with_critic_warmup=True,
+                   run_dirs_list=[tmp_path / "a0", tmp_path / "a1"], trainer_overrides={"checkpoint_interval": 1000})
+    fill_memory(learner)
+    learner._agent_rows_ready = [False, True]  # agent 1 warms up first
+    memory = learner.memory
+    size = memory._agent_size[1] if memory._agent_size is not None else int(memory.size)
+    expected = {name: tensor[1, :size].detach().cpu().clone() for name, tensor in memory.tensors.items()}
+    learner._update_if_ready(timestep=37, timesteps=100)
+    path = tmp_path / "a1" / "checkpoints" / "memory_critic_warmup.pt"
+    assert path.is_file() and not (tmp_path / "a0" / "checkpoints" / "memory_critic_warmup.pt").exists()
+    saved = torch.load(path, weights_only=False)
+    assert saved["meta"]["step"] == 37 and saved["meta"]["agent"] == 1 and saved["meta"]["rows"] == size
+    assert set(saved["rows"]) == set(expected)
+    for name, rows in expected.items():
+        torch.testing.assert_close(saved["rows"][name], rows)  # exactly agent 1's rows when its burst ran
+
+
+def test_without_the_option_no_memory_is_saved_with_the_warm_up_checkpoint(tmp_path):
+    learner = ddpg(critic_warmup_updates=4, run_dirs_list=[tmp_path / "a0", tmp_path / "a1"],
+                   trainer_overrides={"checkpoint_interval": 1000})
+    fill_memory(learner)
+    learner._update_if_ready(timestep=5, timesteps=100)
+    assert (tmp_path / "a0" / "checkpoints" / "ckpt_critic_warmup.ckpt").is_file()
+    assert not list(tmp_path.rglob("memory_*.pt"))
+
+
+def test_saving_the_warm_up_memory_needs_a_warm_up():
+    with pytest.raises(ValueError, match="save_memory_with_critic_warmup needs critic_warmup_updates"):
+        DDPGCfg(save_memory_with_critic_warmup=True).validate(None)
+    DDPGCfg(save_memory_with_critic_warmup=True, critic_warmup_updates=10).validate(None)
+
+
 def test_routed_phases_keep_their_own_warm_up_and_learning_starts():
     from robonuke_rl_core.learners.routed import RoutedSAC
 
