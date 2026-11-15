@@ -441,6 +441,31 @@ def test_without_a_warm_up_the_rollouts_count_from_the_learning_start(tmp_path):
     assert [p.name for p in tmp_path.rglob("ckpt_rollout_*")] == ["ckpt_rollout_1_101.ckpt"]
 
 
+def test_the_last_rollout_checkpoint_saves_the_memory_with_the_demos_the_batches_mix_in(tmp_path):
+    rows = 5
+    demo = {"observations": torch.randn(rows, OBS_DIM), "next_observations": torch.randn(rows, OBS_DIM),
+            "actions": torch.full((rows, ACT_DIM), 0.25), "rewards": torch.zeros(rows, 1),
+            "terminated": torch.zeros(rows, 1, dtype=torch.bool), "truncated": torch.zeros(rows, 1, dtype=torch.bool)}
+    torch.save({"transitions": demo}, tmp_path / "demo.pt")
+    learner = ddpg(critic_warmup_updates=4, init_rollout_checkpoint_saves=2, save_memory_with_last_rollout_checkpoint=True,
+                   demo_transitions=str(tmp_path / "demo.pt"), demo_storage="sample", demo_sampling_end=10**6,
+                   run_dirs_list=[tmp_path / "a0", tmp_path / "a1"], trainer_overrides={"checkpoint_interval": 1000})
+    fill_memory(learner)
+    _env_step(learner, 100)  # the burst
+    _env_step(learner, 101, ended=[0])
+    a0 = tmp_path / "a0" / "checkpoints"
+    assert not list(a0.glob("memory_*.pt"))  # not on the first
+    _env_step(learner, 102, ended=[1])
+    assert sorted(p.name for p in a0.glob("memory_*.pt")) == ["memory_rollout_2_102.pt"]
+    saved = torch.load(a0 / "memory_rollout_2_102.pt", weights_only=False)
+    assert saved["meta"]["step"] == 102 and saved["meta"]["demo_rows_separate"] == rows
+    for name, tensor in demo.items():
+        torch.testing.assert_close(saved["demos"][name], tensor.to(saved["demos"][name].dtype))
+    assert not list((tmp_path / "a1").rglob("memory_*.pt"))  # agent 1 has not ended a rollout
+    with pytest.raises(ValueError, match="save_memory_with_last_rollout_checkpoint needs init_rollout_checkpoint_saves"):
+        DDPGCfg(save_memory_with_last_rollout_checkpoint=True).validate(None)
+
+
 def test_rollout_checkpoints_are_off_by_default_and_refuse_a_negative_count(tmp_path):
     learner = ddpg(critic_warmup_updates=4, run_dirs_list=[tmp_path / "a0", tmp_path / "a1"],
                    trainer_overrides={"checkpoint_interval": 1000})
@@ -570,6 +595,7 @@ def test_the_replay_memory_is_saved_beside_each_checkpoint_only_when_asked(tmp_p
         if not saved["meta"]["wrapped"]:
             torch.testing.assert_close(saved["rows"]["observations"], memory.tensors["observations"][agent, :size].cpu())
     assert all(name.startswith("ckpt_") for name in announced) and len(paths) == 2
+    assert saved["demos"] is None and saved["meta"]["demo_rows_separate"] == 0  # no demos loaded
     # a wrapped ring: the saved rows run oldest to newest
     memory.size, memory.pointer = memory.capacity, 3
     if memory._agent_size is not None:

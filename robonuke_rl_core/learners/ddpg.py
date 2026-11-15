@@ -33,7 +33,7 @@ import torch
 
 from ..losses.losses import LossContext
 from ..optim import BlockAdamW, clip_grad_norm_per_agent
-from .base import CHECKPOINT_CRITIC_WARMUP, MEMORY_CRITIC_WARMUP, rollout_checkpoint_name
+from .base import CHECKPOINT_CRITIC_WARMUP, MEMORY_CRITIC_WARMUP, rollout_checkpoint_name, rollout_memory_name
 from .noise import ActionNoise
 from .sac import SAC, masked_lerp_
 
@@ -291,7 +291,8 @@ class DDPG(SAC):
     def _save_rollout_checkpoints(self, started, timestep: int) -> None:
         """``init_rollout_checkpoint_saves``: ``ckpt_rollout_<k>_<step>.ckpt`` for each agent one of whose envs
         ended an episode this step, after this step's update, for its first ``init_rollout_checkpoint_saves`` such
-        steps after its warm-up (no warm-up: after it starts learning). Host lists only (the step's host read)."""
+        steps after its warm-up (no warm-up: after it starts learning); ``save_memory_with_last_rollout_checkpoint``:
+        the last with the agent's replay memory beside it. Host lists only (the step's host read)."""
         if self.trainer_cfg.checkpoint_interval <= 0 or self.run_dirs is None:
             return
         for agent in range(self.num_agents):
@@ -308,6 +309,9 @@ class DDPG(SAC):
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / rollout_checkpoint_name(self._rollout_saves[agent], timestep)
             torch.save(self._build_checkpoint(agent, timestep), path)
+            last = self._rollout_saves[agent] == self.cfg.init_rollout_checkpoint_saves
+            if last and self.cfg.save_memory_with_last_rollout_checkpoint:
+                self.save_memory(agent, timestep, name=rollout_memory_name(self._rollout_saves[agent], timestep))
             self._announce_checkpoint(agent, timestep, path)
 
     def _save_critic_warmup_checkpoints(self, agents, timestep: int) -> None:

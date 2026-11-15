@@ -41,6 +41,7 @@ __all__ = [
     "MEMORY_CRITIC_WARMUP",
     "checkpoint_name",
     "rollout_checkpoint_name",
+    "rollout_memory_name",
     "SUCCESS_METRIC",
     "BEST_SUCCESS_METRIC",
 ]
@@ -70,6 +71,12 @@ def rollout_checkpoint_name(k: int, step: int) -> str:
     """The file name for the ``k``-th rollout checkpoint after the critic warm-up (DDPG
     ``init_rollout_checkpoint_saves``), written at ``step``."""
     return f"ckpt_rollout_{int(k)}_{int(step)}.{CHECKPOINT_EXTENSION}"
+
+
+def rollout_memory_name(k: int, step: int) -> str:
+    """The replay memory file beside :func:`rollout_checkpoint_name` (DDPG
+    ``save_memory_with_last_rollout_checkpoint``)."""
+    return f"memory_rollout_{int(k)}_{int(step)}.pt"
 
 
 @dataclass

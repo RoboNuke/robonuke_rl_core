@@ -2220,8 +2220,10 @@ class SAC(LearnerBase):
     def save_memory(self, agent: int, step: int, name: Optional[str] = None) -> Path:
         """Write agent ``agent``'s replay memory to ``<checkpoint dir>/memory_<step>.pt`` (or ``name``): ``{"rows": {name: (rows,
         dim) tensor}, "meta": {...}}``, the rows in the order they were written (oldest first: the ring buffer unrolled
-        from the agent's write pointer once it wrapped). Not announced to the ``on_checkpoint`` hooks, so a logger does
-        not upload it."""
+        from the agent's write pointer once it wrapped), and ``"demos"``: the demo transitions the learner mixes into its
+        batches (``demo_storage: sample``, as loaded: one set for every agent; None without them -- with ``memory`` /
+        ``memory_critic`` they are the rows' first ``meta.demo_rows_in_memory``). Not announced to the ``on_checkpoint``
+        hooks, so a logger does not upload it."""
         memory = self.memory
         size = memory._agent_size[agent] if memory._agent_size is not None else int(memory.size)
         pointer = memory._agent_pointer[agent] if memory._agent_pointer is not None else int(memory.pointer)
@@ -2237,10 +2239,12 @@ class SAC(LearnerBase):
             "rows_ever_written": written, "n_step": int(self.cfg.n_step), "discount_factor": float(self.cfg.discount_factor),
             "route_label": self.cfg.route_label, "demo_rows_in_memory": (self._demo_rows[agent] if getattr(self, "_demo_rows", None) else 0),
         }
+        demos = None if self._demo is None else {key: tensor.detach().cpu() for key, tensor in self._demo.items()}
+        meta["demo_rows_separate"] = 0 if demos is None else int(next(iter(demos.values())).shape[0])
         directory = self.checkpoint_dir(agent)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / (name if name is not None else f"memory_{int(step)}.pt")
-        torch.save({"rows": rows, "meta": meta}, path)
+        torch.save({"rows": rows, "demos": demos, "meta": meta}, path)
         return path
 
     def _checkpoint_extras(self, agent: int) -> Dict[str, Any]:

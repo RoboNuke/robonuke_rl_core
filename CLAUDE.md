@@ -604,7 +604,8 @@ Per agent, at `{trainer.output_dir}/{wandb.project}/{wandb.group}/{run_name}/che
 agent's mean episode return over a write interval improves, plus (DDPG with `critic_warmup_updates`)
 `ckpt_critic_warmup.ckpt` right after that agent's critic warm-up burst, whatever its step (`save_memory_with_critic_warmup`:
 with `memory_critic_warmup.pt`, the memory the burst trained on, beside it), plus (`init_rollout_checkpoint_saves`)
-`ckpt_rollout_<k>_<step>.ckpt` at the end of each of its first k rollouts after the burst. A file holds that agent's model
+`ckpt_rollout_<k>_<step>.ckpt` at the end of each of its first k rollouts after the burst (the last with
+`memory_rollout_<k>_<step>.pt` under `save_memory_with_last_rollout_checkpoint`). A file holds that agent's model
 weights, optimizer state, normalizer stats, learner extras, the step and the mean return.
 `load_agent(path, slot)` loads one file into any slot; optimizer state only with
 `with_optimizer=True`, which needs `num_agents == 1`.

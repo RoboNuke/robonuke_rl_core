@@ -270,7 +270,7 @@ class SACCfg(_CommonCfg):
     #: debugging: with every numbered checkpoint, also write each agent's replay memory (its rows, oldest first, every
     #: stored field: observations, states, actions, rewards, terminated, next_*, side inputs, ...) to ``memory_<step>.pt``
     #: beside it. Large (a full 300k-row memory is hundreds of MB per checkpoint) and never uploaded. With demo_storage:
-    #: sample the demos are their own file and are not in it; with memory / memory_critic they are its first rows
+    #: sample the loaded demo transitions are in it under "demos"; with memory / memory_critic they are its first rows
     #: (meta.demo_rows_in_memory). False: no memory files
     save_memory_with_checkpoints: bool = False
     #: capture each kind of gradient step (critic only / with the actor, with or without demo
@@ -819,14 +819,18 @@ class DDPGCfg(SACCfg):
     #: before the next env step; the actor learns from the update after. 0: none
     critic_warmup_updates: int = 0
     #: with ``ckpt_critic_warmup.ckpt``, also write each warmed agent's replay memory -- the rows its critic warm-up
-    #: trained on -- to ``memory_critic_warmup.pt`` beside it (``save_memory``'s format; with demo_storage: sample the
-    #: demos are their own file and are not in it). Needs critic_warmup_updates > 0
+    #: trained on -- to ``memory_critic_warmup.pt`` beside it (``save_memory``'s format, the demos included). Needs
+    #: critic_warmup_updates > 0
     save_memory_with_critic_warmup: bool = False
     #: after each agent's critic warm-up (with critic_warmup_updates 0: once it starts learning), a checkpoint at the
     #: end of each of its first this-many rollouts -- every env step on which one of its envs ends an episode, after
     #: that step's update -- as ``ckpt_rollout_<k>_<step>.ckpt`` (k = 1, 2, ...) beside the numbered ones, to see how
     #: the first updates move the actor and the critics. Written only when checkpoints are. 0: none
     init_rollout_checkpoint_saves: int = 0
+    #: with the last of those (k = init_rollout_checkpoint_saves), also write the agent's replay memory to
+    #: ``memory_rollout_<k>_<step>.pt`` beside it (``save_memory``'s format, the demos included). Needs
+    #: init_rollout_checkpoint_saves > 0
+    save_memory_with_last_rollout_checkpoint: bool = False
     #: with experiment.num_agents > 1: until the agents start learning (``learning_starts_rows``), every env's stored
     #: row goes to every agent's memory -- the warm-up acts on the actors' untrained starting point -- so all agents
     #: reach ``learning_starts_rows`` at once (N envs' rows per step instead of each agent's own), and their critic
@@ -879,6 +883,8 @@ class DDPGCfg(SACCfg):
             raise ValueError(f"{name}: action_l2_reg_weight and critic_warmup_updates must be >= 0")
         if self.init_rollout_checkpoint_saves < 0:
             raise ValueError(f"{name}.init_rollout_checkpoint_saves must be >= 0 (0 is off), got {self.init_rollout_checkpoint_saves}")
+        if self.save_memory_with_last_rollout_checkpoint and self.init_rollout_checkpoint_saves == 0:
+            raise ValueError(f"{name}.save_memory_with_last_rollout_checkpoint needs init_rollout_checkpoint_saves > 0")
         if self.save_memory_with_critic_warmup and self.critic_warmup_updates == 0:
             raise ValueError(f"{name}.save_memory_with_critic_warmup needs critic_warmup_updates > 0 (no warm-up, no "
                              "memory to save)")
