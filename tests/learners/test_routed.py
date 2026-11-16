@@ -54,6 +54,25 @@ def test_each_env_acts_with_its_phases_residual_and_the_base_elsewhere():
     torch.manual_seed(1)
 
 
+def test_an_env_in_a_phase_without_a_residual_gets_the_neutral_action():
+    """A multiplied residual's base alone is r = 1 (a zero multiplier would freeze the env): the neutral action, not zero,
+    goes to every env whose phase has no residual -- and to every env before any phase is known."""
+    routed = routed_pair()
+    for learner in routed.learners.values():
+        learner.neutral_action = 1.0
+    routed.enable_training_mode(True)
+    obs = torch.randn(3, OBS_DIM)
+    actions, _ = routed.act(obs, None, timestep=0, timesteps=10)
+    assert torch.all(actions == 1.0)
+    step(routed, 0, [1, 2, 3])  # env 0 in grasp (no residual), env 1 in insert, env 2 in screw
+    torch.manual_seed(0)
+    a_insert, _ = routed.learners["insert"].act(obs, None, timestep=1, timesteps=10)
+    torch.manual_seed(0)
+    actions, _ = routed.act(obs, None, timestep=1, timesteps=10)
+    assert torch.all(actions[0] == 1.0)
+    torch.testing.assert_close(actions[1], a_insert[1])
+
+
 def test_each_residual_stores_only_its_phase_with_the_envs_reward_and_a_terminal_phase_switch():
     routed = routed_pair()
     routed.enable_training_mode(True)

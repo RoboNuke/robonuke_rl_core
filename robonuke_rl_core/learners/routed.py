@@ -13,7 +13,7 @@ change made to the env's data (a demo loader marks the same steps).
 
 :class:`RoutedSAC` is what the trainer drives: it hands every env step to every residual (each stores only the
 transitions starting in its own phase), and for each env takes the action of the residual of the phase its observation
-is in, or zeros (the base alone) in a phase without one. The phase of the observation an action is chosen for is the
+is in, or the neutral action (``neutral_action``: a residual's base alone) in a phase without one. The phase of the observation an action is chosen for is the
 one the env published with it (the previous step's ``infos``); before any, every env runs the base alone.
 
 Logging: the first residual forwards the env's and the episodes' metrics (``episode/*``, ``phase/*``, ``residual/*``,
@@ -94,16 +94,17 @@ class RoutedSAC:
             learner.pre_interaction(timestep=timestep, timesteps=timesteps)
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
-        """Each env's action from the residual of its observation's phase; zeros in a phase without one."""
+        """Each env's action from the residual of its observation's phase; the neutral action (``neutral_action``: the
+        one that leaves the env as it is, a residual's base alone) in a phase without one."""
         actions = None
         outputs: Dict[str, Any] = {}
         for route, learner in self.learners.items():
             routed, out = learner.act(observations, states, timestep=timestep, timesteps=timesteps)
             if actions is None:
-                actions = torch.zeros_like(routed)
+                actions = torch.full_like(routed, float(getattr(learner, "neutral_action", 0.0)))
             if self._labels is not None:
-                mask = (self._labels == self.names.index(route)).reshape(-1, 1).to(routed.dtype)
-                actions = actions + mask * routed
+                mask = (self._labels == self.names.index(route)).reshape(-1, 1)
+                actions = torch.where(mask, routed, actions)
             outputs[route] = out
         return actions, outputs
 
