@@ -59,6 +59,9 @@ class DDPG(SAC):
         lo, hi = (float(v) for v in self.cfg.action_range)
         self._range = (lo, hi)
         self._mid, self._half = (lo + hi) / 2.0, (hi - lo) / 2.0
+        #: a project's register_action_bound: ``observations -> (lo, hi)``, the deterministic action's clamp
+        #: (straight-through), or None
+        self.action_bound = None
         #: every noise draw: the warm-up's and the training's (learners/noise.py)
         self.noise = ActionNoise(self.cfg.warmup_noise, self.cfg.train_noise, action_range=self._range,
                                  num_agents=self.num_agents, device=self.device, width=self._space_width(self.action_space))
@@ -169,12 +172,20 @@ class DDPG(SAC):
         """``actions`` clamped to ``action_range`` (``clip_actions``), else as they are."""
         return actions.clamp(*self._range) if self.cfg.clip_actions else actions
 
-    def _deterministic(self, model, inputs) -> tuple:
-        """``(mid + half * tanh(mu(s)), outputs)`` of ``model`` (the actor or its target)."""
+    def _deterministic(self, model, inputs, observations=None) -> tuple:
+        """``(mid + half * tanh(mu(s)), outputs)`` of ``model`` (the actor or its target); with an :attr:`action_bound`,
+        clamped to its ``[lo, hi]`` from the raw ``observations`` (straight-through: the gradient passes the clamp)."""
         _, outputs = model.act(inputs, role="policy")
         if "mean_actions" not in outputs:
             raise RuntimeError("DDPG's actor must return mean_actions (a squashed Gaussian actor's tanh(mu))")
-        return self._mid + self._half * outputs["mean_actions"], outputs
+        if self.action_bound is None:
+            return self._mid + self._half * outputs["mean_actions"], outputs
+        if observations is None:
+            raise RuntimeError("DDPG's action_bound reads the raw observations, and none were given")
+        actions = self._mid + self._half * outputs["mean_actions"]
+        lo, hi = self.action_bound(observations)
+        # straight-through: the value is clamped, the gradient passes as if it were not
+        return actions + (torch.maximum(torch.minimum(actions, hi), lo) - actions).detach(), outputs
 
     def act(self, observations, states, *, timestep: int, timesteps: int):
         if self.training and timestep == 0 and not getattr(self, "_initial_logged", False):
@@ -193,7 +204,7 @@ class DDPG(SAC):
         if any(self.noise.needs_actor(phase) for phase in phases):
             inputs = {"observations": self.normalize_observations(observations)}
             with torch.no_grad(), self._batch_mode(self.policy, False):
-                mean, outputs = self._deterministic(self.policy, inputs)
+                mean, outputs = self._deterministic(self.policy, inputs, observations)
         std = self.noise.scale("train", timestep)
         self._explore_std.fill_(std)
         with torch.no_grad():
@@ -214,7 +225,8 @@ class DDPG(SAC):
         if not deterministic:
             raise ValueError("DDPG evaluates its deterministic action only: eval has no noise (deterministic: true)")
         with torch.no_grad(), self._batch_mode(self.policy, False):
-            mean, _ = self._deterministic(self.policy, {"observations": self.normalize_observations(observations)})
+            mean, _ = self._deterministic(self.policy, {"observations": self.normalize_observations(observations)},
+                                          observations)
             return self._clamp(mean)
 
     def _log_initial_policy(self, observations: torch.Tensor) -> None:
@@ -225,7 +237,8 @@ class DDPG(SAC):
             return
         rows = observations.shape[0] // self.num_agents
         with torch.no_grad(), self._batch_mode(self.policy, False):
-            mean, _ = self._deterministic(self.policy, {"observations": self.normalize_observations(observations)})
+            mean, _ = self._deterministic(self.policy, {"observations": self.normalize_observations(observations)},
+                                          observations)
         std = torch.full((self.num_agents,), self.noise.scale("train", 0), device=self.device)
         metrics = {
             "policy/mean_action": mean.abs().reshape(self.num_agents, rows, -1).mean(dim=(1, 2)),
@@ -358,7 +371,7 @@ class DDPG(SAC):
         with torch.no_grad():
             source = self.target_policy if self.cfg.target_actor else self.policy
             with self._batch_mode(source, False):
-                next_actions, _ = self._deterministic(source, next_inputs)
+                next_actions, _ = self._deterministic(source, next_inputs, sampled["next_observations"])
             next_actions = self._clamp(self.noise.smooth(next_actions, sampled["next_observations"]))
             next_critic_actions = self._critic_actions(sampled, "next_observations", next_actions)
             with self._batch_mode(self.target_critics, True):
@@ -401,7 +414,8 @@ class DDPG(SAC):
 
     def _compute_actor_loss(self, *, sampled, inputs, critic_inputs, rows, next_inputs=None):
         with self._batch_mode(self.policy, True):
-            actions, outputs = self._deterministic(self.policy, inputs)
+            actions, outputs = self._deterministic(self.policy, inputs,
+                                                   sampled["observations"] if sampled is not None else None)
         if self.cfg.clip_actions:  # a straight-through clamp to action_range: the value is clamped, the gradient passes
             actions = actions + (actions.clamp(*self._range) - actions).detach()
         with self._batch_mode(self.critics, False):

@@ -707,3 +707,52 @@ def test_per_dim_noise_draws_each_dims_own_scale_and_clip_and_smooths_per_dim():
     assert float(smoothed[:, 1:].abs().max()) <= 0.01 + 1e-7  # the other dims clipped at 0.01
     with pytest.raises(ValueError, match="numbers; the action is"):
         ddpg(train_noise=N(scale=[0.1] * (ACT_DIM + 1)))
+
+
+def test_an_action_bound_clamps_the_deterministic_action_straight_through_per_row_and_the_noise_passes():
+    learner = ddpg(action_range=[-1.0, 3.0], train_noise=N(scale=0.5), clip_actions=False, num_critics=2, critic_subset=2)
+    window = lambda o: (1.0 - o[:, :ACT_DIM].abs() * 0.1, 1.0 + o[:, :ACT_DIM].abs() * 0.1)  # noqa: E731
+    seen = []
+    learner.action_bound = lambda o: seen.append(o) or window(o)
+    obs = torch.randn(6, OBS_DIM)
+    with torch.no_grad():
+        _, out = learner.policy.act({"observations": obs}, role="policy")
+    lo, hi = window(obs)
+    clamped = torch.maximum(torch.minimum(1.0 + 2.0 * out["mean_actions"], hi), lo)  # the actor unchanged, then clamped
+    learner.enable_training_mode(False)
+    torch.testing.assert_close(learner.eval_actions(obs), clamped)
+    assert seen[-1] is obs
+    learner.enable_training_mode(True)
+    started(learner)
+    torch.manual_seed(0)
+    noisy = torch.stack([learner.act(obs, None, timestep=10**6, timesteps=10**7)[0] for _ in range(400)])
+    assert float((noisy - clamped).std()) == pytest.approx(0.5, rel=0.1)  # the noise is added after, not clamped
+    fill_memory(learner)
+    sampled, inputs, next_inputs, critic_inputs, critic_next_inputs = batch(learner)
+    seen.clear()
+    learner._compute_critic_loss(sampled=sampled, inputs=inputs, next_inputs=next_inputs, critic_inputs=critic_inputs,
+                                 critic_next_inputs=critic_next_inputs, rows=learner.cfg.batch_size)
+    assert any(o is sampled["next_observations"] for o in seen)  # the target action reads the next observations
+    seen.clear()
+    _, actions, _, _, _ = learner._compute_actor_loss(sampled=sampled, inputs=inputs, critic_inputs=critic_inputs,
+                                                      rows=learner.cfg.batch_size)
+    assert seen[-1] is sampled["observations"]
+    with torch.no_grad():
+        _, out = learner.policy.act(inputs, role="policy")
+    lo, hi = window(sampled["observations"])
+    torch.testing.assert_close(actions.detach(), torch.maximum(torch.minimum(1.0 + 2.0 * out["mean_actions"], hi), lo))
+    # straight-through: where the clamp binds the actor still gets the unclamped action's gradient
+    tight = lambda o: (torch.full((o.shape[0], ACT_DIM), 0.9), torch.full((o.shape[0], ACT_DIM), 1.1))  # noqa: E731
+    learner.action_bound = tight
+    for p in learner.policy.parameters():
+        p.grad = None
+    a, out = learner._deterministic(learner.policy, inputs, sampled["observations"])
+    assert bool(((a.detach() >= 0.9 - 1e-6) & (a.detach() <= 1.1 + 1e-6)).all())
+    (a * torch.arange(1.0, ACT_DIM + 1)).sum().backward()
+    expected = [torch.autograd.grad((2.0 * o * torch.arange(1.0, ACT_DIM + 1)).sum(), list(learner.policy.parameters()),
+                                    allow_unused=True) for o in [learner.policy.act(inputs, role="policy")[1]["mean_actions"]]][0]
+    for p, g in zip(learner.policy.parameters(), expected):
+        if g is not None:
+            torch.testing.assert_close(p.grad, g)
+    with pytest.raises(RuntimeError, match="raw observations"):
+        learner._deterministic(learner.policy, inputs)

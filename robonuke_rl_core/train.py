@@ -92,7 +92,7 @@ def main(argv=None, setup=None) -> int:
     # at another width (they are built for it)
     transform = None
     if learner_name in q_learners:
-        from robonuke_rl_core.learners.sac import (critic_action_space, critic_action_transform, demo_loader,
+        from robonuke_rl_core.learners.sac import (action_bound, critic_action_space, critic_action_transform, demo_loader,
                                                    exploration_scale, neutral_action)
 
         transform = critic_action_transform(cfg, env)
@@ -108,6 +108,10 @@ def main(argv=None, setup=None) -> int:
                              "register_exploration_scale builder answered for this run")
         # a project's register_neutral_action: the action that leaves the env as it is (a residual: the base alone)
         neutral = neutral_action(cfg, env)
+        # a project's register_action_bound: DDPG's half width times a per-env, per-dim factor from the observation
+        bound = action_bound(cfg, env)
+        if bound is not None and learner_name != "ddpg":
+            raise ValueError(f"a register_action_bound builder answered, and {learner_name} has no bounded actor (ddpg only)")
     def make_learner(learner_cfg, dirs):
         """One learner of ``learner_cfg`` with its own models, memory and optimizers (a routed SAC builds one per
         phase)."""
@@ -168,6 +172,10 @@ def main(argv=None, setup=None) -> int:
                 # a scale that depends on the learner's phase (for_route) is bound to this learner's route (None unrouted)
                 bind = getattr(noise_scale, "for_route", None)
                 learner.exploration_scale = bind(learner_cfg.route_label or None) if bind is not None else noise_scale
+                bind = getattr(bound, "for_route", None)
+                learner.action_bound = bind(learner_cfg.route_label or None) if bind is not None else bound
+                if bound is not None:
+                    print("[train] the actor's half width is bounded by a registered factor (register_action_bound)", flush=True)
             if loader is not None:
                 print("[train] demo transitions built at load by a registered demo loader (register_demo_loader)", flush=True)
             if learner.critic_action_transform is not None:

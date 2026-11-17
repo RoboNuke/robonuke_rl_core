@@ -1120,6 +1120,13 @@ def _build_single_eval_policy(
         if scale is not None:
             bind = getattr(scale, "for_route", None)
             learner.exploration_scale = bind(getattr(learner_cfg, "route_label", None) or None) if bind is not None else scale
+        from .learners.sac import action_bound
+
+        # the actor's bounded half width, as in training (train.py sets it): eval acts with the same bound
+        bound = action_bound(cfg, env)
+        if bound is not None:
+            bind = getattr(bound, "for_route", None)
+            learner.action_bound = bind(getattr(learner_cfg, "route_label", None) or None) if bind is not None else bound
     metadata = learner.load_agent(checkpoint, slot=0, with_optimizer=False)
     learner.enable_training_mode(False)  # eval mode: no dropout, no stat updates
     if any(getattr(m, "uses_batch_stats", False) for m in learner.models.values() if m is not None):

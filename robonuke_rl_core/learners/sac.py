@@ -61,7 +61,7 @@ from .n_step import NStepWindow, n_step_rows
 
 __all__ = ["SAC", "register_critic_action", "critic_action_transform", "critic_action_space", "categorical_projection",
            "register_demo_loader", "demo_loader", "register_exploration_scale", "exploration_scale",
-           "register_neutral_action", "neutral_action"]
+           "register_neutral_action", "neutral_action", "register_action_bound", "action_bound"]
 
 #: ``fn(cfg, env) -> loader | None``, registered by a project in its training script's ``setup()``: a loader
 #: ``(data, route_label) -> transitions`` turns a demo file that does not hold ready transitions (``data``, the file's
@@ -143,6 +143,29 @@ def exploration_scale(cfg: Any, env: Any) -> Any:
     found = [f for f in (fn(cfg, env) for fn in EXPLORATION_SCALE_BUILDERS) if f is not None]
     if len(found) > 1:
         raise ValueError(f"{len(found)} registered exploration-scale builders answered for this run; at most one may")
+    return found[0] if found else None
+
+
+#: ``fn(cfg, env) -> bound | None``, registered by a project in its training script's (and eval scripts') ``setup()``:
+#: ``bound`` is a callable ``observations -> (lo, hi)``, each ``(rows, A)``: DDPG's deterministic action
+#: ``mid + half * tanh(mu)`` is clamped to ``[lo, hi]`` per row and dim (acting, eval, the target action, the actor loss;
+#: straight-through: the value clamped, the actor's gradient passing as if it were not);
+#: the noise is added after the clamp, unclamped by it (a residual: the policy's own change limited, the exploration
+#: not). From the raw observations: device ops only, no host read. At most one builder may answer. A bound with a
+#: ``for_route(route)`` method is bound per learner, as the exploration scale is
+ACTION_BOUND_BUILDERS: List[Any] = []
+
+
+def register_action_bound(fn: Any) -> None:
+    """Add an :data:`ACTION_BOUND_BUILDERS` entry; ``train.py`` and the eval builder ask each once the env is built."""
+    ACTION_BOUND_BUILDERS.append(fn)
+
+
+def action_bound(cfg: Any, env: Any) -> Any:
+    """The one bound a registered builder returns for this run, or None."""
+    found = [f for f in (fn(cfg, env) for fn in ACTION_BOUND_BUILDERS) if f is not None]
+    if len(found) > 1:
+        raise ValueError(f"{len(found)} registered action-bound builders answered for this run; at most one may")
     return found[0] if found else None
 
 
