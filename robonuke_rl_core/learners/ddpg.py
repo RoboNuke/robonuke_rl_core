@@ -61,7 +61,7 @@ class DDPG(SAC):
         self._mid, self._half = (lo + hi) / 2.0, (hi - lo) / 2.0
         #: every noise draw: the warm-up's and the training's (learners/noise.py)
         self.noise = ActionNoise(self.cfg.warmup_noise, self.cfg.train_noise, action_range=self._range,
-                                 num_agents=self.num_agents, device=self.device)
+                                 num_agents=self.num_agents, device=self.device, width=self._space_width(self.action_space))
         self.noise.load_smoothing("train", 0)
         #: the training noise's scale at the last acting step (logged as policy/exploration_std)
         self._explore_std = torch.full((), self.noise.scale("train", 0), device=self.device)

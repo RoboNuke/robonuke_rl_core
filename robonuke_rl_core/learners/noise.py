@@ -9,6 +9,8 @@ critic update's target smoothing). Eval acts without noise. One draw, for either
     noise = noise * factor(obs)                    adaptive: the env's per-env, per-dim factor, from the observation
     a     = actor(s) + noise  |  mid + noise       center
 
+Every scale and clip is one number for every action dim or a list, one per dim (``width`` the action's).
+
 Target smoothing (TD3's) in a critic update: ``a' = mu'(s') + clip(N(0, target_scale), +-target_clip)``, times
 ``factor(s')`` with ``target_adaptive``. Its numbers live in device buffers set before each update (:meth:`ActionNoise.
 load_smoothing`), so one captured CUDA graph serves both phases.
@@ -18,7 +20,7 @@ load_smoothing`), so one captured CUDA graph serves both phases.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -65,8 +67,15 @@ class ActionNoise:
     deterministic actor over ``action_range`` ``(lo, hi)``. ``factor`` is read when needed: ``obs -> (rows, A)``, the
     adaptive factor from raw observations (the trainer sets it from ``register_exploration_scale``), or None."""
 
-    def __init__(self, warmup: Any, train: Any, *, action_range, num_agents: int, device: Any) -> None:
+    def __init__(self, warmup: Any, train: Any, *, action_range, num_agents: int, device: Any, width: int = 1) -> None:
         self.cfgs = {"warmup": warmup, "train": train}
+        self.width = int(width)
+        for phase, cfg in self.cfgs.items():
+            for name in ("scale", "scale_end", "clip", "target_scale", "target_clip"):
+                value = getattr(cfg, name)
+                if value is not None and not isinstance(value, (int, float)) and len(value) not in (1, self.width):
+                    raise ValueError(f"ddpg.{phase}_noise.{name} has {len(value)} numbers; the action is {self.width} wide")
+        self._lists: Dict[tuple, torch.Tensor] = {}
         lo, hi = (float(v) for v in action_range)
         self.mid, self.half = (lo + hi) / 2.0, (hi - lo) / 2.0
         self.num_agents = int(num_agents)
@@ -77,19 +86,45 @@ class ActionNoise:
         #: target smoothing, set per update (:meth:`load_smoothing`): on (0/1), std, clip, adaptive (0/1)
         self.smoothing_used = any(cfg.target_smoothing for cfg in self.cfgs.values())
         self.smoothing_adaptive = any(cfg.target_smoothing and cfg.target_adaptive for cfg in self.cfgs.values())
-        self._smooth = {k: torch.zeros((), device=device) for k in ("on", "std", "clip", "adaptive")}
+        self._smooth = {k: torch.zeros((), device=device) for k in ("on", "adaptive")}
+        # per action dim (a per-dim target_scale / target_clip), filled before each update
+        self._smooth.update({k: torch.zeros((self.width,), device=device) for k in ("std", "clip")})
         self._smooth["clip"].fill_(1.0)
 
     # ------------------------------------------------------------------ scales
-    def scale(self, phase: str, timestep: int) -> float:
-        """Phase ``phase``'s std / half width at env step ``timestep`` (``scale`` null: the range's half width)."""
+    @staticmethod
+    def _floats(value: Any) -> List[float]:
+        return [float(value)] if isinstance(value, (int, float)) else [float(v) for v in value]
+
+    def scales(self, phase: str, timestep: int) -> List[float]:
+        """Phase ``phase``'s std / half width at env step ``timestep``, one number (every dim) or one per dim (``scale``
+        null: the range's half width)."""
         cfg = self.cfgs[phase]
         if cfg.scale is None:
-            return self.half
-        start, end, steps = float(cfg.scale), cfg.scale_end, int(cfg.scale_steps)
-        if end is None or steps <= 0:
+            return [self.half]
+        start = self._floats(cfg.scale)
+        if cfg.scale_end is None or int(cfg.scale_steps) <= 0:
             return start
-        return start + (float(end) - start) * min(max(timestep, 0) / steps, 1.0)
+        end = self._floats(cfg.scale_end)
+        n = max(len(start), len(end))
+        start, end = (start * n if len(start) == 1 else start), (end * n if len(end) == 1 else end)
+        frac = min(max(timestep, 0) / int(cfg.scale_steps), 1.0)
+        return [a + (b - a) * frac for a, b in zip(start, end)]
+
+    def scale(self, phase: str, timestep: int) -> float:
+        """Phase ``phase``'s std / half width at env step ``timestep``, averaged over the dims (what is logged)."""
+        values = self.scales(phase, timestep)
+        return sum(values) / len(values)
+
+    def _tensor(self, values: List[float]) -> torch.Tensor:
+        """``values`` as a device tensor: a scalar, or ``(width,)`` per dim -- made once per list (a tensor from a Python
+        list is a host-to-device copy, a synchronization every step)."""
+        key = tuple(values)
+        found = self._lists.get(key)
+        if found is None:
+            found = torch.tensor(values[0] if len(values) == 1 else values, dtype=torch.float32, device=self.device)
+            self._lists[key] = found
+        return found
 
     def _factor(self, observations: torch.Tensor, what: str) -> torch.Tensor:
         if self.factor is None:
@@ -111,9 +146,10 @@ class ActionNoise:
             unit = torch.rand((rows, width), device=self.device) * 2.0 - 1.0
         if self.held[phase] is not None:
             unit = self.held[phase](unit)
-        noise = unit * self.scale(phase, timestep)
+        noise = unit * self._tensor(self.scales(phase, timestep))
         if cfg.clip is not None:
-            noise = noise.clamp(-float(cfg.clip), float(cfg.clip))
+            clip = self._tensor(self._floats(cfg.clip))
+            noise = torch.maximum(torch.minimum(noise, clip), -clip)
         if cfg.adaptive:
             noise = noise * self._factor(observations, f"ddpg.{phase}_noise.adaptive")
         if cfg.center == "mid":
@@ -130,10 +166,10 @@ class ActionNoise:
         """Set the device buffers the next critic updates' target smoothing reads to phase ``phase``'s (device fills, no
         host read; a captured graph sees them)."""
         cfg = self.cfgs[phase]
-        std = float(cfg.target_scale) if cfg.target_scale is not None else self.scale(phase, timestep)
+        std = self._floats(cfg.target_scale) if cfg.target_scale is not None else self.scales(phase, timestep)
         self._smooth["on"].fill_(1.0 if cfg.target_smoothing else 0.0)
-        self._smooth["std"].fill_(std)
-        self._smooth["clip"].fill_(float(cfg.target_clip))
+        self._smooth["std"].copy_(self._tensor(std).expand(self.width))
+        self._smooth["clip"].copy_(self._tensor(self._floats(cfg.target_clip)).expand(self.width))
         self._smooth["adaptive"].fill_(1.0 if cfg.target_smoothing and cfg.target_adaptive else 0.0)
 
     def smooth(self, next_actions: torch.Tensor, next_observations: torch.Tensor) -> torch.Tensor:
@@ -148,5 +184,5 @@ class ActionNoise:
         return next_actions + noise * self._smooth["on"]
 
     def smoothing_std(self) -> torch.Tensor:
-        """The loaded phase's smoothing std, a device scalar (for logging)."""
-        return self._smooth["std"]
+        """The loaded phase's smoothing std, a device scalar (for logging; the mean over the dims)."""
+        return self._smooth["std"].mean()

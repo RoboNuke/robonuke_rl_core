@@ -706,7 +706,9 @@ class SACCfg(_CommonCfg):
 @dataclass
 class NoiseCfg:
     """One phase's action noise (``ddpg.warmup_noise``, ``ddpg.train_noise``; ``learners/noise.py`` draws both): the same
-    options for the warm-up and for training, each phase set on its own. ``r`` units throughout (``action_range``'s)."""
+    options for the warm-up and for training, each phase set on its own. ``r`` units throughout (``action_range``'s).
+    ``scale``, ``scale_end``, ``clip``, ``target_scale`` and ``target_clip`` each take one number for every action dim or a
+    list, one per dim (per-dim noise)."""
 
     #: what the noise is added to: "actor", the actor's own action; "mid", ``action_range``'s midpoint (ResFiT's
     #: uniform warm-up acts there, ignoring the actor)
@@ -715,12 +717,12 @@ class NoiseCfg:
     distribution: str = "gaussian"
     #: the gaussian's std or the uniform's half width, linear to ``scale_end`` over ``scale_steps`` env steps (``scale_end``
     #: null or ``scale_steps`` 0: constant). Null: ``action_range``'s half width -- uniform only (with ``center: mid``,
-    #: uniform over the whole range)
-    scale: Optional[float] = 0.1
-    scale_end: Optional[float] = None
+    #: uniform over the whole range). A list: one per action dim (``scale_end`` then a list too, or null)
+    scale: Any = 0.1
+    scale_end: Any = None
     scale_steps: int = 0
-    #: the draw (``scale`` applied, before ``adaptive``) clipped to +-this; null: unclipped
-    clip: Optional[float] = None
+    #: the draw (``scale`` applied, before ``adaptive``) clipped to +-this (one number, or one per dim); null: unclipped
+    clip: Any = None
     #: times a per-env, per-dim factor computed from the observation (``register_exploration_scale``; a residual: the
     #: base's motion in r units), after the clip: a clip is then that many times the motion
     adaptive: bool = False
@@ -733,9 +735,9 @@ class NoiseCfg:
     #: the target's next action plus ``N(0, target_scale)`` clipped to +-``target_clip`` (then times the factor with
     #: ``target_adaptive``, computed from the next observation)
     target_smoothing: bool = False
-    #: null: this phase's ``scale`` at that step
-    target_scale: Optional[float] = None
-    target_clip: float = 0.3
+    #: null: this phase's ``scale`` at that step (one number, or one per dim, as ``target_clip``)
+    target_scale: Any = None
+    target_clip: Any = 0.3
     target_adaptive: bool = False
 
     CENTERS = ("actor", "mid")
@@ -746,20 +748,38 @@ class NoiseCfg:
             raise ValueError(f"{where}.center must be one of {self.CENTERS}, got {self.center!r}")
         if self.distribution not in self.DISTRIBUTIONS:
             raise ValueError(f"{where}.distribution must be one of {self.DISTRIBUTIONS}, got {self.distribution!r}")
-        if self.scale is None:
+        def values(name):  # the field as a list of floats (one number: a 1-list), None when null
+            value = getattr(self, name)
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return [float(value)]
+            try:
+                out = [float(v) for v in value]
+            except (TypeError, ValueError):
+                raise ValueError(f"{where}.{name} is a number or a list of numbers (one per action dim), got {value!r}")
+            if not out:
+                raise ValueError(f"{where}.{name} is an empty list")
+            return out
+
+        scale, scale_end, clip = values("scale"), values("scale_end"), values("clip")
+        target_scale, target_clip = values("target_scale"), values("target_clip")
+        if scale is None:
             if self.distribution != "uniform":
                 raise ValueError(f"{where}.scale: null (the range's half width) is for distribution: uniform only")
-            if self.scale_end is not None:
+            if scale_end is not None:
                 raise ValueError(f"{where}.scale: null (the range's half width) has no schedule: leave scale_end null")
-        elif self.scale < 0 or (self.scale_end is not None and self.scale_end < 0):
+        elif min(scale) < 0 or (scale_end is not None and min(scale_end) < 0):
             raise ValueError(f"{where}.scale (and scale_end) must be >= 0")
+        if scale is not None and scale_end is not None and len(scale_end) not in (1, len(scale)) and len(scale) != 1:
+            raise ValueError(f"{where}.scale_end has {len(scale_end)} numbers, scale {len(scale)}")
         if self.scale_steps < 0:
             raise ValueError(f"{where}.scale_steps must be >= 0, got {self.scale_steps}")
-        if self.clip is not None and self.clip <= 0:
+        if clip is not None and min(clip) <= 0:
             raise ValueError(f"{where}.clip must be > 0 or null, got {self.clip}")
         if self.repeat and (self.repeat_max < 1 or self.repeat_zeta_s <= 0):
             raise ValueError(f"{where}.repeat needs repeat_max >= 1 and repeat_zeta_s > 0")
-        if self.target_clip <= 0 or (self.target_scale is not None and self.target_scale < 0):
+        if target_clip is None or min(target_clip) <= 0 or (target_scale is not None and min(target_scale) < 0):
             raise ValueError(f"{where}.target_clip must be > 0 and target_scale >= 0 or null")
         if self.target_scale is None and self.scale is None:
             raise ValueError(f"{where}.target_scale: null takes this phase's scale, which is null here: set it")

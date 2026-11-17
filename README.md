@@ -336,23 +336,25 @@ DDPG's own fields:
 
 **A noise block** (`warmup_noise`, `train_noise`: the same fields, each phase its own values; `learners/noise.py` draws
 both, so every noise draw goes through one place). Per draw: `clip(d * scale, ±clip) * factor`, added to the actor's
-action or the range's midpoint, then clamped with `clip_actions`.
+action or the range's midpoint, then clamped with `clip_actions`. `scale`, `scale_end`, `clip`, `target_scale` and
+`target_clip` each take one number (every action dim) or a list, one per action dim (per-dim noise; the logged
+`policy/exploration_std` is the mean over the dims).
 
 | field | type | default | what it does |
 | --- | --- | --- | --- |
 | `center` | str | `"actor"` | `actor`: the noise is added to the actor's action. `mid`: to `action_range`'s midpoint, ignoring the actor (ResFiT's uniform warm-up) |
 | `distribution` | str | `"gaussian"` | `gaussian`: `N(0, scale)` per dim. `uniform`: `U(-scale, scale)` per dim |
-| `scale` | float or null | `0.1` | the gaussian's std or the uniform's half width. Null: `action_range`'s half width, uniform only (with `center: mid`: uniform over the whole range) |
-| `scale_end` | float or null | `null` | the scale at the end of a linear schedule over env steps. Null: constant |
+| `scale` | float, list or null | `0.1` | the gaussian's std or the uniform's half width. Null: `action_range`'s half width, uniform only (with `center: mid`: uniform over the whole range) |
+| `scale_end` | float, list or null | `null` | the scale at the end of a linear schedule over env steps. Null: constant |
 | `scale_steps` | int | `0` | env steps the schedule runs over; 0: constant |
-| `clip` | float or null | `null` | the scaled draw clipped to ±this, before `adaptive`'s factor (a clip is then that many times the motion). Null: unclipped |
+| `clip` | float, list or null | `null` | the scaled draw clipped to ±this, before `adaptive`'s factor (a clip is then that many times the motion). Null: unclipped |
 | `adaptive` | bool | `false` | times a per-row, per-dim factor computed from the raw observation by a project's builder (`register_exploration_scale(fn)`, `fn(cfg, env) -> (observations -> (rows, A)) or None`, registered in the training script's `setup()`; a residual: the base's motion in r units; a scale with a `for_route(route)` method is bound to each learner's own `route_label`). No builder answering is refused |
 | `repeat` | bool | `false` | correlated noise (FlashSAC's): each agent holds one draw for k env steps, k ~ Zeta(`repeat_zeta_s`) truncated at `repeat_max` |
 | `repeat_zeta_s` | float | `2.0` | the Zeta exponent, `P(k) ~ k^-s` |
 | `repeat_max` | int | `16` | the longest hold, in env steps |
 | `target_smoothing` | bool | `false` | TD3's target-policy smoothing in this phase's critic updates: the target's next action plus `N(0, target_scale)` clipped to ±`target_clip` |
-| `target_scale` | float or null | `null` | the smoothing std. Null: this phase's `scale` at that step |
-| `target_clip` | float | `0.3` | the smoothing noise's clip |
+| `target_scale` | float, list or null | `null` | the smoothing std. Null: this phase's `scale` at that step |
+| `target_clip` | float or list | `0.3` | the smoothing noise's clip |
 | `target_adaptive` | bool | `false` | the smoothing noise times the factor of the next observation (as `adaptive`) |
 
 Metrics, on top of SAC's (no `entropy/*`): `policy/exploration_std` (the training noise's scale now; also `policy/std`),

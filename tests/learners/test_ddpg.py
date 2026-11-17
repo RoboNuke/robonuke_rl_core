@@ -261,9 +261,9 @@ def test_each_phase_loads_its_own_target_smoothing_and_the_adaptive_one_reads_th
                    train_noise=N(scale=0.4, scale_end=0.0, scale_steps=100, target_smoothing=True, target_clip=0.7))
     smooth = learner.noise._smooth
     learner.noise.load_smoothing("warmup", 0)  # the critic warm-up burst
-    assert [float(smooth[k]) for k in ("on", "std", "clip", "adaptive")] == pytest.approx([1.0, 0.3, 0.5, 1.0])
+    assert [float(smooth[k].reshape(-1)[0]) for k in ("on", "std", "clip", "adaptive")] == pytest.approx([1.0, 0.3, 0.5, 1.0])
     learner.noise.load_smoothing("train", 50)  # target_scale null: the phase's scale at that step
-    assert [float(smooth[k]) for k in ("on", "std", "clip", "adaptive")] == pytest.approx([1.0, 0.2, 0.7, 0.0])
+    assert [float(smooth[k].reshape(-1)[0]) for k in ("on", "std", "clip", "adaptive")] == pytest.approx([1.0, 0.2, 0.7, 0.0])
     learner.noise.load_smoothing("warmup", 0)
     next_obs = torch.randn(4, OBS_DIM)
     seen = []
@@ -690,3 +690,20 @@ def test_critic_values_scores_given_transitions_per_slot_as_the_update_does():
         torch.testing.assert_close(out[agent][1], target.reshape(learner.num_agents, rows)[agent])
     assert learner.critic_values([None, sets[1]])[0] is None
     assert size > 0
+
+
+def test_per_dim_noise_draws_each_dims_own_scale_and_clip_and_smooths_per_dim():
+    scales = [0.1 * (d + 1) for d in range(ACT_DIM)]
+    learner = ddpg(warmup_noise=N(scale=0.2), train_noise=N(scale=scales, target_smoothing=True,
+                                                            target_scale=[0.05] * ACT_DIM, target_clip=[1.0] + [0.01] * (ACT_DIM - 1)))
+    torch.manual_seed(0)
+    obs = torch.zeros(20000, OBS_DIM)
+    draw = learner.noise.draw("train", torch.zeros(20000, ACT_DIM), obs, 20000, ACT_DIM, 0)
+    torch.testing.assert_close(draw.std(dim=0), torch.tensor(scales), atol=0.01, rtol=0.03)
+    assert learner.noise.scale("train", 0) == pytest.approx(sum(scales) / ACT_DIM)  # the logged mean
+    learner.noise.load_smoothing("train", 0)
+    smoothed = learner.noise.smooth(torch.zeros(20000, ACT_DIM), obs)
+    assert float(smoothed[:, 0].std()) == pytest.approx(0.05, rel=0.05)  # clip 1.0: the full N(0, 0.05)
+    assert float(smoothed[:, 1:].abs().max()) <= 0.01 + 1e-7  # the other dims clipped at 0.01
+    with pytest.raises(ValueError, match="numbers; the action is"):
+        ddpg(train_noise=N(scale=[0.1] * (ACT_DIM + 1)))
