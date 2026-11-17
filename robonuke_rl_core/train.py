@@ -108,7 +108,7 @@ def main(argv=None, setup=None) -> int:
                              "register_exploration_scale builder answered for this run")
         # a project's register_neutral_action: the action that leaves the env as it is (a residual: the base alone)
         neutral = neutral_action(cfg, env)
-        # a project's register_action_bound: DDPG's half width times a per-env, per-dim factor from the observation
+        # a project's register_action_bound: DDPG's deterministic action clamped per env and dim from the observation
         bound = action_bound(cfg, env)
         if bound is not None and learner_name != "ddpg":
             raise ValueError(f"a register_action_bound builder answered, and {learner_name} has no bounded actor (ddpg only)")
@@ -175,7 +175,7 @@ def main(argv=None, setup=None) -> int:
                 bind = getattr(bound, "for_route", None)
                 learner.action_bound = bind(learner_cfg.route_label or None) if bind is not None else bound
                 if bound is not None:
-                    print("[train] the actor's half width is bounded by a registered factor (register_action_bound)", flush=True)
+                    print("[train] the actor's action is clamped per row by a registered bound, straight-through (register_action_bound)", flush=True)
             if loader is not None:
                 print("[train] demo transitions built at load by a registered demo loader (register_demo_loader)", flush=True)
             if learner.critic_action_transform is not None:
