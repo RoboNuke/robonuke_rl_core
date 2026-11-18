@@ -271,12 +271,10 @@ def test_a_real_job_runs_the_process_we_asked_for(config, tmp_path):
 def test_a_job_whose_image_is_missing_fails_fast(config, tmp_path):
     """A bad path must fail in seconds with a named variable, not after the queue wait."""
     command = probe_sbatch(config, tmp_path, argv=["true"])
-    # swap the image path in the --export list for one that does not exist
+    # swap the image path sbatch's environment hands the job for one that does not exist
     for index, part in enumerate(command):
-        if part.startswith("--export="):
-            command[index] = re.sub(
-                r"RNK_SIF=[^,]*", "RNK_SIF=/nonexistent/image.sif", part
-            )
+        if part.startswith("RNK_SIF="):
+            command[index] = "RNK_SIF=/nonexistent/image.sif"
     submitted = run(command)
     assert submitted.returncode == 0, submitted.stderr
     job = job_id(submitted.stdout)
@@ -304,7 +302,7 @@ def test_the_launcher_composes_a_job_for_this_config(config, capsys):
     )
     out = capsys.readouterr().out
     assert code == 0, out
-    line = next(l for l in out.splitlines() if l.startswith("sbatch "))
+    line = next(l for l in out.splitlines() if l.startswith("env ") and " sbatch " in l)
     assert f"-A {config.hpc.account}" in line
     assert str(Path(config.hpc.sif_image).expanduser()) in line
     assert "scripts/train.py" in line

@@ -73,8 +73,14 @@ def required_overrides(paths: dict) -> list:
 
 
 def sbatch_lines(captured: str) -> list:
-    """The sbatch command lines out of a --dry_run's stdout."""
-    return [line for line in captured.splitlines() if line.startswith("sbatch ")]
+    """The sbatch command lines (``env K=V ... sbatch ...``) out of a --dry_run's stdout."""
+    return [line for line in captured.splitlines() if line.startswith("env ") and " sbatch " in line]
+
+
+def exported(line: str) -> dict:
+    """The variables an sbatch command line hands the job: the ``K=V`` words between ``env`` and ``sbatch``."""
+    parts = line.split()
+    return dict(part.split("=", 1) for part in parts[1:parts.index("sbatch")])
 
 
 def flag(line: str, name: str) -> str:

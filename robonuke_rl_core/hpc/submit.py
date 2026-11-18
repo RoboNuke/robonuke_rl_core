@@ -339,10 +339,15 @@ def sbatch_command(
                 "(a tag list is 'wandb.tags=[a,b]', never 'wandb.tags=[a, b]'), or put the "
                 "code in a file and pass the file's path."
             )
-    exports = ",".join(["ALL"] + [f"{key}={value}" for key, value in env.items()])
+    # The RNK_* values ride in sbatch's own environment (`env K=V ... sbatch`), which --export=ALL carries into the
+    # job, never in an --export list: sbatch splits that list on commas, so a comma-joined value (two extra_repos,
+    # two binds, every agent's eval run) would reach the job cut at its first comma.
+    assignments = [f"{key}={value}" for key, value in env.items()]
     # --constraint only when set: an empty one is not "no constraint" to sbatch, it is an error
     constraint = [f"--constraint={hpc.constraint}"] if hpc.constraint else []
     return [
+        "env",
+        *assignments,
         "sbatch",
         "-A", hpc.account,
         "-p", hpc.partitions,
@@ -355,7 +360,7 @@ def sbatch_command(
         "-J", job_name,
         "-o", str(out_path),
         "-e", str(err_path),
-        f"--export={exports}",
+        "--export=ALL",
         str(job_script()),
         *argv,
     ]

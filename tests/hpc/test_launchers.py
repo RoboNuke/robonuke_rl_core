@@ -15,7 +15,7 @@ import pytest
 from robonuke_rl_core.hpc import launch_eval, launch_sweep, launch_train, launch_watch
 from robonuke_rl_core.hpc import submit as S
 
-from hpc_helpers import flag, sbatch_lines, tree
+from hpc_helpers import exported, flag, sbatch_lines, tree
 
 
 def train(paths, *args, capsys=None, **kwargs):
@@ -74,11 +74,11 @@ def test_the_launcher_wandb_keys_come_last(tmp_path, capsys):
 def test_the_env_exports_carry_all_plus_the_rnk_variables(tmp_path, capsys):
     paths = tree(tmp_path, names=("alpha",))
     _, lines, _ = train(paths, capsys=capsys)
-    export = next(part for part in lines[0].split() if part.startswith("--export="))
-    # ALL first, so WANDB_API_KEY reaches the job from the login shell
-    assert export.startswith("--export=ALL,")
+    # ALL, so WANDB_API_KEY reaches the job from the login shell, and the RNK_* values with it from sbatch's environment
+    assert "--export=ALL" in lines[0].split()
+    export = exported(lines[0])
     for name in ("RNK_PKG_ROOT", "RNK_PROJECT_ROOT", "RNK_SIF", "RNK_CACHE_HOME", "RNK_PYTHON"):
-        assert f"{name}=" in export
+        assert name in export
 
 
 def test_the_second_image_and_the_extra_repos_are_exported_to_the_job(tmp_path, capsys):
@@ -90,19 +90,21 @@ def test_the_second_image_and_the_extra_repos_are_exported_to_the_job(tmp_path, 
         extra="hpc:\n  sif_image_sm70: ~/images/general-cu126.sif\n  extra_repos:\n    - ~/furniture_lab\n    - /nfs/share/other_repo\n",
     )
     _, lines, _ = train(paths, capsys=capsys)
-    export = next(part for part in lines[0].split() if part.startswith("--export="))
+    export = exported(lines[0])
     home = str(S.Path("~").expanduser())
-    assert f"RNK_SIF_SM70={home}/images/general-cu126.sif" in export
-    assert f"RNK_EXTRA_REPOS={home}/furniture_lab,/nfs/share/other_repo" in export
+    assert export["RNK_SIF_SM70"] == f"{home}/images/general-cu126.sif"
+    # whole: an --export list would have cut it at the comma
+    assert export["RNK_EXTRA_REPOS"] == f"{home}/furniture_lab,/nfs/share/other_repo"
+    assert not any(part.startswith("--export=") and part != "--export=ALL" for part in lines[0].split())
 
 
 def test_the_second_image_and_the_extra_repos_are_exported_empty_when_unset(tmp_path, capsys):
     """Exported always, so the job script reads one spelling and never a missing variable."""
     paths = tree(tmp_path, names=("alpha",))
     _, lines, _ = train(paths, capsys=capsys)
-    export = next(part for part in lines[0].split() if part.startswith("--export="))
-    assert "RNK_SIF_SM70=," in export
-    assert "RNK_EXTRA_REPOS=," in export
+    export = exported(lines[0])
+    assert export["RNK_SIF_SM70"] == ""
+    assert export["RNK_EXTRA_REPOS"] == ""
 
 
 def test_a_constraint_becomes_the_sbatch_flag_and_an_empty_one_emits_nothing(tmp_path, capsys):
@@ -214,12 +216,12 @@ def test_eval_after_train_uses_the_chain_wrapper_and_names_every_agent(tmp_path,
     eval_config = tmp_path / "quick.yaml"
     eval_config.write_text("eval:\n  num_rollouts: 4\n")
     _, lines, _ = train(paths, "--eval_config", str(eval_config), capsys=capsys)
-    export = next(part for part in lines[0].split() if part.startswith("--export="))
-    assert "RNK_CHAIN_SCRIPT=" in export
-    assert f"RNK_EVAL_CONFIG={eval_config}" in export
+    export = exported(lines[0])
+    assert "RNK_CHAIN_SCRIPT" in export
+    assert export["RNK_EVAL_CONFIG"] == str(eval_config)
     # num_agents is 2 in the temp base, so both runs are named
-    assert "RNK_EVAL_RUNS=hur/P/G_alpha_a0,hur/P/G_alpha_a1" in export
-    assert "RNK_EVAL_CHECKPOINT=best" in export
+    assert export["RNK_EVAL_RUNS"] == "hur/P/G_alpha_a0,hur/P/G_alpha_a1"
+    assert export["RNK_EVAL_CHECKPOINT"] == "best"
 
 
 def test_a_plain_train_job_uses_no_chain_wrapper(tmp_path, capsys):
