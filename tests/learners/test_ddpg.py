@@ -155,35 +155,83 @@ def test_the_uniform_warm_up_is_about_the_ranges_midpoint():
     assert float(warm.mean()) == pytest.approx(1.0, abs=0.02)
 
 
-def test_adaptive_noise_scales_each_rows_and_dims_draw_by_the_factor_of_its_observation():
-    learner = started(ddpg(train_noise=N(scale=0.2, adaptive=True), clip_actions=False))
+def test_a_registered_scale_draws_each_rows_and_dims_noise_from_the_function_of_its_observation():
+    learner = started(ddpg(train_noise=N(scale="registered"), clip_actions=False))
     learner.enable_training_mode(True)
     obs = torch.randn(6, OBS_DIM)
-    with pytest.raises(RuntimeError, match="register_exploration_scale"):
-        learner.act(obs, None, timestep=1, timesteps=100)  # adaptive with no factor: refused, never a silent constant
-    factor = torch.ones(6, ACT_DIM)
-    factor[0] = 0.0  # env 0 still: no noise
-    factor[1, 0] = 5.0  # env 1, dim 0: five times the std
+    with pytest.raises(RuntimeError, match="register_noise_scale"):
+        learner.act(obs, None, timestep=1, timesteps=100)  # registered with no function: refused, never a silent constant
+    scale = torch.full((6, ACT_DIM), 0.2)
+    scale[0] = 0.0  # env 0: no noise
+    scale[1, 0] = 1.0  # env 1, dim 0: std 1
     seen = []
-    learner.exploration_scale = lambda o: seen.append(o) or factor
+    learner.noise_scale = lambda o, phase: seen.append((o, phase)) or scale
     with torch.no_grad():
         mean = learner.policy.act({"observations": obs}, role="policy")[1]["mean_actions"]
     torch.manual_seed(0)
     noise = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(400)]) - mean
-    assert seen[0] is obs  # the factor reads the raw observation the learner acts on
+    assert seen[0][0] is obs and seen[0][1] == "train"  # the raw observation the learner acts on, and the phase
     assert float(noise[:, 0].abs().max()) == 0.0
     assert float(noise[:, 1, 0].std()) == pytest.approx(1.0, rel=0.1)
     assert float(noise[:, 2:].std()) == pytest.approx(0.2, rel=0.1)
+    # policy/exploration_std: each agent's mean drawn scale (agent 0: envs 0-2)
+    expected = torch.stack([scale[:3].mean(), scale[3:].mean()])
+    torch.testing.assert_close(learner._explore_std, expected)
+    learner.noise_scale = lambda o, phase: torch.ones(o.shape[0], ACT_DIM + 1)
+    with pytest.raises(ValueError, match="shape"):
+        learner.act(obs, None, timestep=1, timesteps=100)
 
 
-def test_the_clip_bounds_the_scaled_draw_before_the_adaptive_factor():
-    learner = started(ddpg(train_noise=N(scale=10.0, clip=0.1, adaptive=True), clip_actions=False))
-    learner.exploration_scale = lambda o: torch.full((o.shape[0], ACT_DIM), 3.0)
+def test_a_registered_uniform_warmup_scale_is_the_half_width_about_the_midpoint():
+    learner = ddpg(warmup_noise=N(center="mid", distribution="uniform", scale="registered"),
+                   train_noise=N(scale="registered"), action_range=[-1.0, 3.0], clip_actions=False,
+                   learning_starts_rows=10**6)
+    learner.enable_training_mode(True)
+    half = torch.linspace(0.1, 0.6, 6).unsqueeze(-1).expand(6, ACT_DIM)
+    phases = []
+    learner.noise_scale = lambda o, phase: phases.append(phase) or half
+    obs = torch.randn(6, OBS_DIM)
+    torch.manual_seed(0)
+    warm = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(400)])
+    assert set(phases) == {"warmup"}
+    offset = (warm - 1.0).abs().amax(dim=0)  # about the midpoint 1, within each row's own half width
+    assert bool((offset <= half + 1e-6).all()) and bool((offset >= 0.9 * half).all())
+    assert bool(torch.isnan(learner._explore_std).all())  # no training draw yet: nothing to log
+
+
+def test_the_clip_bounds_the_registered_scaled_draw():
+    learner = started(ddpg(train_noise=N(scale="registered", clip=0.1), clip_actions=False))
+    learner.noise_scale = lambda o, phase: torch.full((o.shape[0], ACT_DIM), 30.0)
     obs = torch.randn(6, OBS_DIM)
     with torch.no_grad():
         mean = learner.policy.act({"observations": obs}, role="policy")[1]["mean_actions"]
     noise = torch.stack([learner.act(obs, None, timestep=t + 1, timesteps=100)[0] for t in range(20)]) - mean
-    assert float(noise.abs().max()) == pytest.approx(0.3)  # clipped to 0.1, then 3 x
+    assert float(noise.abs().max()) == pytest.approx(0.1)
+
+
+def test_the_initial_policy_log_publishes_the_registered_scales_per_agent_mean():
+    learner = started(ddpg(train_noise=N(scale="registered")))
+    learner.enable_training_mode(True)
+    scale = torch.cat([torch.full((3, ACT_DIM), 0.1), torch.full((3, ACT_DIM), 0.3)])
+    learner.noise_scale = lambda o, phase: scale
+    logged = {}
+    learner.on_log.append(lambda agent, metrics, step: logged.setdefault(agent, {}).update(metrics))
+    learner.act(torch.randn(6, OBS_DIM), None, timestep=0, timesteps=100)
+    assert float(logged[0]["policy/exploration_std"]) == pytest.approx(0.1)
+    assert float(logged[1]["policy/exploration_std"]) == pytest.approx(0.3)
+
+
+def test_a_registered_scale_has_no_number_schedule_or_implicit_target_scale():
+    NoiseCfg(scale="registered").validate("ddpg.train_noise")
+    NoiseCfg(scale="registered", target_smoothing=True, target_scale=0.05).validate("ddpg.train_noise")
+    for bad, match in (({"scale": "adaptive"}, "registered"), ({"scale": "registered", "scale_end": 0.1}, "schedule"),
+                       ({"scale": "registered", "target_smoothing": True}, "target_scale")):
+        with pytest.raises(ValueError, match=match):
+            NoiseCfg(**bad).validate("ddpg.train_noise")
+    learner = ddpg(train_noise=N(scale="registered"))  # no smoothing: no target std is needed
+    learner.noise.load_smoothing("train", 0)
+    with pytest.raises(ValueError, match="registered"):
+        learner.noise.scales("train", 0)
 
 
 def test_each_agent_acts_with_its_own_phase_and_each_phase_with_its_own_options():
@@ -256,20 +304,14 @@ def test_target_policy_smoothing_stays_within_its_clip():
     torch.testing.assert_close(smoothed, target(), atol=1e-5, rtol=0)  # noise of std 10 clipped to 1e-7
 
 
-def test_each_phase_loads_its_own_target_smoothing_and_the_adaptive_one_reads_the_next_observation():
-    learner = ddpg(warmup_noise=N(scale=0.2, target_smoothing=True, target_scale=0.3, target_clip=0.5, target_adaptive=True),
+def test_each_phase_loads_its_own_target_smoothing():
+    learner = ddpg(warmup_noise=N(scale=0.2, target_smoothing=True, target_scale=0.3, target_clip=0.5),
                    train_noise=N(scale=0.4, scale_end=0.0, scale_steps=100, target_smoothing=True, target_clip=0.7))
     smooth = learner.noise._smooth
     learner.noise.load_smoothing("warmup", 0)  # the critic warm-up burst
-    assert [float(smooth[k].reshape(-1)[0]) for k in ("on", "std", "clip", "adaptive")] == pytest.approx([1.0, 0.3, 0.5, 1.0])
+    assert [float(smooth[k].reshape(-1)[0]) for k in ("on", "std", "clip")] == pytest.approx([1.0, 0.3, 0.5])
     learner.noise.load_smoothing("train", 50)  # target_scale null: the phase's scale at that step
-    assert [float(smooth[k].reshape(-1)[0]) for k in ("on", "std", "clip", "adaptive")] == pytest.approx([1.0, 0.2, 0.7, 0.0])
-    learner.noise.load_smoothing("warmup", 0)
-    next_obs = torch.randn(4, OBS_DIM)
-    seen = []
-    learner.exploration_scale = lambda o: seen.append(o) or torch.zeros(o.shape[0], ACT_DIM)
-    out = learner.noise.smooth(torch.zeros(4, ACT_DIM), next_obs)
-    assert seen[0] is next_obs and float(out.abs().max()) == 0.0  # a zero factor: no smoothing noise
+    assert [float(smooth[k].reshape(-1)[0]) for k in ("on", "std", "clip")] == pytest.approx([1.0, 0.2, 0.7])
 
 
 def test_the_critic_loss_forms():
@@ -702,7 +744,7 @@ def test_per_dim_noise_draws_each_dims_own_scale_and_clip_and_smooths_per_dim():
     torch.testing.assert_close(draw.std(dim=0), torch.tensor(scales), atol=0.01, rtol=0.03)
     assert learner.noise.scale("train", 0) == pytest.approx(sum(scales) / ACT_DIM)  # the logged mean
     learner.noise.load_smoothing("train", 0)
-    smoothed = learner.noise.smooth(torch.zeros(20000, ACT_DIM), obs)
+    smoothed = learner.noise.smooth(torch.zeros(20000, ACT_DIM))
     assert float(smoothed[:, 0].std()) == pytest.approx(0.05, rel=0.05)  # clip 1.0: the full N(0, 0.05)
     assert float(smoothed[:, 1:].abs().max()) <= 0.01 + 1e-7  # the other dims clipped at 0.01
     with pytest.raises(ValueError, match="numbers; the action is"):

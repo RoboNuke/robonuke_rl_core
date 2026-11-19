@@ -60,7 +60,7 @@ from .noise import HeldDraw
 from .n_step import NStepWindow, n_step_rows
 
 __all__ = ["SAC", "register_critic_action", "critic_action_transform", "critic_action_space", "categorical_projection",
-           "register_demo_loader", "demo_loader", "register_exploration_scale", "exploration_scale",
+           "register_demo_loader", "demo_loader", "register_noise_scale", "noise_scale",
            "register_neutral_action", "neutral_action", "register_action_bound", "action_bound"]
 
 #: ``fn(cfg, env) -> loader | None``, registered by a project in its training script's ``setup()``: a loader
@@ -125,24 +125,24 @@ def critic_action_transform(cfg: Any, env: Any) -> Any:
 
 
 #: ``fn(cfg, env) -> scale | None``, registered by a project in its training script's ``setup()``: ``scale`` is a
-#: callable ``observations -> (rows, A)``, the per-row, per-dim factor on DDPG's adaptive noise (``NoiseCfg.adaptive``,
-#: ``target_adaptive``; a residual: the base's motion in r units), from the raw observations (the env's when acting, a
-#: replay batch's next observations in target smoothing): device ops only, no host read, as it runs inside a captured
-#: critic update. At most one builder may answer. A scale with a ``for_route(route)`` method is bound per learner:
-#: train.py gives each learner ``scale.for_route(<its route_label>)`` (None unrouted), e.g. a per-phase residual scale
-EXPLORATION_SCALE_BUILDERS: List[Any] = []
+#: callable ``(observations, phase) -> (rows, A)``, DDPG's noise scale per row and dim (``NoiseCfg.scale: registered``:
+#: the gaussian's std or the uniform's half width, in r units) from the raw observations the learner acts on and the
+#: phase (``"warmup"`` or ``"train"``): device ops only, no host read (it runs every acting step). At most one builder may
+#: answer. A scale with a ``for_route(route)`` method is bound per learner: train.py gives each learner
+#: ``scale.for_route(<its route_label>)`` (None unrouted), e.g. a per-phase residual scale
+NOISE_SCALE_BUILDERS: List[Any] = []
 
 
-def register_exploration_scale(fn: Any) -> None:
-    """Add an :data:`EXPLORATION_SCALE_BUILDERS` entry; ``scripts/train.py`` asks each once its env is built."""
-    EXPLORATION_SCALE_BUILDERS.append(fn)
+def register_noise_scale(fn: Any) -> None:
+    """Add a :data:`NOISE_SCALE_BUILDERS` entry; ``scripts/train.py`` asks each once its env is built."""
+    NOISE_SCALE_BUILDERS.append(fn)
 
 
-def exploration_scale(cfg: Any, env: Any) -> Any:
-    """The one scale a registered builder returns for this run, or None."""
-    found = [f for f in (fn(cfg, env) for fn in EXPLORATION_SCALE_BUILDERS) if f is not None]
+def noise_scale(cfg: Any, env: Any) -> Any:
+    """The one noise scale a registered builder returns for this run, or None."""
+    found = [f for f in (fn(cfg, env) for fn in NOISE_SCALE_BUILDERS) if f is not None]
     if len(found) > 1:
-        raise ValueError(f"{len(found)} registered exploration-scale builders answered for this run; at most one may")
+        raise ValueError(f"{len(found)} registered noise-scale builders answered for this run; at most one may")
     return found[0] if found else None
 
 

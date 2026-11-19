@@ -717,28 +717,25 @@ class NoiseCfg:
     distribution: str = "gaussian"
     #: the gaussian's std or the uniform's half width, linear to ``scale_end`` over ``scale_steps`` env steps (``scale_end``
     #: null or ``scale_steps`` 0: constant). Null: ``action_range``'s half width -- uniform only (with ``center: mid``,
-    #: uniform over the whole range). A list: one per action dim (``scale_end`` then a list too, or null)
+    #: uniform over the whole range). A list: one per action dim (``scale_end`` then a list too, or null). ``registered``:
+    #: per row and dim from the raw observation and the phase, a project's function (``register_noise_scale``), in r units
     scale: Any = 0.1
     scale_end: Any = None
     scale_steps: int = 0
-    #: the draw (``scale`` applied, before ``adaptive``) clipped to +-this (one number, or one per dim); null: unclipped
+    #: the draw (``scale`` applied) clipped to +-this (one number, or one per dim); null: unclipped
     clip: Any = None
-    #: times a per-env, per-dim factor computed from the observation (``register_exploration_scale``; a residual: the
-    #: base's motion in r units), after the clip: a clip is then that many times the motion
-    adaptive: bool = False
     #: correlated noise (FlashSAC's): each agent holds one draw for k env steps, k ~ Zeta(``repeat_zeta_s``) truncated at
     #: ``repeat_max`` (P(k) ~ k^-s), then draws afresh
     repeat: bool = False
     repeat_zeta_s: float = 2.0
     repeat_max: int = 16
     #: TD3's target-policy smoothing in the critic updates of this phase (the warm-up's: the critic warm-up burst):
-    #: the target's next action plus ``N(0, target_scale)`` clipped to +-``target_clip`` (then times the factor with
-    #: ``target_adaptive``, computed from the next observation)
+    #: the target's next action plus ``N(0, target_scale)`` clipped to +-``target_clip``
     target_smoothing: bool = False
-    #: null: this phase's ``scale`` at that step (one number, or one per dim, as ``target_clip``)
+    #: null: this phase's ``scale`` at that step (one number, or one per dim, as ``target_clip``); a number with a null or
+    #: registered ``scale``
     target_scale: Any = None
     target_clip: Any = 0.3
-    target_adaptive: bool = False
 
     CENTERS = ("actor", "mid")
     DISTRIBUTIONS = ("gaussian", "uniform")
@@ -762,9 +759,16 @@ class NoiseCfg:
                 raise ValueError(f"{where}.{name} is an empty list")
             return out
 
-        scale, scale_end, clip = values("scale"), values("scale_end"), values("clip")
+        registered = isinstance(self.scale, str)
+        if registered and self.scale != "registered":
+            raise ValueError(f"{where}.scale is a number, a list, null or 'registered', got {self.scale!r}")
+        scale = None if registered else values("scale")
+        scale_end, clip = values("scale_end"), values("clip")
         target_scale, target_clip = values("target_scale"), values("target_clip")
-        if scale is None:
+        if registered:
+            if scale_end is not None:
+                raise ValueError(f"{where}.scale: registered (a per-row function) has no schedule: leave scale_end null")
+        elif scale is None:
             if self.distribution != "uniform":
                 raise ValueError(f"{where}.scale: null (the range's half width) is for distribution: uniform only")
             if scale_end is not None:
@@ -781,12 +785,14 @@ class NoiseCfg:
             raise ValueError(f"{where}.repeat needs repeat_max >= 1 and repeat_zeta_s > 0")
         if target_clip is None or min(target_clip) <= 0 or (target_scale is not None and min(target_scale) < 0):
             raise ValueError(f"{where}.target_clip must be > 0 and target_scale >= 0 or null")
-        if self.target_scale is None and self.scale is None:
-            raise ValueError(f"{where}.target_scale: null takes this phase's scale, which is null here: set it")
+        if self.target_smoothing and self.target_scale is None and (self.scale is None or registered):
+            raise ValueError(f"{where}.target_scale: null takes this phase's scale, which is "
+                             f"{'registered' if registered else 'null'} here: set it")
 
     @property
-    def adaptive_anywhere(self) -> bool:
-        return bool(self.adaptive or (self.target_smoothing and self.target_adaptive))
+    def scale_registered(self) -> bool:
+        """``scale: registered``: the scale comes from a project's per-row function (``register_noise_scale``)."""
+        return self.scale == "registered"
 
 
 @dataclass

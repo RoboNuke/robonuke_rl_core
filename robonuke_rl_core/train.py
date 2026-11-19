@@ -93,19 +93,21 @@ def main(argv=None, setup=None) -> int:
     transform = None
     if learner_name in q_learners:
         from robonuke_rl_core.learners.sac import (action_bound, critic_action_space, critic_action_transform, demo_loader,
-                                                   exploration_scale, neutral_action)
+                                                   neutral_action, noise_scale)
 
         transform = critic_action_transform(cfg, env)
         # a project's register_demo_loader: the demo file's transitions are built at load, with the env's own code
         loader = demo_loader(cfg, env)
-        # a project's register_exploration_scale: DDPG's adaptive noise (either phase, acting or target smoothing)
-        # multiplies by a per-env, per-dim factor computed from the observation
-        noise_scale = exploration_scale(cfg, env)
-        adaptive = [f"{learner_name}.{phase}" for phase in ("warmup_noise", "train_noise")
-                    if getattr(getattr(learner_cfg, phase, None), "adaptive_anywhere", False)]
-        if adaptive and noise_scale is None:
-            raise ValueError(f"{adaptive} adaptive needs a per-env, per-dim factor from the observation, and no "
-                             "register_exploration_scale builder answered for this run")
+        # a project's register_noise_scale: DDPG's noise scale (scale: registered) per row and dim, from the observation
+        registered_scale = noise_scale(cfg, env)
+        registered = [f"{learner_name}.{phase}" for phase in ("warmup_noise", "train_noise")
+                      if getattr(getattr(learner_cfg, phase, None), "scale_registered", False)]
+        if registered and registered_scale is None:
+            raise ValueError(f"{registered}.scale is registered (a per-row function of the observation), and no "
+                             "register_noise_scale builder answered for this run")
+        if registered_scale is not None and not registered:
+            raise ValueError(f"a register_noise_scale builder answered, and no {learner_name}.warmup_noise / train_noise "
+                             "has scale: registered: the registered scale would go unused")
         # a project's register_neutral_action: the action that leaves the env as it is (a residual: the base alone)
         neutral = neutral_action(cfg, env)
         # a project's register_action_bound: DDPG's deterministic action clamped per env and dim from the observation
@@ -170,8 +172,8 @@ def main(argv=None, setup=None) -> int:
             learner.neutral_action = neutral
             if learner_name == "ddpg":
                 # a scale that depends on the learner's phase (for_route) is bound to this learner's route (None unrouted)
-                bind = getattr(noise_scale, "for_route", None)
-                learner.exploration_scale = bind(learner_cfg.route_label or None) if bind is not None else noise_scale
+                bind = getattr(registered_scale, "for_route", None)
+                learner.noise_scale = bind(learner_cfg.route_label or None) if bind is not None else registered_scale
                 bind = getattr(bound, "for_route", None)
                 learner.action_bound = bind(learner_cfg.route_label or None) if bind is not None else bound
                 if bound is not None:

@@ -5,15 +5,17 @@ starts learning, and the target smoothing of its critic warm-up burst) and ``tra
 critic update's target smoothing). Eval acts without noise. One draw, for either phase::
 
     d     = N(0, 1) | U(-1, 1)                     distribution (held for k steps per agent with ``repeat``)
-    noise = clip(d * scale(t), +-clip)             scale: std / half width, linear schedule; clip on the scaled draw
-    noise = noise * factor(obs)                    adaptive: the env's per-env, per-dim factor, from the observation
+    noise = clip(d * scale, +-clip)                scale: std / half width; clip on the scaled draw
     a     = actor(s) + noise  |  mid + noise       center
 
-Every scale and clip is one number for every action dim or a list, one per dim (``width`` the action's).
+``scale`` is the config's (one number for every action dim or a list, one per dim; a linear schedule with
+``scale_end``), or with ``scale: registered`` a project's per-row, per-dim function of the raw observation and the phase
+(:attr:`ActionNoise.scale_fn`, set by the trainer from ``register_noise_scale``), ``(rows, A)`` in r units. Every clip is
+one number or one per dim.
 
-Target smoothing (TD3's) in a critic update: ``a' = mu'(s') + clip(N(0, target_scale), +-target_clip)``, times
-``factor(s')`` with ``target_adaptive``. Its numbers live in device buffers set before each update (:meth:`ActionNoise.
-load_smoothing`), so one captured CUDA graph serves both phases.
+Target smoothing (TD3's) in a critic update: ``a' = mu'(s') + clip(N(0, target_scale), +-target_clip)``. Its numbers
+live in device buffers set before each update (:meth:`ActionNoise.load_smoothing`), so one captured CUDA graph serves
+both phases.
 
 :class:`HeldDraw` is the correlated-noise hold (FlashSAC's), shared with SAC's ``noise_repeat``.
 """
@@ -24,9 +26,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-__all__ = ["HeldDraw", "ActionNoise", "PHASES"]
+__all__ = ["HeldDraw", "ActionNoise", "PHASES", "REGISTERED"]
 
 PHASES = ("warmup", "train")
+#: ``NoiseCfg.scale``'s value for a scale computed per row by a project's function (``register_noise_scale``)
+REGISTERED = "registered"
 
 
 class HeldDraw:
@@ -64,8 +68,9 @@ class HeldDraw:
 
 class ActionNoise:
     """The two phases' noise (``warmup``, ``train``: :class:`~robonuke_rl_core.learners.cfg.NoiseCfg`) for a
-    deterministic actor over ``action_range`` ``(lo, hi)``. ``factor`` is read when needed: ``obs -> (rows, A)``, the
-    adaptive factor from raw observations (the trainer sets it from ``register_exploration_scale``), or None."""
+    deterministic actor over ``action_range`` ``(lo, hi)``. ``scale_fn`` is read when a phase's ``scale`` is
+    ``registered``: ``(observations, phase) -> (rows, A)``, the std / half width per row and dim in r units from the raw
+    observations (the trainer sets it from ``register_noise_scale``), or None."""
 
     def __init__(self, warmup: Any, train: Any, *, action_range, num_agents: int, device: Any, width: int = 1) -> None:
         self.cfgs = {"warmup": warmup, "train": train}
@@ -73,20 +78,23 @@ class ActionNoise:
         for phase, cfg in self.cfgs.items():
             for name in ("scale", "scale_end", "clip", "target_scale", "target_clip"):
                 value = getattr(cfg, name)
-                if value is not None and not isinstance(value, (int, float)) and len(value) not in (1, self.width):
+                if value is None or (name == "scale" and value == REGISTERED):
+                    continue
+                if not isinstance(value, (int, float)) and len(value) not in (1, self.width):
                     raise ValueError(f"ddpg.{phase}_noise.{name} has {len(value)} numbers; the action is {self.width} wide")
         self._lists: Dict[tuple, torch.Tensor] = {}
         lo, hi = (float(v) for v in action_range)
         self.mid, self.half = (lo + hi) / 2.0, (hi - lo) / 2.0
         self.num_agents = int(num_agents)
         self.device = device
-        self.factor: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+        self.scale_fn: Optional[Callable[[torch.Tensor, str], torch.Tensor]] = None
+        #: each phase's last registered scale ``(rows, A)`` (None before its first draw), for logging
+        self.last_scale: Dict[str, Optional[torch.Tensor]] = {phase: None for phase in PHASES}
         self.held = {phase: HeldDraw(num_agents, cfg.repeat_zeta_s, cfg.repeat_max, device) if cfg.repeat else None
                      for phase, cfg in self.cfgs.items()}
-        #: target smoothing, set per update (:meth:`load_smoothing`): on (0/1), std, clip, adaptive (0/1)
+        #: target smoothing, set per update (:meth:`load_smoothing`): on (0/1), std, clip
         self.smoothing_used = any(cfg.target_smoothing for cfg in self.cfgs.values())
-        self.smoothing_adaptive = any(cfg.target_smoothing and cfg.target_adaptive for cfg in self.cfgs.values())
-        self._smooth = {k: torch.zeros((), device=device) for k in ("on", "adaptive")}
+        self._smooth = {"on": torch.zeros((), device=device)}
         # per action dim (a per-dim target_scale / target_clip), filled before each update
         self._smooth.update({k: torch.zeros((self.width,), device=device) for k in ("std", "clip")})
         self._smooth["clip"].fill_(1.0)
@@ -96,10 +104,16 @@ class ActionNoise:
     def _floats(value: Any) -> List[float]:
         return [float(value)] if isinstance(value, (int, float)) else [float(v) for v in value]
 
+    def registered(self, phase: str) -> bool:
+        """Phase ``phase``'s scale is a project's per-row function (``scale: registered``)."""
+        return self.cfgs[phase].scale == REGISTERED
+
     def scales(self, phase: str, timestep: int) -> List[float]:
         """Phase ``phase``'s std / half width at env step ``timestep``, one number (every dim) or one per dim (``scale``
-        null: the range's half width)."""
+        null: the range's half width). A registered scale has no number: refused."""
         cfg = self.cfgs[phase]
+        if cfg.scale == REGISTERED:
+            raise ValueError(f"ddpg.{phase}_noise.scale is registered: a per-row function of the observation, no number")
         if cfg.scale is None:
             return [self.half]
         start = self._floats(cfg.scale)
@@ -126,13 +140,17 @@ class ActionNoise:
             self._lists[key] = found
         return found
 
-    def _factor(self, observations: torch.Tensor, what: str) -> torch.Tensor:
-        if self.factor is None:
+    def registered_scale(self, observations: torch.Tensor, phase: str, rows: int, width: int) -> torch.Tensor:
+        """Phase ``phase``'s registered scale for every row, ``(rows, width)`` in r units (:attr:`scale_fn`)."""
+        if self.scale_fn is None:
             raise RuntimeError(
-                f"{what} is adaptive: it scales by a per-env, per-dim factor from the observation, but no builder "
-                "answered (register_exploration_scale in the training script's setup())"
+                f"ddpg.{phase}_noise.scale is registered: a per-row, per-dim function of the observation, but no builder "
+                "answered (register_noise_scale in the training script's setup())"
             )
-        return self.factor(observations)
+        scale = self.scale_fn(observations, phase)
+        if tuple(scale.shape) != (rows, width):
+            raise ValueError(f"the registered noise scale returned shape {tuple(scale.shape)}; the draw is {(rows, width)}")
+        return scale
 
     # ------------------------------------------------------------------ acting
     def draw(self, phase: str, mean: Optional[torch.Tensor], observations: torch.Tensor, rows: int, width: int,
@@ -146,12 +164,15 @@ class ActionNoise:
             unit = torch.rand((rows, width), device=self.device) * 2.0 - 1.0
         if self.held[phase] is not None:
             unit = self.held[phase](unit)
-        noise = unit * self._tensor(self.scales(phase, timestep))
+        if cfg.scale == REGISTERED:
+            scale = self.registered_scale(observations, phase, rows, width)
+            self.last_scale[phase] = scale
+        else:
+            scale = self._tensor(self.scales(phase, timestep))
+        noise = unit * scale
         if cfg.clip is not None:
             clip = self._tensor(self._floats(cfg.clip))
             noise = torch.maximum(torch.minimum(noise, clip), -clip)
-        if cfg.adaptive:
-            noise = noise * self._factor(observations, f"ddpg.{phase}_noise.adaptive")
         if cfg.center == "mid":
             return self.mid + noise
         if mean is None:
@@ -166,21 +187,22 @@ class ActionNoise:
         """Set the device buffers the next critic updates' target smoothing reads to phase ``phase``'s (device fills, no
         host read; a captured graph sees them)."""
         cfg = self.cfgs[phase]
-        std = self._floats(cfg.target_scale) if cfg.target_scale is not None else self.scales(phase, timestep)
+        if cfg.target_scale is not None:
+            std = self._floats(cfg.target_scale)
+        elif cfg.target_smoothing:
+            std = self.scales(phase, timestep)
+        else:  # no smoothing in this phase: the std is never used
+            std = [0.0]
         self._smooth["on"].fill_(1.0 if cfg.target_smoothing else 0.0)
         self._smooth["std"].copy_(self._tensor(std).expand(self.width))
         self._smooth["clip"].copy_(self._tensor(self._floats(cfg.target_clip)).expand(self.width))
-        self._smooth["adaptive"].fill_(1.0 if cfg.target_smoothing and cfg.target_adaptive else 0.0)
 
-    def smooth(self, next_actions: torch.Tensor, next_observations: torch.Tensor) -> torch.Tensor:
+    def smooth(self, next_actions: torch.Tensor) -> torch.Tensor:
         """The target's next action plus the loaded phase's smoothing noise (unclamped); as it is when no phase smooths."""
         if not self.smoothing_used:
             return next_actions
         clip = self._smooth["clip"]
         noise = torch.maximum(torch.minimum(torch.randn_like(next_actions) * self._smooth["std"], clip), -clip)
-        if self.smoothing_adaptive:
-            factor = self._factor(next_observations, "the target smoothing (target_adaptive)")
-            noise = noise * (1.0 + self._smooth["adaptive"] * (factor - 1.0))
         return next_actions + noise * self._smooth["on"]
 
     def smoothing_std(self) -> torch.Tensor:
