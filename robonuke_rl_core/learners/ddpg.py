@@ -65,9 +65,18 @@ class DDPG(SAC):
         self.noise = ActionNoise(self.cfg.warmup_noise, self.cfg.train_noise, action_range=self._range,
                                  num_agents=self.num_agents, device=self.device, width=self._space_width(self.action_space))
         self.noise.load_smoothing("train", 0)
-        #: the training noise's scale at the last acting step, per agent (logged as policy/exploration_std; a registered
-        #: scale: the mean over the agent's envs and dims of the last draw's, NaN before the first)
-        self._explore_std = torch.full((self.num_agents,), self._configured_train_scale(), device=self.device)
+        #: the exploration noise the envs got, from the actions themselves (the executed action minus its center: the
+        #: actor's mean in an "actor" phase, the range's midpoint in a "mid" one), per agent and action dim: its squares
+        #: summed and the rows counted over the write interval, published as ``policy/std/<d>`` (their RMS) and
+        #: ``policy/std`` (the mean over d) by :meth:`_emit_interval_metrics`
+        width = self._space_width(self.action_space)
+        self._noise_sq = torch.zeros((self.num_agents, width), device=self.device)
+        self._noise_rows = torch.zeros((self.num_agents, 1), device=self.device)
+        #: the actor's own action (its deterministic mean) on the rows it acted on (an "actor" phase's), per agent and
+        #: dim: |action| summed and the rows counted over the write interval, published as ``policy/mean_action/<d>``
+        #: (their mean) and ``policy/mean_action`` (the mean over d)
+        self._mean_abs = torch.zeros((self.num_agents, width), device=self.device)
+        self._mean_rows = torch.zeros((self.num_agents, 1), device=self.device)
         #: critic_warmup_updates, per agent: its burst has run (or none is asked for); _in_critic_warmup while one runs
         self._agent_warmed = [int(self.cfg.critic_warmup_updates) == 0] * self.num_agents
         self._in_critic_warmup = False
@@ -135,10 +144,6 @@ class DDPG(SAC):
     @noise_scale.setter
     def noise_scale(self, fn) -> None:
         self.noise.scale_fn = fn
-
-    def _configured_train_scale(self, timestep: int = 0) -> float:
-        """The training noise's configured scale at ``timestep`` (the mean over the dims); NaN when it is registered."""
-        return float("nan") if self.noise.registered("train") else self.noise.scale("train", timestep)
 
     def _per_agent_mean(self, values: torch.Tensor) -> torch.Tensor:
         """``(rows, A)`` agent-major rows -> ``(num_agents,)`` means."""
@@ -216,22 +221,34 @@ class DDPG(SAC):
                 mean, outputs = self._deterministic(self.policy, inputs, observations)
         with torch.no_grad():
             drawn = {phase: self.noise.draw(phase, mean, observations, rows, width, timestep) for phase in phases}
-            if not self.noise.registered("train"):
-                self._explore_std.fill_(self.noise.scale("train", timestep))
-            elif "train" in drawn:  # device ops only: the per-agent mean of the scale just drawn
-                self._explore_std.copy_(self._per_agent_mean(self.noise.last_scale["train"]))
+            # each phase's center, which its noise is drawn about
+            center = {phase: mean if self.noise.needs_actor(phase) else torch.full_like(drawn[phase], self.noise.mid)
+                      for phase in drawn}
+            # the rows whose noise is drawn about the actor's mean (an "actor" phase): the rows the actor acted on
+            on_actor = {phase: torch.full((rows,), self.noise.needs_actor(phase), device=self.device) for phase in drawn}
             if len(drawn) == 2:
                 per_env = self._random_agent_mask(random_agents).repeat_interleave(rows // self.num_agents)
                 actions = torch.where(per_env[:, None], drawn["warmup"], drawn["train"])
+                centers = torch.where(per_env[:, None], center["warmup"], center["train"])
+                acted = torch.where(per_env, on_actor["warmup"], on_actor["train"])
             else:
                 actions = next(iter(drawn.values()))
+                centers = next(iter(center.values()))
+                acted = next(iter(on_actor.values()))
             actions = self._clamp(actions)
+            # the noise the envs got (after the clamp), summed per agent and dim for policy/std (device ops only)
+            noise = (actions - centers).reshape(self.num_agents, -1, width)
+            self._noise_sq += noise.square().sum(dim=1)
+            self._noise_rows += noise.shape[1]
+            if mean is not None:  # the actor's action on the rows it acted on, for policy/mean_action
+                weight = acted.to(mean.dtype).reshape(self.num_agents, -1, 1)
+                self._mean_abs += (mean.abs().reshape(self.num_agents, -1, width) * weight).sum(dim=1)
+                self._mean_rows += weight.sum(dim=1)
         if mean is not None:
             if self.noise.registered("train") and "train" in drawn:  # each env's own drawn scale
                 log_std = self.noise.last_scale["train"].clamp_min(1e-12).log()
             else:
-                per_row = self._explore_std.clamp_min(1e-12).log().repeat_interleave(rows // self.num_agents)
-                log_std = per_row.unsqueeze(-1).expand_as(mean)
+                log_std = torch.full_like(mean, float(self.noise.scale("train", timestep))).clamp_min(1e-12).log()
             self._emit_std_by_label({"log_std": log_std}, timestep)
             outputs = {**outputs, "mean_actions": mean}
         return actions, outputs
@@ -246,25 +263,12 @@ class DDPG(SAC):
             return self._clamp(mean)
 
     def _log_initial_policy(self, observations: torch.Tensor) -> None:
-        """The actor as it starts, before any update, published at step 0: ``policy/mean_action`` (the mean |action|
-        it would take without noise), ``policy/exploration_std`` and the learning rates."""
+        """The learning rates at step 0 (``policy/std`` and ``policy/mean_action`` come from the actions acted on, every
+        write interval: :meth:`_emit_interval_metrics`)."""
         self._initial_logged = True
         if not self.on_log:
             return
-        rows = observations.shape[0] // self.num_agents
-        with torch.no_grad(), self._batch_mode(self.policy, False):
-            mean, _ = self._deterministic(self.policy, {"observations": self.normalize_observations(observations)},
-                                          observations)
-        if self.noise.registered("train"):
-            width = self._space_width(self.action_space)
-            with torch.no_grad():
-                std = self._per_agent_mean(self.noise.registered_scale(observations, "train", observations.shape[0], width))
-        else:
-            std = torch.full((self.num_agents,), self.noise.scale("train", 0), device=self.device)
         metrics = {
-            "policy/mean_action": mean.abs().reshape(self.num_agents, rows, -1).mean(dim=(1, 2)),
-            "policy/exploration_std": std,
-            "policy/std": std,
             "lr/actor": self.policy_optimizer.lr.to(torch.float32),
             "lr/critic": self.critic_optimizer.lr.to(torch.float32),
         }
@@ -393,7 +397,7 @@ class DDPG(SAC):
             source = self.target_policy if self.cfg.target_actor else self.policy
             with self._batch_mode(source, False):
                 next_actions, _ = self._deterministic(source, next_inputs, sampled["next_observations"])
-            next_actions = self._clamp(self.noise.smooth(next_actions))
+            next_actions = self._clamp(self.noise.smooth(next_actions, sampled["next_observations"]))
             next_critic_actions = self._critic_actions(sampled, "next_observations", next_actions)
             with self._batch_mode(self.target_critics, True):
                 target_out, _ = self.target_critics.act(
@@ -502,10 +506,28 @@ class DDPG(SAC):
         }
 
     def _emit_update_metrics(self, **kwargs) -> None:
-        """SAC's update metrics, plus the training noise's scale (``policy/exploration_std``, also as ``policy/std``) and
-        the critics' spread across the ensemble (``q/ensemble_std``)."""
+        """SAC's update metrics, plus the critics' spread across the ensemble (``q/ensemble_std``); not SAC's
+        ``policy/mean_action`` of the update batch (DDPG's comes from the actions acted on: :meth:`_emit_interval_metrics`)."""
+        kwargs["mean_actions"] = None
         aux = dict(kwargs.get("aux_metrics") or {})
-        std = self._explore_std.clone()
-        aux.update({"policy/exploration_std": std, "policy/std": std, "q/ensemble_std": self._q_spread})
+        aux.update({"q/ensemble_std": self._q_spread})
         kwargs["aux_metrics"] = aux
         super()._emit_update_metrics(**kwargs)
+
+    def _emit_interval_metrics(self, timestep: int) -> None:
+        """SAC's, plus, from the actions acted on over the interval, per agent: the exploration noise the envs got (the
+        warm-up's and the training noise's alike, after the clamp), ``policy/std/<d>`` its RMS per action dim and
+        ``policy/std`` their mean; and the actor's own action on the rows it acted on, ``policy/mean_action/<d>`` its
+        mean |action| per dim and ``policy/mean_action`` their mean (an agent with no such rows: NaN, no point). Then
+        the sums restart."""
+        super()._emit_interval_metrics(timestep)
+        if self.on_log:
+            std = (self._noise_sq / self._noise_rows).sqrt()  # 0 / 0 rows: NaN
+            mean_abs = self._mean_abs / self._mean_rows
+            metrics = {"policy/std": std.mean(dim=1), "policy/mean_action": mean_abs.mean(dim=1)}
+            for d in range(std.shape[1]):
+                metrics[f"policy/std/{d}"] = std[:, d].contiguous()
+                metrics[f"policy/mean_action/{d}"] = mean_abs[:, d].contiguous()
+            self.emit_per_agent(metrics, timestep)
+        for total in (self._noise_sq, self._noise_rows, self._mean_abs, self._mean_rows):
+            total.zero_()

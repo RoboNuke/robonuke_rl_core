@@ -1112,13 +1112,19 @@ def _build_single_eval_policy(
         # health on eval and demo rows (critic_values) goes through it
         learner.critic_action_transform = transform
     if learner_name == "ddpg":
-        from .learners.sac import action_bound
+        from .learners.sac import action_bound, noise_scale
 
         # the actor's bounded half width, as in training (train.py sets it): eval acts with the same bound
         bound = action_bound(cfg, env)
         if bound is not None:
             bind = getattr(bound, "for_route", None)
             learner.action_bound = bind(getattr(learner_cfg, "route_label", None) or None) if bind is not None else bound
+        # the registered noise scale, as in training (train.py sets it): a target_scale: registered reads it in the
+        # critics' TD target on eval and demo rows (critic_values); eval's actions never use it
+        registered_scale = noise_scale(cfg, env)
+        if registered_scale is not None:
+            bind = getattr(registered_scale, "for_route", None)
+            learner.noise_scale = bind(getattr(learner_cfg, "route_label", None) or None) if bind is not None else registered_scale
     metadata = learner.load_agent(checkpoint, slot=0, with_optimizer=False)
     learner.enable_training_mode(False)  # eval mode: no dropout, no stat updates
     if any(getattr(m, "uses_batch_stats", False) for m in learner.models.values() if m is not None):

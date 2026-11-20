@@ -116,3 +116,41 @@ def test_an_eval_ddpg_learner_gets_the_runs_critic_action_transform(monkeypatch)
     env = SimpleNamespace(num_envs=2, observation_space=None, state_space=None, action_space=None, device="cpu")
     _, learner, metadata = evaluation.build_eval_policy(cfg, env, "ckpt")
     assert learner.critic_action_transform is transform and metadata == {"step": 7}
+
+
+def test_an_eval_ddpg_learner_gets_the_runs_registered_noise_scale(monkeypatch):
+    """A target_scale: registered reads the registered scale in the critics' TD target (critic_values on eval and demo
+    rows): the eval learner gets it as train.py sets it on the training one, bound to its route."""
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    from robonuke_rl_core import evaluation
+    from robonuke_rl_core.learners import ddpg, sac
+    from robonuke_rl_core.models import factory
+
+    class Scale:
+        def for_route(self, route):
+            return ("bound to", route)
+
+    class FakeDDPG:
+        def __init__(self, **kwargs):
+            self.models = {}
+
+        def load_agent(self, path, slot=0, with_optimizer=False):
+            return {"step": 7}
+
+        def enable_training_mode(self, enabled=True):
+            pass
+
+    monkeypatch.setattr(ddpg, "DDPG", FakeDDPG)
+    monkeypatch.setattr(factory, "build_models", lambda *a, **k: {})
+    monkeypatch.setattr(sac, "critic_action_transform", lambda cfg, env: None)
+    monkeypatch.setattr(sac, "noise_scale", lambda cfg, env: Scale())
+    cfg = OmegaConf.create({"trainer": {"learner": "ddpg"}, "ddpg": {"num_critics": 2, "route_labels": []}, "model": {}})
+    env = SimpleNamespace(num_envs=2, observation_space=None, state_space=None, action_space=None, device="cpu")
+    _, learner, _ = evaluation.build_eval_policy(cfg, env, "ckpt")
+    assert learner.noise_scale == ("bound to", None)
+    monkeypatch.setattr(sac, "noise_scale", lambda cfg, env: None)  # no builder answered: nothing set
+    _, learner, _ = evaluation.build_eval_policy(cfg, env, "ckpt")
+    assert not hasattr(learner, "noise_scale")

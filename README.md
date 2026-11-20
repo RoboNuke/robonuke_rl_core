@@ -337,8 +337,8 @@ DDPG's own fields:
 **A noise block** (`warmup_noise`, `train_noise`: the same fields, each phase its own values; `learners/noise.py` draws
 both, so every noise draw goes through one place). Per draw: `clip(d * scale, ±clip)`, added to the actor's action or
 the range's midpoint, then clamped with `clip_actions`. `scale`, `scale_end`, `clip`, `target_scale` and `target_clip`
-each take one number (every action dim) or a list, one per action dim (per-dim noise; the logged
-`policy/exploration_std` is the mean over the dims). `scale: registered` takes the scale per row and dim from a
+each take one number (every action dim) or a list, one per action dim (per-dim noise; the logged `policy/std` is
+measured from the actions, per dim). `scale: registered` takes the scale per row and dim from a
 project's function of the raw observation instead (`register_noise_scale(fn)`, `fn(cfg, env) -> ((observations, phase)
 -> (rows, A)) or None`, registered in the training script's `setup()`; `phase` is `"warmup"` or `"train"`, the result
 is in r units, device ops only; a scale with a `for_route(route)` method is bound to each learner's own `route_label`).
@@ -357,12 +357,14 @@ registered.
 | `repeat_zeta_s` | float | `2.0` | the Zeta exponent, `P(k) ~ k^-s` |
 | `repeat_max` | int | `16` | the longest hold, in env steps |
 | `target_smoothing` | bool | `false` | TD3's target-policy smoothing in this phase's critic updates: the target's next action plus `N(0, target_scale)` clipped to ±`target_clip` |
-| `target_scale` | float, list or null | `null` | the smoothing std. Null: this phase's `scale` at that step (refused with a null or registered `scale` when `target_smoothing` is on) |
+| `target_scale` | float, list, null or `"registered"` | `null` | the smoothing std. Null: this phase's `scale` at that step (refused with a null or registered `scale` when `target_smoothing` is on). `registered`: per row, the project's `register_noise_scale` function at the next observation for the `train` phase (the training noise's std there, no warm-up factor), so the smoothing is the acting noise |
 | `target_clip` | float or list | `0.3` | the smoothing noise's clip |
 
-Metrics, on top of SAC's (no `entropy/*`): `policy/exploration_std` (the training noise's scale now, per agent; a
-registered scale: the mean over the agent's envs and dims of the last draw's; also `policy/std`),
-`policy/mean_action` (mean |deterministic action|), `q/ensemble_std` (the critics' spread over the batch) and
+Metrics, on top of SAC's (no `entropy/*`), every write interval from the actions acted on, per agent:
+`policy/std/<d>` (the RMS of the exploration noise the envs got on action dim d -- the executed action minus its center,
+the actor's mean or the midpoint, after the clamp; the warm-up's and the training noise's alike) and `policy/std` (their
+mean); `policy/mean_action/<d>` (the mean |deterministic action| on dim d over the rows the actor acted on) and
+`policy/mean_action` (their mean). Then `q/ensemble_std` (the critics' spread over the batch) and
 `q/action_grad_norm` (|dQ/da| of the critics' mean at the actor's own action, per row: the slope the actor follows;
 only with `log_action_grad`).
 The critic warm-up burst (`critic_warmup_updates`) publishes only its last 1000 gradient steps (one point per update, as

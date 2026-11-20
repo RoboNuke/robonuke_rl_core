@@ -15,7 +15,8 @@ one number or one per dim.
 
 Target smoothing (TD3's) in a critic update: ``a' = mu'(s') + clip(N(0, target_scale), +-target_clip)``. Its numbers
 live in device buffers set before each update (:meth:`ActionNoise.load_smoothing`), so one captured CUDA graph serves
-both phases.
+both phases. ``target_scale: registered``: the std per row is the registered scale of the next observation ``s'`` for the
+``train`` phase (the training noise's own std there), so the smoothing is the acting noise, as with one number for both.
 
 :class:`HeldDraw` is the correlated-noise hold (FlashSAC's), shared with SAC's ``noise_repeat``.
 """
@@ -78,7 +79,7 @@ class ActionNoise:
         for phase, cfg in self.cfgs.items():
             for name in ("scale", "scale_end", "clip", "target_scale", "target_clip"):
                 value = getattr(cfg, name)
-                if value is None or (name == "scale" and value == REGISTERED):
+                if value is None or (name in ("scale", "target_scale") and value == REGISTERED):
                     continue
                 if not isinstance(value, (int, float)) and len(value) not in (1, self.width):
                     raise ValueError(f"ddpg.{phase}_noise.{name} has {len(value)} numbers; the action is {self.width} wide")
@@ -94,7 +95,10 @@ class ActionNoise:
                      for phase, cfg in self.cfgs.items()}
         #: target smoothing, set per update (:meth:`load_smoothing`): on (0/1), std, clip
         self.smoothing_used = any(cfg.target_smoothing for cfg in self.cfgs.values())
-        self._smooth = {"on": torch.zeros((), device=device)}
+        #: a phase smooths with the registered scale (``target_scale: registered``): every critic target then reads it,
+        #: selected per phase by the device flag ``registered`` (one captured graph serves both phases)
+        self.smoothing_registered = any(cfg.target_smoothing and cfg.target_scale == REGISTERED for cfg in self.cfgs.values())
+        self._smooth = {"on": torch.zeros((), device=device), "registered": torch.zeros((), device=device)}
         # per action dim (a per-dim target_scale / target_clip), filled before each update
         self._smooth.update({k: torch.zeros((self.width,), device=device) for k in ("std", "clip")})
         self._smooth["clip"].fill_(1.0)
@@ -187,22 +191,33 @@ class ActionNoise:
         """Set the device buffers the next critic updates' target smoothing reads to phase ``phase``'s (device fills, no
         host read; a captured graph sees them)."""
         cfg = self.cfgs[phase]
-        if cfg.target_scale is not None:
+        registered = cfg.target_scale == REGISTERED
+        if registered:  # per row, from the next observations (smooth)
+            std = [0.0]
+        elif cfg.target_scale is not None:
             std = self._floats(cfg.target_scale)
         elif cfg.target_smoothing:
             std = self.scales(phase, timestep)
         else:  # no smoothing in this phase: the std is never used
             std = [0.0]
         self._smooth["on"].fill_(1.0 if cfg.target_smoothing else 0.0)
+        self._smooth["registered"].fill_(1.0 if registered else 0.0)
         self._smooth["std"].copy_(self._tensor(std).expand(self.width))
         self._smooth["clip"].copy_(self._tensor(self._floats(cfg.target_clip)).expand(self.width))
 
-    def smooth(self, next_actions: torch.Tensor) -> torch.Tensor:
-        """The target's next action plus the loaded phase's smoothing noise (unclamped); as it is when no phase smooths."""
+    def smooth(self, next_actions: torch.Tensor, next_observations: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """The target's next action plus the loaded phase's smoothing noise (unclamped); as it is when no phase smooths.
+        ``next_observations``: the raw next observations, read when a phase smooths with the registered scale."""
         if not self.smoothing_used:
             return next_actions
         clip = self._smooth["clip"]
-        noise = torch.maximum(torch.minimum(torch.randn_like(next_actions) * self._smooth["std"], clip), -clip)
+        std = self._smooth["std"]
+        if self.smoothing_registered:
+            if next_observations is None:
+                raise RuntimeError("target_scale: registered reads the next observations' registered scale, and none were given")
+            per_row = self.registered_scale(next_observations, "train", next_actions.shape[0], next_actions.shape[1])
+            std = torch.where(self._smooth["registered"] > 0, per_row, std)
+        noise = torch.maximum(torch.minimum(torch.randn_like(next_actions) * std, clip), -clip)
         return next_actions + noise * self._smooth["on"]
 
     def smoothing_std(self) -> torch.Tensor:

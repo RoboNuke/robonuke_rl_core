@@ -101,13 +101,14 @@ def main(argv=None, setup=None) -> int:
         # a project's register_noise_scale: DDPG's noise scale (scale: registered) per row and dim, from the observation
         registered_scale = noise_scale(cfg, env)
         registered = [f"{learner_name}.{phase}" for phase in ("warmup_noise", "train_noise")
-                      if getattr(getattr(learner_cfg, phase, None), "scale_registered", False)]
+                      if getattr(getattr(learner_cfg, phase, None), "scale_registered", False)
+                      or getattr(getattr(learner_cfg, phase, None), "target_scale_registered", False)]
         if registered and registered_scale is None:
-            raise ValueError(f"{registered}.scale is registered (a per-row function of the observation), and no "
+            raise ValueError(f"{registered}.scale or target_scale is registered (a per-row function of the observation), and no "
                              "register_noise_scale builder answered for this run")
         if registered_scale is not None and not registered:
             raise ValueError(f"a register_noise_scale builder answered, and no {learner_name}.warmup_noise / train_noise "
-                             "has scale: registered: the registered scale would go unused")
+                             "has scale or target_scale: registered: the registered scale would go unused")
         # a project's register_neutral_action: the action that leaves the env as it is (a residual: the base alone)
         neutral = neutral_action(cfg, env)
         # a project's register_action_bound: DDPG's deterministic action clamped per env and dim from the observation

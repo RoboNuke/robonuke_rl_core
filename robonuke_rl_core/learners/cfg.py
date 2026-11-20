@@ -733,7 +733,8 @@ class NoiseCfg:
     #: the target's next action plus ``N(0, target_scale)`` clipped to +-``target_clip``
     target_smoothing: bool = False
     #: null: this phase's ``scale`` at that step (one number, or one per dim, as ``target_clip``); a number with a null or
-    #: registered ``scale``
+    #: registered ``scale``; ``registered``: per row, the registered scale of the next observation for the ``train`` phase
+    #: (the training noise's std there, no warm-up factor; needs ``register_noise_scale``)
     target_scale: Any = None
     target_clip: Any = 0.3
 
@@ -764,7 +765,11 @@ class NoiseCfg:
             raise ValueError(f"{where}.scale is a number, a list, null or 'registered', got {self.scale!r}")
         scale = None if registered else values("scale")
         scale_end, clip = values("scale_end"), values("clip")
-        target_scale, target_clip = values("target_scale"), values("target_clip")
+        target_registered = isinstance(self.target_scale, str)
+        if target_registered and self.target_scale != "registered":
+            raise ValueError(f"{where}.target_scale is a number, a list, null or 'registered', got {self.target_scale!r}")
+        target_scale = None if target_registered else values("target_scale")
+        target_clip = values("target_clip")
         if registered:
             if scale_end is not None:
                 raise ValueError(f"{where}.scale: registered (a per-row function) has no schedule: leave scale_end null")
@@ -793,6 +798,11 @@ class NoiseCfg:
     def scale_registered(self) -> bool:
         """``scale: registered``: the scale comes from a project's per-row function (``register_noise_scale``)."""
         return self.scale == "registered"
+
+    @property
+    def target_scale_registered(self) -> bool:
+        """``target_scale: registered`` with ``target_smoothing``: the smoothing std from ``register_noise_scale``."""
+        return bool(self.target_smoothing) and self.target_scale == "registered"
 
 
 @dataclass
